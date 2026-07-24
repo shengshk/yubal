@@ -8,22 +8,24 @@ Self-hosted YouTube Music downloader & library manager.
 
 Fork of [guillevc/yubal](https://github.com/guillevc/yubal) → [shengshk/yubal](https://github.com/shengshk/yubal)
 
-<sub>Heavily modified · **DB / layout not compatible with upstream** · 魔改较多 · 数据库与路径与原项目不通用</sub>
-
 [![Upstream](https://img.shields.io/badge/upstream-guillevc%2Fyubal-blue)](https://github.com/guillevc/yubal)
 [![Fork](https://img.shields.io/badge/fork-shengshk%2Fyubal-teal)](https://github.com/shengshk/yubal)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-<picture>
-  <img src="docs/demo.gif" alt="yubal demo" width="75%">
-</picture>
+</div>
 
-<sub>
-Demo GIF is from upstream ([guillevc/yubal](https://github.com/guillevc/yubal)) — reference only; will be updated later.<br/>
-演示 GIF 来自原项目，仅作参考（后续更新）。 · 演示 GIF 來自原專案，僅作參考（後續更新）。
-</sub>
+> Heavily modified · **DB / layout not compatible with upstream** · 魔改较多 · 数据库与路径与原项目不通用
+
+Thanks to **YouTube Music** for its publicly available APIs (consumed via [ytmusicapi](https://github.com/sigma67/ytmusicapi)) — this project would not exist without them.  
+感谢 **YouTube Music** 开放 API（经 [ytmusicapi](https://github.com/sigma67/ytmusicapi) 使用）；本项目依赖于此。
+
+<div align="center">
+
+<img src="docs/demo.gif" alt="yubal demo" width="75%">
 
 </div>
+
+*Demo GIF from upstream [guillevc/yubal](https://github.com/guillevc/yubal) — reference only; will be updated later. · 演示 GIF 来自原项目，仅作参考。*
 
 <br/>
 
@@ -149,14 +151,17 @@ For age-restricted content, private playlists, Liked Music (`list=LM`), or Premi
 
 ## Acknowledgments
 
+- **YouTube Music** open / public APIs — metadata & catalog access via [ytmusicapi](https://github.com/sigma67/ytmusicapi)
 - Upstream: [guillevc/yubal](https://github.com/guillevc/yubal) — support the original author via [Ko-fi](https://ko-fi.com/guillevc) / [GitHub Sponsors](https://github.com/sponsors/guillevc)
-- Built with [yt-dlp](https://github.com/yt-dlp/yt-dlp) and [ytmusicapi](https://github.com/sigma67/ytmusicapi)
+- [yt-dlp](https://github.com/yt-dlp/yt-dlp) for downloads
+
+## Disclaimer
+
+This software is provided **as-is**, for **personal archiving and self-hosted library management** only. You are solely responsible for complying with [YouTube’s Terms of Service](https://www.youtube.com/t/terms), copyright law, and any other applicable rules. The authors and contributors are **not** liable for misuse, account restrictions, data loss, or legal consequences arising from your use of this project. Do not use it to redistribute copyrighted content.
 
 ## License
 
 [MIT](LICENSE)
-
-<sub>For personal archiving only. Comply with YouTube’s Terms of Service and applicable copyright law.</sub>
 
 ---
 
@@ -281,14 +286,17 @@ docker compose -f compose.yaml up -d
 
 ## 致谢
 
+- **YouTube Music** 开放 API — 经 [ytmusicapi](https://github.com/sigma67/ytmusicapi) 获取元数据与曲目信息  
 - 上游：[guillevc/yubal](https://github.com/guillevc/yubal) — [Ko-fi](https://ko-fi.com/guillevc) / [Sponsors](https://github.com/sponsors/guillevc)  
-- [yt-dlp](https://github.com/yt-dlp/yt-dlp)、[ytmusicapi](https://github.com/sigma67/ytmusicapi)
+- [yt-dlp](https://github.com/yt-dlp/yt-dlp) 下载能力
+
+## 免责声明
+
+本软件按「现状」提供，**仅供个人归档与自托管曲库管理**。请自行遵守 [YouTube 服务条款](https://www.youtube.com/t/terms)、版权法及其他适用规定。作者与贡献者**不对**滥用、账号受限、数据丢失或由此产生的法律后果承担责任。请勿用于传播受版权保护的内容。
 
 ## License
 
 [MIT](LICENSE)
-
-<sub>仅供个人归档。请遵守 YouTube 服务条款及适用版权法律。</sub>
 
 ---
 
@@ -413,11 +421,14 @@ docker compose -f compose.yaml up -d
 
 ## 致謝
 
+- **YouTube Music** 開放 API — 經 [ytmusicapi](https://github.com/sigma67/ytmusicapi) 取得中繼資料與曲目資訊  
 - 上游：[guillevc/yubal](https://github.com/guillevc/yubal) — [Ko-fi](https://ko-fi.com/guillevc) / [Sponsors](https://github.com/sponsors/guillevc)  
-- [yt-dlp](https://github.com/yt-dlp/yt-dlp)、[ytmusicapi](https://github.com/sigma67/ytmusicapi)
+- [yt-dlp](https://github.com/yt-dlp/yt-dlp) 下載能力
+
+## 免責聲明
+
+本軟體依「現況」提供，**僅供個人歸檔與自託管曲庫管理**。請自行遵守 [YouTube 服務條款](https://www.youtube.com/t/terms)、著作權法及其他適用規定。作者與貢獻者**不對**濫用、帳號受限、資料遺失或由此產生的法律後果負責。請勿用於傳播受著作權保護的內容。
 
 ## License
 
 [MIT](LICENSE)
-
-<sub>僅供個人歸檔。請遵守 YouTube 服務條款及適用著作權法律。</sub>
