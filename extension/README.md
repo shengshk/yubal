@@ -1,5 +1,8 @@
 # yubal browser extension
 
+> [!WARNING]
+> **shengshk/yubal fork:** this extension is upstream-only and **unchanged**. It is **not** adapted for this fork’s built-in login (`YUBAL_AUTH_LOGIN=true` blocks `/api/jobs` etc.). Prefer the Web UI, or use [guillevc/yubal](https://github.com/guillevc/yubal) if you need the extension.
+
 Browser extension for Chrome and Firefox. Download tracks and subscribe to playlists from YouTube and YouTube Music without copy-pasting URLs.
 
 Works with any [yubal](https://github.com/guillevc/yubal) instance.

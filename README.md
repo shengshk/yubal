@@ -8,6 +8,8 @@ Self-hosted YouTube Music downloader & library manager.
 
 Fork of [guillevc/yubal](https://github.com/guillevc/yubal) → [shengshk/yubal](https://github.com/shengshk/yubal)
 
+<sub>Heavily modified · **DB / layout not compatible with upstream** · 魔改较多 · 数据库与路径与原项目不通用</sub>
+
 [![Upstream](https://img.shields.io/badge/upstream-guillevc%2Fyubal-blue)](https://github.com/guillevc/yubal)
 [![Fork](https://img.shields.io/badge/fork-shengshk%2Fyubal-teal)](https://github.com/shengshk/yubal)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
@@ -15,6 +17,11 @@ Fork of [guillevc/yubal](https://github.com/guillevc/yubal) → [shengshk/yubal]
 <picture>
   <img src="docs/demo.gif" alt="yubal demo" width="75%">
 </picture>
+
+<sub>
+Demo GIF is from upstream ([guillevc/yubal](https://github.com/guillevc/yubal)) — reference only; will be updated later.<br/>
+演示 GIF 来自原项目，仅作参考（后续更新）。 · 演示 GIF 來自原專案，僅作參考（後續更新）。
+</sub>
 
 </div>
 
@@ -25,6 +32,11 @@ Fork of [guillevc/yubal](https://github.com/guillevc/yubal) → [shengshk/yubal]
 Self-hosted YouTube Music downloader and library manager.
 
 This repo is a fork of [guillevc/yubal](https://github.com/guillevc/yubal) ([shengshk/yubal](https://github.com/shengshk/yubal)). On top of “paste a link → tagged, organized files”, it adds a **dual-root hardlink library, external library, Sync Center, built-in login, Telegram**, and more.
+
+> [!WARNING]
+> **This fork diverges heavily from upstream.** Do **not** reuse an upstream database, config layout, or `ghcr.io/guillevc/yubal` image expecting a drop-in upgrade. Paths (`/data/...` vs `/app/data`), schema, and features are incompatible — treat this as a **separate product** forked from yubal, not a compatible branch.
+>
+> The upstream **browser extension** is unchanged in this repo and is **not** adapted for this fork (built-in login will reject its API calls). It is not a supported feature here; use the Web UI (or disable built-in auth at your own risk). Prefer the official upstream project if you need the extension.
 
 ## Main differences vs upstream
 
@@ -39,7 +51,7 @@ This repo is a fork of [guillevc/yubal](https://github.com/guillevc/yubal) ([she
 | **Lyrics / covers** | lrclib → YTM → **QQ Music**; Apple/iTunes cover search | lrclib + YTM |
 | **Auth** | Built-in login (`YUBAL_AUTH_LOGIN`); or disable for reverse-proxy auth | Deploy-side auth |
 | **UI** | **en / 简 / 繁** (default **English**); settings drawer, search, library health, PWA | English Web UI |
-| **Telegram** | Bot: search / preview / download / subscribe; optional local Bot API | — |
+| **Telegram** | Bot: search / preview / download / subscribe; optional local Bot API; audio sends cache Telegram `file_id` for instant re-send | — |
 
 Container layout:
 
@@ -57,23 +69,9 @@ Container layout:
 
 ## Features
 
-**From upstream:** Web UI, albums/playlists/tracks, scheduled subscriptions, M3U, synced lyrics, ReplayGain, formats, [browser extension](extension/README.md), [CLI](packages/yubal/src/yubal/cli/README.md), media-server ready.
+**From upstream (core ideas):** Web UI, albums/playlists/tracks, scheduled subscriptions, M3U, synced lyrics, ReplayGain, formats, [CLI](packages/yubal/src/yubal/cli/README.md), media-server ready.
 
 **Fork extras:** Sync Center ledger, external library + hardlink dedupe, built-in login, QQ lyrics & Apple covers, Telegram bot (optional `tgapi`), trilingual UI + PWA.
-
-## Browser extension
-
-<p>
-  <img src="https://raw.githubusercontent.com/guillevc/yubal/refs/heads/master/extension/docs/images/extension-track.png" alt="Track view" width="32%">
-  <img src="https://raw.githubusercontent.com/guillevc/yubal/refs/heads/master/extension/docs/images/extension-playlist.png" alt="Playlist view" width="32%">
-  <img src="https://raw.githubusercontent.com/guillevc/yubal/refs/heads/master/extension/docs/images/extension-settings.png" alt="Settings view" width="32%">
-</p>
-<p>
-  <a href="https://addons.mozilla.org/addon/yubal/"><img src="https://img.shields.io/badge/Firefox-get_add--on-FF7139?logo=firefox&logoColor=white&style=for-the-badge" alt="Get the add-on for Firefox"></a>
-  <a href="https://github.com/guillevc/yubal/releases?q=🧩"><img src="https://img.shields.io/badge/Chrome-manual_install-4285F4?logo=googlechrome&logoColor=white&style=for-the-badge" alt="Chrome manual install"></a>
-</p>
-
-See [extension/README.md](extension/README.md).
 
 ## Quick start
 
@@ -99,6 +97,7 @@ See [`compose.example.yaml`](compose.example.yaml) for the full `yubal` + option
 ### Telegram & `tgapi`
 
 - Bot token / admin IDs are configured in the Web **Settings** drawer (not compose).
+- **Sending audio is not a full re-upload every time.** After the first successful send, yubal stores Telegram’s cloud `file_id` (per track). Later sends reuse that id for near-instant delivery (Telegram-side “秒传”), instead of uploading the file again.
 - Without `YUBAL_TG_API_URL`, the bot uses the **official** Telegram Bot API (fine for small files).
 - With local **`tgapi`** ([aiogram/telegram-bot-api](https://hub.docker.com/r/aiogram/telegram-bot-api)): set `YUBAL_TG_API_URL=http://tgapi:8081`, same compose network as yubal, and mount `./data:/data:ro` so large files can be uploaded by **path**. Fill `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` from [my.telegram.org](https://my.telegram.org); never commit them.
 
@@ -135,6 +134,7 @@ Mount `/data/download` (and `external/organized` if needed).
 | --- | --- | :---: |
 | **Navidrome** | Works out of the box | ✅ |
 | **Jellyfin** | Enable “Use non-standard artists tags” | ✅ |
+| **Plex / Plexamp** | Works out of the box (point Plex library at the mount) | ✅ |
 | **Gonic** | `GONIC_MULTI_VALUE_ARTIST=multi` | ❌ (limited M3U) |
 
 ## Cookies (optional)
@@ -166,6 +166,11 @@ For age-restricted content, private playlists, Liked Music (`list=LM`), or Premi
 
 本仓库是 [guillevc/yubal](https://github.com/guillevc/yubal) 的 fork（[shengshk/yubal](https://github.com/shengshk/yubal)），在「粘贴链接 → 打标签整理」之上，扩展了**双库硬链接、外部曲库、同步中心、内置登录、Telegram** 等能力。
 
+> [!WARNING]
+> **本 fork 魔改较多，与原项目不通用。** 请勿把上游数据库 / 配置目录 / `ghcr.io/guillevc/yubal` 镜像当作可原地升级。路径（`/data/...` vs `/app/data`）、库表结构与功能均不兼容——应视为基于 yubal 的**独立产品**，不是兼容分支。
+>
+> 仓库内仍保留上游的**浏览器扩展**源码，但**本 fork 未改、不适配**（开启内置登录时扩展调 API 会被拒）。本项目不把它当支持功能；请用 Web UI（若强行关闭内置登录自担风险）。需要扩展请用原项目。
+
 ## 与原项目的主要差异
 
 | 方向 | 本 fork | 上游典型形态 |
@@ -179,7 +184,7 @@ For age-restricted content, private playlists, Liked Music (`list=LM`), or Premi
 | **歌词 / 封面** | lrclib → YTM → **QQ Music**；Apple/iTunes 封面检索 | lrclib + YTM |
 | **认证** | 内置登录（`YUBAL_AUTH_LOGIN`）；也可关掉改走反向代理鉴权 | 依赖部署侧鉴权 |
 | **界面** | **英 / 简 / 繁**（默认 **English**）；设置抽屉、在线搜索、库健康、PWA | 英文 Web UI |
-| **Telegram** | Bot：搜索 / 预览 / 下载 / 订阅；可选本地 Bot API | 无 |
+| **Telegram** | Bot：搜索 / 预览 / 下载 / 订阅；可选本地 Bot API；发送后缓存云端 `file_id`，再次发送秒传 | 无 |
 
 目录约定（容器内）：
 
@@ -197,23 +202,9 @@ For age-restricted content, private playlists, Liked Music (`list=LM`), or Premi
 
 ## 功能概览
 
-**沿用上游：** Web UI、专辑/歌单/单曲、订阅同步、M3U、歌词、ReplayGain、格式可选、[浏览器扩展](extension/README.md)、[CLI](packages/yubal/src/yubal/cli/README.md)、媒体库对接。
+**沿用上游（核心能力）：** Web UI、专辑/歌单/单曲、订阅同步、M3U、歌词、ReplayGain、格式可选、[CLI](packages/yubal/src/yubal/cli/README.md)、媒体库对接。
 
 **本 fork：** 同步中心、外部曲库与硬链去重、内置登录、QQ 歌词与 Apple 封面、Telegram（可选 `tgapi`）、三语界面与 PWA。
-
-## 浏览器扩展
-
-<p>
-  <img src="https://raw.githubusercontent.com/guillevc/yubal/refs/heads/master/extension/docs/images/extension-track.png" alt="Track view" width="32%">
-  <img src="https://raw.githubusercontent.com/guillevc/yubal/refs/heads/master/extension/docs/images/extension-playlist.png" alt="Playlist view" width="32%">
-  <img src="https://raw.githubusercontent.com/guillevc/yubal/refs/heads/master/extension/docs/images/extension-settings.png" alt="Settings view" width="32%">
-</p>
-<p>
-  <a href="https://addons.mozilla.org/addon/yubal/"><img src="https://img.shields.io/badge/Firefox-get_add--on-FF7139?logo=firefox&logoColor=white&style=for-the-badge" alt="Get the add-on for Firefox"></a>
-  <a href="https://github.com/guillevc/yubal/releases?q=🧩"><img src="https://img.shields.io/badge/Chrome-manual_install-4285F4?logo=googlechrome&logoColor=white&style=for-the-badge" alt="Chrome manual install"></a>
-</p>
-
-详见 [extension/README.md](extension/README.md)。
 
 ## 快速开始
 
@@ -239,6 +230,7 @@ docker compose -f compose.yaml up -d
 ### Telegram 与 `tgapi`
 
 - Bot Token / 管理员 ID 在 Web **设置**抽屉里配置（不在 compose）。
+- **发送音频不是每次都重新传文件。** 首次发送成功后会记录 Telegram 云端 `file_id`（按曲目）；之后再发同一曲会用该 id **秒传**，无需再次上传。
 - 不设 `YUBAL_TG_API_URL` 时，Bot 走 **官方** Telegram Bot API（小文件够用）。
 - 启用本地 **`tgapi`**（[aiogram/telegram-bot-api](https://hub.docker.com/r/aiogram/telegram-bot-api)）：设 `YUBAL_TG_API_URL=http://tgapi:8081`，与 yubal **同 compose 网络**，并挂载 `./data:/data:ro`，才能按**路径**上传大文件。`TELEGRAM_API_ID` / `TELEGRAM_API_HASH` 从 [my.telegram.org](https://my.telegram.org) 申请，**勿提交密钥**。
 ## 配置
@@ -274,6 +266,7 @@ docker compose -f compose.yaml up -d
 | --- | --- | :---: |
 | **Navidrome** | 开箱可用 | ✅ |
 | **Jellyfin** | 开启 “Use non-standard artists tags” | ✅ |
+| **Plex / Plexamp** | 开箱可用（Plex 媒体库指向挂载目录即可） | ✅ |
 | **Gonic** | `GONIC_MULTI_VALUE_ARTIST=multi` | ❌（M3U 有限） |
 
 ## Cookies（可选）
@@ -305,6 +298,11 @@ docker compose -f compose.yaml up -d
 
 本倉庫是 [guillevc/yubal](https://github.com/guillevc/yubal) 的 fork（[shengshk/yubal](https://github.com/shengshk/yubal)），在「貼上連結 → 打標籤整理」之上，擴充了**雙庫硬連結、外部曲庫、同步中心、內建登入、Telegram** 等能力。
 
+> [!WARNING]
+> **本 fork 魔改較多，與原專案不通用。** 請勿把上游資料庫 / 設定目錄 / `ghcr.io/guillevc/yubal` 映像當作可原地升級。路徑（`/data/...` vs `/app/data`）、庫表結構與功能均不相容——應視為基於 yubal 的**獨立產品**，不是相容分支。
+>
+> 倉庫內仍保留上游的**瀏覽器擴充**原始碼，但**本 fork 未改、不適配**（開啟內建登入時擴充呼叫 API 會被拒）。本專案不把它當支援功能；請用 Web UI（若強行關閉內建登入自擔風險）。需要擴充請用原專案。
+
 ## 與原專案的主要差異
 
 | 方向 | 本 fork | 上游典型形態 |
@@ -318,7 +316,7 @@ docker compose -f compose.yaml up -d
 | **歌詞 / 封面** | lrclib → YTM → **QQ Music**；Apple/iTunes 封面檢索 | lrclib + YTM |
 | **認證** | 內建登入（`YUBAL_AUTH_LOGIN`）；也可關掉改走反向代理鑑權 | 依賴部署側鑑權 |
 | **介面** | **英 / 簡 / 繁**（預設 **English**）；設定抽屜、線上搜尋、庫健康、PWA | 英文 Web UI |
-| **Telegram** | Bot：搜尋 / 預覽 / 下載 / 訂閱；可選本地 Bot API | 無 |
+| **Telegram** | Bot：搜尋 / 預覽 / 下載 / 訂閱；可選本地 Bot API；發送後快取雲端 `file_id`，再次發送秒傳 | 無 |
 
 目錄約定（容器內）：
 
@@ -336,23 +334,9 @@ docker compose -f compose.yaml up -d
 
 ## 功能概覽
 
-**沿用上游：** Web UI、專輯/歌單/單曲、訂閱同步、M3U、歌詞、ReplayGain、格式可選、[瀏覽器擴充](extension/README.md)、[CLI](packages/yubal/src/yubal/cli/README.md)、媒體庫對接。
+**沿用上游（核心能力）：** Web UI、專輯/歌單/單曲、訂閱同步、M3U、歌詞、ReplayGain、格式可選、[CLI](packages/yubal/src/yubal/cli/README.md)、媒體庫對接。
 
 **本 fork：** 同步中心、外部曲庫與硬連結去重、內建登入、QQ 歌詞與 Apple 封面、Telegram（可選 `tgapi`）、三語介面與 PWA。
-
-## 瀏覽器擴充
-
-<p>
-  <img src="https://raw.githubusercontent.com/guillevc/yubal/refs/heads/master/extension/docs/images/extension-track.png" alt="Track view" width="32%">
-  <img src="https://raw.githubusercontent.com/guillevc/yubal/refs/heads/master/extension/docs/images/extension-playlist.png" alt="Playlist view" width="32%">
-  <img src="https://raw.githubusercontent.com/guillevc/yubal/refs/heads/master/extension/docs/images/extension-settings.png" alt="Settings view" width="32%">
-</p>
-<p>
-  <a href="https://addons.mozilla.org/addon/yubal/"><img src="https://img.shields.io/badge/Firefox-get_add--on-FF7139?logo=firefox&logoColor=white&style=for-the-badge" alt="Get the add-on for Firefox"></a>
-  <a href="https://github.com/guillevc/yubal/releases?q=🧩"><img src="https://img.shields.io/badge/Chrome-manual_install-4285F4?logo=googlechrome&logoColor=white&style=for-the-badge" alt="Chrome manual install"></a>
-</p>
-
-詳見 [extension/README.md](extension/README.md)。
 
 ## 快速開始
 
@@ -378,6 +362,7 @@ docker compose -f compose.yaml up -d
 ### Telegram 與 `tgapi`
 
 - Bot Token / 管理員 ID 在 Web **設定**抽屜裡設定（不在 compose）。
+- **發送音訊不是每次都重新傳檔。** 首次發送成功後會記錄 Telegram 雲端 `file_id`（依曲目）；之後再發同一曲會用該 id **秒傳**，無需再次上傳。
 - 不設 `YUBAL_TG_API_URL` 時，Bot 走 **官方** Telegram Bot API（小檔案夠用）。
 - 啟用本地 **`tgapi`**（[aiogram/telegram-bot-api](https://hub.docker.com/r/aiogram/telegram-bot-api)）：設 `YUBAL_TG_API_URL=http://tgapi:8081`，與 yubal **同 compose 網路**，並掛載 `./data:/data:ro`，才能依**路徑**上傳大檔案。`TELEGRAM_API_ID` / `TELEGRAM_API_HASH` 從 [my.telegram.org](https://my.telegram.org) 申請，**勿提交密鑰**。
 ## 設定
@@ -413,6 +398,7 @@ docker compose -f compose.yaml up -d
 | --- | --- | :---: |
 | **Navidrome** | 開箱可用 | ✅ |
 | **Jellyfin** | 開啟 “Use non-standard artists tags” | ✅ |
+| **Plex / Plexamp** | 開箱可用（Plex 媒體庫指向掛載目錄即可） | ✅ |
 | **Gonic** | `GONIC_MULTI_VALUE_ARTIST=multi` | ❌（M3U 有限） |
 
 ## Cookies（可選）
