@@ -1,9 +1,11 @@
 import type { components } from "@/api/schema";
+import type { ReactNode } from "react";
 import {
   AlertTriangleIcon,
   ArrowDownIcon,
   ArrowRightIcon,
   CheckIcon,
+  LinkIcon,
   PaperclipIcon,
   XIcon,
 } from "lucide-react";
@@ -24,6 +26,7 @@ const STATUS_CONFIG: Record<
 > = {
   success: { icon: CheckIcon, color: "text-success" },
   skipped: { icon: ArrowRightIcon, color: "text-secondary" },
+  hardlinked: { icon: LinkIcon, color: "text-primary" },
   failed: { icon: XIcon, color: "text-danger" },
 };
 
@@ -126,28 +129,68 @@ function ExtractionStatsLog({
 /** Download stats display */
 function DownloadStatsLog({
   success,
+  hardlinked,
   failed,
   skippedByReason,
 }: {
   success: number;
+  hardlinked: number;
   failed: number;
   skippedByReason: SkippedByReason;
 }) {
-  // Show warning icon if any tracks failed
+  const skippedTotal = Object.values(skippedByReason).reduce(
+    (a, b) => a + b,
+    0,
+  );
   const hasIssues = failed > 0;
   const Icon = hasIssues ? AlertTriangleIcon : CheckIcon;
   const iconColor = hasIssues ? "text-warning" : "text-success";
 
+  const parts: { key: string; node: ReactNode }[] = [];
+  if (success > 0) {
+    parts.push({
+      key: "success",
+      node: <span className="text-success">{success} downloaded</span>,
+    });
+  }
+  if (hardlinked > 0) {
+    parts.push({
+      key: "hardlinked",
+      node: (
+        <span className="text-primary">{hardlinked} hardlinked</span>
+      ),
+    });
+  }
+  if (skippedTotal > 0) {
+    parts.push({
+      key: "skipped",
+      node: (
+        <span className="text-secondary">
+          {formatSkippedMessage(skippedByReason)}
+        </span>
+      ),
+    });
+  }
+  if (failed > 0) {
+    parts.push({
+      key: "failed",
+      node: <span className="text-danger">{failed} failed</span>,
+    });
+  }
+
   return (
     <div className="flex items-center gap-1">
       <Icon className={`${ICON_CLASS} ${iconColor}`} />
-      <span className="text-success">{success} success</span>
-      <span>,</span>
-      <span className="text-secondary">
-        {formatSkippedMessage(skippedByReason)}
-      </span>
-      <span>,</span>
-      <span className="text-danger">{failed} failed</span>
+      {parts.length > 0 ? (
+        parts.map((part, i) => (
+          <span key={part.key} className="contents">
+            {i > 0 ? <span>,</span> : null}
+            {part.node}
+          </span>
+        ))
+      ) : (
+        <span className="text-foreground-400">no tracks processed</span>
+      )}
     </div>
   );
 }
@@ -257,6 +300,7 @@ export function LogLine({ entry }: { entry: LogEntry }) {
       return (
         <DownloadStatsLog
           success={stats.success ?? 0}
+          hardlinked={stats.hardlinked ?? 0}
           failed={stats.failed ?? 0}
           skippedByReason={skippedByReason}
         />

@@ -4,4 +4,5 @@ import type { paths } from "./schema";
 
 export const api = createClient<paths>({
   baseUrl: `${basePath}/api`,
+  credentials: "include",
 });

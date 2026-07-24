@@ -46,8 +46,86 @@
   }
 }
 
-html {
-  scrollbar-gutter: stable;
+/* Keep scroll; hide all scrollbars (page, drawer, logs, ScrollShadow) */
+* {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+*::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+  display: none;
+}
+
+/* Lyrics typography — system CJK sans (no remote webfont; avoids fonts.gstatic failures) */
+.lyrics-type {
+  font-family:
+    "PingFang SC",
+    "Hiragino Sans GB",
+    "Microsoft YaHei UI",
+    "Microsoft YaHei",
+    "Noto Sans SC",
+    "Source Han Sans SC",
+    sans-serif;
+  font-feature-settings: "kern" 1;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Fullscreen: YouYuan (Windows) / Yuanti (macOS), rounded CJK */
+.lyrics-type-fs {
+  font-family:
+    YouYuan,
+    "幼圆",
+    "Yuanti SC",
+    "YuanTi SC",
+    "STYuanti",
+    "PingFang SC",
+    "Microsoft YaHei",
+    sans-serif;
+  font-feature-settings: "kern" 1;
+  -webkit-font-smoothing: antialiased;
+  -webkit-user-select: none !important;
+  user-select: none !important;
+}
+
+.lyrics-type-fs,
+.lyrics-type-fs * {
+  -webkit-user-select: none !important;
+  user-select: none !important;
+}
+
+/* Soft emboss — light top-left + dark bottom-right, keep it subtle */
+.lyrics-fs-emboss {
+  text-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.14),
+    0 -1px 0 rgba(0, 0, 0, 0.35),
+    0 1px 2px rgba(0, 0, 0, 0.28);
+}
+
+.lyrics-fs-emboss-active {
+  text-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.22),
+    0 -1px 0 rgba(0, 0, 0, 0.4),
+    0 2px 3px rgba(0, 0, 0, 0.32);
+}
+
+/* Viewport-edge fade — Apple Music / NetEase style (not per-line stepped opacity) */
+.lyrics-fs-mask {
+  -webkit-mask-image: linear-gradient(
+    to bottom,
+    transparent 0%,
+    #000 16%,
+    #000 84%,
+    transparent 100%
+  );
+  mask-image: linear-gradient(
+    to bottom,
+    transparent 0%,
+    #000 16%,
+    #000 84%,
+    transparent 100%
+  );
 }
 
 /* Background */

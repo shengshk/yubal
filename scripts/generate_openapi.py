@@ -40,7 +40,10 @@ def main() -> int:
     """Generate OpenAPI schema."""
     print("Starting temporary API server...")
 
-    # Start server with temporary YUBAL_ROOT
+    # Start server with temporary data/config under a temp root
+    tmp = Path(tempfile.mkdtemp(prefix="yubal-openapi-"))
+    (tmp / "Download").mkdir()
+    (tmp / "config").mkdir()
     server_process = subprocess.Popen(
         [
             "uv",
@@ -56,7 +59,13 @@ def main() -> int:
             "--log-level",
             "error",
         ],
-        env=os.environ | {"YUBAL_ROOT": tempfile.gettempdir()},
+        env=os.environ
+        | {
+            "YUBAL_ROOT": str(tmp),
+            "YUBAL_DATA": str(tmp / "Download"),
+            "YUBAL_CONFIG": str(tmp / "config"),
+            "YUBAL_LIBRARY_ROOT": str(tmp),
+        },
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )

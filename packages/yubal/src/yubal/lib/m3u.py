@@ -79,14 +79,14 @@ def write_m3u(
     *,
     ascii_filenames: bool = False,
 ) -> Path:
-    """Write an M3U playlist file to the Playlists folder.
+    """Write an M3U playlist file into the playlist save folder.
 
-    Creates the Playlists directory if it doesn't exist.
+    Creates the directory if it doesn't exist.
     Sanitizes the playlist name for safe filesystem usage.
     Appends a truncated playlist ID to avoid filename collisions.
 
     Args:
-        base_path: Base directory for downloads (e.g., /music or ./data).
+        base_path: Playlist save folder (e.g., ./data/Liked Songs).
         playlist_name: Name of the playlist (will be sanitized for filename).
         playlist_id: Unique playlist ID (last 8 chars appended to filename).
         tracks: List of tuples containing (TrackMetadata, file_path) for each track.
@@ -97,20 +97,18 @@ def write_m3u(
 
     Example:
         >>> from pathlib import Path
-        >>> tracks = [(track_meta, Path("/music/Artist/2024 - Album/01 - Song.opus"))]
-        >>> m3u_path = write_m3u(Path("/music"), "My Favorites", "PLxyz123abc", tracks)
+        >>> tracks = [(track_meta, Path("/music/Liked/Artist/2024 - Album/01 - Song.opus"))]
+        >>> m3u_path = write_m3u(Path("/music/Liked"), "My Favorites", "PLxyz123abc", tracks)
         >>> print(m3u_path)
-        /music/_Playlists/My Favorites [z123abc].m3u
+        /music/Liked/My Favorites [z123abc].m3u
     """
-    # Create _Playlists directory
-    playlists_dir = base_path / "_Playlists"
-    playlists_dir.mkdir(parents=True, exist_ok=True)
+    base_path.mkdir(parents=True, exist_ok=True)
 
     # Build M3U file path with ID suffix
     filename = format_playlist_filename(
         playlist_name, playlist_id, ascii_filenames=ascii_filenames
     )
-    m3u_path = playlists_dir / f"{filename}.m3u"
+    m3u_path = base_path / f"{filename}.m3u"
 
     # Generate and write content
     content = generate_m3u(tracks, m3u_path, playlist_name)

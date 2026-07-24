@@ -165,13 +165,13 @@ class BufferHandler(logging.Handler):
             return "phase"
         if entry_data.get("stats") is not None:
             return "stats"
+        if entry_data.get("status") is not None:
+            return "status"
         if (
             entry_data.get("current") is not None
             and entry_data.get("total") is not None
         ):
             return "progress"
-        if entry_data.get("status") is not None:
-            return "status"
         if (
             entry_data.get("file_path") is not None
             or entry_data.get("file_type") is not None

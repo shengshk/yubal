@@ -15,6 +15,11 @@ class SubscriptionRepository:
         """Initialize repository with database engine."""
         self._engine = engine
 
+    @property
+    def engine(self) -> Engine:
+        """Underlying SQLAlchemy engine (shared with other repositories)."""
+        return self._engine
+
     def list(
         self,
         *,

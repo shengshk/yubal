@@ -106,3 +106,5 @@ class SearchResult(YTMusicModel):
     title: str
     artists: list[Artist] = Field(default_factory=list)
     album: AlbumRef | None = None
+    thumbnails: list[Thumbnail] = Field(default_factory=list)
+    duration_seconds: int | None = None

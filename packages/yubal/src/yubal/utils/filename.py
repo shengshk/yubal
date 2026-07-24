@@ -88,28 +88,36 @@ def build_track_path(
     title: str,
     *,
     ascii_filenames: bool = False,
+    video_id: str | None = None,
 ) -> Path:
     """Build a filesystem path for a track following the convention.
 
-    Creates a path structure: base/Artist/YEAR - Album/NN - Title
-    When year is unknown: base/Artist/Album/NN - Title
+    Creates a path structure: base/Artist/YEAR - Album/Artist - Title
+    When year is unknown: base/Artist/Album/Artist - Title
 
     Args:
         base: Base directory for downloads.
-        artist: Album artist name.
+        artist: Album artist name (used for both the artist folder and the
+            filename prefix; ``track_number`` is intentionally not part of
+            the filename anymore).
         year: Release year (or None for unknown).
         album: Album name.
-        track_number: Track number (or None for unknown).
+        track_number: Track number (or None for unknown; retained for
+            call-site compatibility but no longer used in the filename).
         title: Track title.
         ascii_filenames: If True, transliterate unicode to ASCII.
+        video_id: Optional YouTube video ID; when given, its last 6 chars
+            are appended as a ``[xxxxxx]`` suffix to resolve filename
+            collisions between distinct tracks that share Artist - Title.
 
     Returns:
         Full path to the track file (without extension).
 
     Example:
         >>> build_track_path(Path("/music"), "Artist", "2024", "Album", 1, "Song")
-        PosixPath('/music/Artist/2024 - Album/01 - Song')
+        PosixPath('/music/Artist/2024 - Album/Artist - Song')
     """
+    _ = track_number  # kept for call-site compatibility
     # Sanitize components
     safe_artist = (
         clean_filename(artist, ascii_filenames=ascii_filenames) or "Unknown Artist"
@@ -126,12 +134,15 @@ def build_track_path(
     album_folder = f"{year} - {safe_album}" if year else safe_album
     album_folder = _limit_path_component(album_folder)
 
-    # Build track filename
-    if track_number is not None:
-        track_name = f"{track_number:02d} - {safe_title}"
+    # Build track filename: "Artist - Title", optionally suffixed with
+    # "[last6]" of the video ID to disambiguate collisions.
+    base_name = f"{safe_artist} - {safe_title}"
+    if video_id:
+        suffix_id = clean_filename(video_id, ascii_filenames=ascii_filenames)
+        suffix_id = suffix_id[-6:] if len(suffix_id) > 6 else suffix_id
+        track_name = _limit_path_component_with_suffix(base_name, f" [{suffix_id}]")
     else:
-        track_name = safe_title
-    track_name = _limit_path_component(track_name)
+        track_name = _limit_path_component(base_name)
 
     return base / safe_artist / album_folder / track_name
 
@@ -151,7 +162,7 @@ def _build_flat_track_path(
 
     Args:
         base: Base directory for downloads.
-        folder: Subfolder name (e.g., "_Unmatched", "_Unofficial").
+        folder: Subfolder name (e.g., "Unmatched", "Unofficial").
         artist: Artist name from the video listing.
         title: Track title from the video listing.
         video_id: YouTube video ID (ensures filename uniqueness).
@@ -185,10 +196,10 @@ def build_unmatched_track_path(
     """Build a filesystem path for an unmatched track.
 
     Unmatched tracks are OMVs where no confident ATV album match was found.
-    They are stored in a flat ``_Unmatched`` folder with the video ID appended
+    They are stored in a flat ``Unmatched`` folder with the video ID appended
     to guarantee uniqueness.
 
-    Path structure: base/_Unmatched/Artist - Title [videoId]
+    Path structure: base/Unmatched/Artist - Title [videoId]
 
     Args:
         base: Base directory for downloads.
@@ -204,10 +215,10 @@ def build_unmatched_track_path(
         >>> build_unmatched_track_path(
         ...     Path("/music"), "Wiz Khalifa", "Mercury Retrograde", "-HJ0ZGkdlTk"
         ... )
-        PosixPath('/music/_Unmatched/Wiz Khalifa - Mercury Retrograde [-HJ0ZGkdlTk]')
+        PosixPath('/music/Unmatched/Wiz Khalifa - Mercury Retrograde [-HJ0ZGkdlTk]')
     """
     return _build_flat_track_path(
-        base, "_Unmatched", artist, title, video_id, ascii_filenames=ascii_filenames
+        base, "unmatched", artist, title, video_id, ascii_filenames=ascii_filenames
     )
 
 
@@ -222,9 +233,9 @@ def build_unofficial_track_path(
     """Build a filesystem path for an unofficial (UGC) track.
 
     UGC tracks have unreliable metadata and are stored in a flat
-    ``_Unofficial`` folder with the video ID appended for uniqueness.
+    ``Unofficial`` folder with the video ID appended for uniqueness.
 
-    Path structure: base/_Unofficial/Artist - Title [videoId]
+    Path structure: base/Unofficial/Artist - Title [videoId]
 
     Args:
         base: Base directory for downloads.
@@ -240,8 +251,8 @@ def build_unofficial_track_path(
         >>> build_unofficial_track_path(
         ...     Path("/music"), "Some User", "Cool Song", "abc123"
         ... )
-        PosixPath('/music/_Unofficial/Some User - Cool Song [abc123]')
+        PosixPath('/music/Unofficial/Some User - Cool Song [abc123]')
     """
     return _build_flat_track_path(
-        base, "_Unofficial", artist, title, video_id, ascii_filenames=ascii_filenames
+        base, "unofficial", artist, title, video_id, ascii_filenames=ascii_filenames
     )

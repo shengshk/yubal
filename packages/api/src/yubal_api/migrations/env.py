@@ -8,7 +8,18 @@ from sqlalchemy import engine_from_config, pool
 from sqlmodel import SQLModel
 
 # Import ALL models to register them with SQLModel.metadata
+from yubal_api.db.external_library import (  # noqa: F401
+    ExternalPlaylist,
+    ExternalRawTrack,
+)
+from yubal_api.db.preselect import PreselectTrack  # noqa: F401
 from yubal_api.db.subscription import Subscription  # noqa: F401
+from yubal_api.db.subscription_membership import (  # noqa: F401
+    SubscriptionSyncSnapshot,
+    SubscriptionTrack,
+)
+from yubal_api.db.sync_ledger import SyncLedgerEntry  # noqa: F401
+from yubal_api.db.track_catalog import TrackLocation, TrackRecord  # noqa: F401
 from yubal_api.settings import get_settings
 
 config = context.config

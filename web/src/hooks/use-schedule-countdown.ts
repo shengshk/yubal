@@ -1,71 +1,65 @@
 import { formatCountdown } from "@/lib/format";
-import { CronExpressionParser } from "cron-parser";
-import { useEffect, useMemo, useState } from "react";
-
-function computeNextRun(
-  cronExpression: string | null | undefined,
-  timezone: string | null | undefined,
-): Date | null {
-  if (!cronExpression || !timezone) return null;
-
-  try {
-    const interval = CronExpressionParser.parse(cronExpression, {
-      tz: timezone,
-      currentDate: new Date(),
-    });
-    return interval.next().toDate();
-  } catch {
-    return null;
-  }
-}
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 
 /**
- * Hook that computes the next run time from a cron expression and returns
- * a formatted countdown string that updates every second.
+ * Countdown to an absolute ISO datetime from the scheduler API
+ * (already includes per-subscription jitter).
+ *
+ * When the target is reached, ``onExpire`` fires once so the caller can
+ * fetch the next ``next_run_at`` immediately — never linger on "0后".
  */
 export function useScheduleCountdown(
-  cronExpression: string | null | undefined,
-  timezone: string | null | undefined,
+  targetIso: string | null | undefined,
+  onExpire?: () => void,
 ): string {
-  const [recomputeCount, setRecomputeCount] = useState(0);
+  const { t, i18n } = useTranslation();
   const nextRun = useMemo(() => {
-    void recomputeCount;
-    return computeNextRun(cronExpression, timezone);
-  }, [cronExpression, timezone, recomputeCount]);
+    if (!targetIso) return null;
+    const d = new Date(targetIso);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }, [targetIso]);
   const [tick, setTick] = useState(0);
+  const onExpireRef = useRef(onExpire);
+  onExpireRef.current = onExpire;
+  const expiredKeyRef = useRef<string | null>(null);
 
-  // Schedule recomputation when next run time passes
   useEffect(() => {
     if (!nextRun) return;
-
-    const ms = nextRun.getTime() - Date.now();
-    if (ms <= 0) {
-      // Already passed, schedule immediate recompute
-      const timeout = setTimeout(() => {
-        setRecomputeCount((count) => count + 1);
-      }, 0);
-      return () => clearTimeout(timeout);
-    }
-
-    // Schedule recomputation when next run time passes
-    const timeout = setTimeout(() => {
-      setRecomputeCount((count) => count + 1);
-    }, ms + 100); // Small buffer to ensure cron-parser moves to next interval
-
-    return () => clearTimeout(timeout);
-  }, [nextRun]);
-
-  // Tick every second for countdown display
-  useEffect(() => {
-    if (!nextRun) return;
-
     const interval = setInterval(() => {
-      setTick((t) => t + 1);
+      setTick((current) => current + 1);
     }, 1000);
-
     return () => clearInterval(interval);
   }, [nextRun]);
 
+  useEffect(() => {
+    if (!nextRun || !targetIso) {
+      expiredKeyRef.current = null;
+      return;
+    }
+
+    const fireExpire = () => {
+      if (expiredKeyRef.current === targetIso) return;
+      expiredKeyRef.current = targetIso;
+      onExpireRef.current?.();
+    };
+
+    const ms = nextRun.getTime() - Date.now();
+    if (ms <= 0) {
+      fireExpire();
+      return;
+    }
+
+    expiredKeyRef.current = null;
+    const timer = window.setTimeout(fireExpire, ms + 50);
+    return () => window.clearTimeout(timer);
+  }, [nextRun, targetIso]);
+
   void tick;
-  return formatCountdown(nextRun);
+  void i18n.language;
+
+  if (!nextRun) return "—";
+  const ms = nextRun.getTime() - Date.now();
+  if (ms <= 0) return "—";
+  return formatCountdown(nextRun, t);
 }

@@ -100,15 +100,15 @@ class TestPlaylistArtifactsService:
         tmp_path: Path,
     ) -> None:
         """Should generate both M3U and cover files."""
-        mock_m3u.return_value = tmp_path / "_Playlists" / "Test Playlist.m3u"
-        mock_cover.return_value = tmp_path / "_Playlists" / "Test Playlist.jpg"
+        mock_m3u.return_value = tmp_path / "Test Playlist.m3u"
+        mock_cover.return_value = (tmp_path / "Test Playlist.jpg", "written")
 
         m3u_path, cover_path = composer.compose(
             tmp_path, playlist_info, download_results
         )
 
-        assert m3u_path == tmp_path / "_Playlists" / "Test Playlist.m3u"
-        assert cover_path == tmp_path / "_Playlists" / "Test Playlist.jpg"
+        assert m3u_path == tmp_path / "Test Playlist.m3u"
+        assert cover_path == tmp_path / "Test Playlist.jpg"
         mock_m3u.assert_called_once()
         mock_cover.assert_called_once()
 
@@ -124,7 +124,7 @@ class TestPlaylistArtifactsService:
         tmp_path: Path,
     ) -> None:
         """Should skip M3U generation when disabled."""
-        mock_cover.return_value = tmp_path / "_Playlists" / "Test Playlist.jpg"
+        mock_cover.return_value = (tmp_path / "Test Playlist.jpg", "written")
 
         m3u_path, cover_path = composer.compose(
             tmp_path, playlist_info, download_results, generate_m3u=False
@@ -147,7 +147,7 @@ class TestPlaylistArtifactsService:
         tmp_path: Path,
     ) -> None:
         """Should skip cover when disabled."""
-        mock_m3u.return_value = tmp_path / "_Playlists" / "Test Playlist.m3u"
+        mock_m3u.return_value = tmp_path / "Test Playlist.m3u"
 
         m3u_path, cover_path = composer.compose(
             tmp_path, playlist_info, download_results, save_cover=False
@@ -170,7 +170,7 @@ class TestPlaylistArtifactsService:
         tmp_path: Path,
     ) -> None:
         """Should skip M3U for album playlists when configured."""
-        mock_cover.return_value = tmp_path / "_Playlists" / "Test Album.jpg"
+        mock_cover.return_value = (tmp_path / "Test Album.jpg", "written")
 
         m3u_path, cover_path = composer.compose(
             tmp_path, album_playlist_info, download_results, skip_album_m3u=True
@@ -192,8 +192,8 @@ class TestPlaylistArtifactsService:
         tmp_path: Path,
     ) -> None:
         """Should generate M3U for album playlists when skip_album_m3u=False."""
-        mock_m3u.return_value = tmp_path / "_Playlists" / "Test Album.m3u"
-        mock_cover.return_value = tmp_path / "_Playlists" / "Test Album.jpg"
+        mock_m3u.return_value = tmp_path / "Test Album.m3u"
+        mock_cover.return_value = (tmp_path / "Test Album.jpg", "written")
 
         m3u_path, _ = composer.compose(
             tmp_path, album_playlist_info, download_results, skip_album_m3u=False

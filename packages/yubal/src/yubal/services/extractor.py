@@ -1,7 +1,7 @@
 """Metadata extraction service."""
 
 import logging
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 
 from yubal.client import YTMusicProtocol
@@ -21,6 +21,40 @@ logger = logging.getLogger(__name__)
 SUPPORTED_VIDEO_TYPES = frozenset(
     {VideoType.ATV, VideoType.OMV, VideoType.OFFICIAL_SOURCE_MUSIC}
 )
+
+
+def select_tracks_for_round(
+    tracks: list[PlaylistTrack],
+    max_items: int | None,
+    *,
+    is_already_local: Callable[[str], bool] | None = None,
+) -> tuple[list[PlaylistTrack], bool]:
+    """Select tracks for one sync round under a max_items budget.
+
+    When ``is_already_local`` is provided, ``max_items`` limits how many
+    **not-yet-local** tracks are taken (already-local tracks are always kept so
+    they can hardlink/skip). Without a local check, falls back to a prefix slice.
+
+    Returns:
+        (selected_tracks, limited) where limited means some playlist tracks
+        were deferred to a later round.
+    """
+    if not max_items or max_items >= len(tracks):
+        return tracks, False
+
+    if is_already_local is None:
+        return tracks[:max_items], True
+
+    selected: list[PlaylistTrack] = []
+    new_slots = 0
+    for track in tracks:
+        video_id = track.video_id
+        if video_id and is_already_local(video_id):
+            selected.append(track)
+        elif new_slots < max_items:
+            selected.append(track)
+            new_slots += 1
+    return selected, len(selected) < len(tracks)
 
 
 def _format_artists(artists: list[Artist]) -> str:
@@ -120,6 +154,7 @@ class MetadataExtractorService:
         max_items: int | None = None,
         cancel_token: CancelToken | None = None,
         cache: ExtractionCache | None = None,
+        is_already_local: Callable[[str], bool] | None = None,
     ) -> Iterator[ExtractProgress]:
         """Extract metadata from any YouTube Music URL with progress updates.
 
@@ -138,12 +173,16 @@ class MetadataExtractorService:
 
         Args:
             url: YouTube Music URL (single track, album, or playlist).
-            max_items: Maximum number of tracks to extract. If None, extracts
-                all tracks. Useful for testing or quick previews. Ignored for
-                single tracks.
+            max_items: Per-round cap. With ``is_already_local``, limits how many
+                not-yet-local tracks are extracted this round (already-local
+                tracks are still included for hardlink/skip). Without it, takes
+                the first N tracks. None extracts all.
             cancel_token: Optional token for cancellation support. Checked
                 after playlist fetch, after classification, and before/after
                 each track extraction.
+            cache: Optional extraction cache.
+            is_already_local: Optional predicate ``video_id -> bool`` used with
+                max_items for "fill missing" round semantics.
 
         Yields:
             ExtractProgress with current/total counts and the extracted track.
@@ -156,10 +195,6 @@ class MetadataExtractorService:
             PlaylistNotFoundError: If playlist doesn't exist.
             TrackNotFoundError: If track doesn't exist.
             UpstreamAPIError: If API requests fail.
-
-        Example:
-            >>> for progress in extractor.extract(url):
-            ...     print(f"[{progress.current}/{progress.total}]")
         """
         # Check if this is a single track URL
         video_id = parse_video_id(url)
@@ -176,15 +211,21 @@ class MetadataExtractorService:
         playlist_total = len(playlist.tracks) + playlist.unavailable_count
         unavailable_count = playlist.unavailable_count
 
-        # Apply max_items limit if specified
-        tracks = playlist.tracks
-        limited = False
-        if max_items and max_items < len(playlist.tracks):
-            logger.debug("Limiting to %d of %d tracks", max_items, playlist_total)
-            tracks = tracks[:max_items]
+        tracks, limited = select_tracks_for_round(
+            playlist.tracks,
+            max_items,
+            is_already_local=is_already_local,
+        )
+        if limited:
+            logger.debug(
+                "Round limited to %d of %d tracks (max_items=%s, local_aware=%s)",
+                len(tracks),
+                playlist_total,
+                max_items,
+                is_already_local is not None,
+            )
             # Don't report unavailable count when truncating (outside scope)
             unavailable_count = 0
-            limited = True
 
         total = len(tracks)
         logger.debug(
@@ -530,7 +571,7 @@ class MetadataExtractorService:
         we get complete metadata (track numbers, year, album artists, etc).
 
         Tracks where no confident album match is found are marked as unmatched
-        and routed to the ``_Unmatched/`` folder by the downloader.
+        and routed to the ``Unmatched/`` folder by the downloader.
 
         Args:
             track: Playlist track to process.
@@ -567,7 +608,7 @@ class MetadataExtractorService:
         album_id = track.album.id if track.album else None
         search_atv_id: str | None = None
 
-        # OSM tracks without album: skip search, route to _Unmatched/.
+        # OSM tracks without album: skip search, route to Unmatched/.
         # These are channel uploads (ambient, covers, loops) — searching would
         # match a different version (e.g., 3 min album cut vs 1 hour loop).
         if not album_id and video_type == VideoType.OFFICIAL_SOURCE_MUSIC:
@@ -713,7 +754,7 @@ class MetadataExtractorService:
                     title_match.similarity,
                 )
                 logger.warning(
-                    "'%s' by %s -> _Unmatched/ (no confident album match)",
+                    "'%s' by %s -> Unmatched/ (no confident album match)",
                     track.title,
                     _format_artists(track.artists),
                 )
@@ -739,7 +780,7 @@ class MetadataExtractorService:
                     artist_match.best_score,
                 )
                 logger.warning(
-                    "'%s' by %s -> _Unmatched/ (no confident album match)",
+                    "'%s' by %s -> Unmatched/ (no confident album match)",
                     track.title,
                     _format_artists(track.artists),
                 )
@@ -762,7 +803,7 @@ class MetadataExtractorService:
                 artists,
             )
             logger.warning(
-                "'%s' by %s -> _Unmatched/ (no confident album match)",
+                "'%s' by %s -> Unmatched/ (no confident album match)",
                 track.title,
                 artists,
             )

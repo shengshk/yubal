@@ -20,6 +20,14 @@ def main() -> None:
         host=settings.host,
         port=settings.port,
         reload=settings.reload,
+        reload_dirs=(
+            [
+                "/app/packages/api/src",
+                "/app/packages/yubal/src",
+            ]
+            if settings.reload
+            else None
+        ),
     )
 
 

@@ -3,12 +3,14 @@ import { Button } from "@heroui/react";
 import { MoonIcon, SunIcon } from "lucide-react";
 import { useCallback, useRef } from "react";
 import { flushSync } from "react-dom";
+import { useTranslation } from "react-i18next";
 
 type Props = {
   duration?: number;
 };
 
 export function AnimatedThemeToggler({ duration = 400 }: Props) {
+  const { t } = useTranslation();
   const { theme, toggle } = useTheme();
   const buttonRef = useRef<HTMLButtonElement>(null);
 
@@ -68,7 +70,7 @@ export function AnimatedThemeToggler({ duration = 400 }: Props) {
       isIconOnly
       size="sm"
       variant="light"
-      aria-label="Toggle theme"
+      aria-label={t("nav.toggleTheme")}
       onPress={handleToggle}
     >
       {theme === "dark" ? (

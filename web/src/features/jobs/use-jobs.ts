@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 import {
   cancelJob as cancelJobApi,
   createJob,
@@ -14,6 +15,7 @@ const SSE_URL = `${basePath}/api/jobs/sse`;
 const RECONNECT_DELAYS = [1000, 2000, 4000, 8000, 16000] as const;
 
 export function useJobsState() {
+  const { t } = useTranslation();
   const [jobs, setJobs] = useState<Job[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [isOffline, setIsOffline] = useState(false);
@@ -98,12 +100,16 @@ export function useJobsState() {
     };
   }, []);
 
-  const startJob = useCallback(async (url: string, maxItems?: number) => {
-    const result = await createJob(url, maxItems);
-    if (!result.success) {
-      showErrorToast("Download failed", result.error);
-    }
-  }, []);
+  const startJob = useCallback(
+    async (url: string) => {
+      const result = await createJob(url);
+      if (!result.success && result.code !== "direct_download_limit_exceeded") {
+        showErrorToast(t("downloads.failedTitle"), result.error);
+      }
+      return result;
+    },
+    [t],
+  );
 
   const cancelJob = useCallback(async (jobId: string) => {
     try {

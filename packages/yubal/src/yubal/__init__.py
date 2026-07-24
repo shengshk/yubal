@@ -153,6 +153,7 @@ def create_downloader(
 def create_playlist_downloader(
     config: PlaylistDownloadConfig,
     cookies_path: Path | None = None,
+    folder_presence: object | None = None,
 ) -> PlaylistDownloadService:
     """Create a configured playlist download service.
 
@@ -190,7 +191,11 @@ def create_playlist_downloader(
         service = create_playlist_downloader(config, cookies_path=Path("cookies.txt"))
         ```
     """
-    return PlaylistDownloadService(config, cookies_path=cookies_path)
+    return PlaylistDownloadService(
+        config,
+        cookies_path=cookies_path,
+        folder_presence=folder_presence,
+    )
 
 
 __all__ = [

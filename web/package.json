@@ -21,11 +21,14 @@
     "@heroui/react": "^2.8.10",
     "@tanstack/react-router": "^1.170.15",
     "cron-parser": "^5.5.0",
+    "i18next": "^26.3.6",
     "lucide-react": "^0.577.0",
     "motion": "^12.40.0",
     "openapi-fetch": "0.17.0",
+    "pinyin-pro": "^3.27.0",
     "react": "19.2.4",
     "react-dom": "19.2.4",
+    "react-i18next": "^17.0.10",
     "ts-pattern": "^5.9.0"
   },
   "devDependencies": {

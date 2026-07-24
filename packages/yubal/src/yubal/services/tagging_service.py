@@ -31,7 +31,11 @@ class AudioFileTaggingService:
     # ============================================================================
 
     def apply_metadata_tags(
-        self, path: Path, track: TrackMetadata, cover: bytes | None = None
+        self,
+        path: Path,
+        track: TrackMetadata,
+        cover: bytes | None = None,
+        lyrics: str | None = None,
     ) -> None:
         """Apply complete metadata tags to an audio file.
 
@@ -39,33 +43,23 @@ class AudioFileTaggingService:
         audio file in the correct format for that file type. The mediafile library
         handles format-specific details (ID3v2 for MP3, Vorbis for FLAC, etc.).
 
-        Why separate steps: Breaking tagging into logical sections (basic metadata,
-        track numbers, year, cover art) makes it easier to debug issues and add
-        format-specific handling in the future.
-
         What gets written:
         - Basic metadata: title, artist(s), album, album artist(s)
         - Track numbering: track position and total tracks
         - Release year: parsed from string to integer
         - Cover art: JPEG or PNG embedded image
+        - Lyrics: embedded lyrics text when provided
 
         Args:
             path: Path to the audio file to tag.
             track: Complete track metadata to write.
             cover: Optional cover art bytes (JPEG or PNG). The Image class
                 auto-detects MIME type from magic bytes.
+            lyrics: Optional lyrics text to embed (LRC or plain).
 
         Raises:
             Exception: If tagging fails. Caller should handle gracefully to avoid
                 stopping the entire download process due to one tagging error.
-
-        Example:
-            >>> tagger = AudioFileTaggingService()
-            >>> tagger.apply_metadata_tags(
-            ...     Path("track.mp3"),
-            ...     track_metadata,
-            ...     cover_bytes
-            ... )
         """
         audio = MediaFile(path)
 
@@ -73,6 +67,7 @@ class AudioFileTaggingService:
         self._write_track_numbering(audio, track)
         self._write_year_metadata(audio, track)
         self._write_cover_art(audio, cover)
+        self._write_lyrics(audio, lyrics)
 
         audio.save()
         logger.debug("Successfully tagged: %s", path)
@@ -170,13 +165,23 @@ class AudioFileTaggingService:
         if cover:
             audio.images = [Image(data=cover)]
 
+    def _write_lyrics(self, audio: MediaFile, lyrics: str | None) -> None:
+        """Embed lyrics text into the audio file when provided."""
+        if lyrics and lyrics.strip():
+            audio.lyrics = lyrics.strip()
+
 
 # ============================================================================
 # PUBLIC API - Convenience function for tagging audio files
 # ============================================================================
 
 
-def tag_track(path: Path, track: TrackMetadata, cover: bytes | None = None) -> None:
+def tag_track(
+    path: Path,
+    track: TrackMetadata,
+    cover: bytes | None = None,
+    lyrics: str | None = None,
+) -> None:
     """Apply metadata tags to audio file.
 
     Convenience function that wraps AudioFileTaggingService for simple use cases.
@@ -185,9 +190,10 @@ def tag_track(path: Path, track: TrackMetadata, cover: bytes | None = None) -> N
         path: Path to the audio file.
         track: Track metadata to apply.
         cover: Optional cover art bytes (JPEG or PNG).
+        lyrics: Optional lyrics text to embed.
 
     Raises:
         Exception: If tagging fails (caller should handle gracefully).
     """
     service = AudioFileTaggingService()
-    service.apply_metadata_tags(path, track, cover)
+    service.apply_metadata_tags(path, track, cover, lyrics)

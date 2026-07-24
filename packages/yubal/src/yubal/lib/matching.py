@@ -31,8 +31,9 @@ _ALBUM_SEARCH_ARTIST_THRESHOLD = 70  # Minimum similarity for artist matching
 _FUZZY_MATCH_HIGH_CONFIDENCE = 80  # Auto-accept threshold
 _FUZZY_MATCH_LOW_CONFIDENCE = 50  # Minimum acceptable threshold
 
-# Common video suffixes to strip when comparing titles (case-insensitive)
-# These are added by YouTube for music videos but aren't part of the actual song title
+# Official-video suffixes to strip when comparing titles (case-insensitive).
+# Live / DJ / 现场 are NOT stripped here — those are real version markers and must
+# stay distinct under strict matching (relaxed mode may use base_similarity instead).
 _VIDEO_SUFFIXES = (
     "(official video)",
     "(official music video)",
@@ -45,6 +46,15 @@ _VIDEO_SUFFIXES = (
     "(visualizer)",
     "(audio)",
     "(video)",
+)
+
+# Alternate-version markers: studio originals must not accept these under strict mode.
+_VERSION_MARKER_RE = re.compile(
+    r"(?:"
+    r"\blive\b|\bdj\b|\bremix\b|\bcover\b|\bkaraoke\b|\binstrumental\b|"
+    r"现场|演唱会|翻唱|伴奏|dj版|live版|现场版"
+    r")",
+    re.IGNORECASE,
 )
 
 
@@ -130,11 +140,17 @@ class FuzzyTrackMatch:
 # ============================================================================
 
 
+def has_version_marker(title: str) -> bool:
+    """Return True when a title looks like Live / DJ / remix / 现场 / etc."""
+    return bool(_VERSION_MARKER_RE.search(title or ""))
+
+
 def normalize_title(title: str) -> str:
-    """Normalize a title by stripping common video suffixes.
+    """Normalize a title by stripping common official-video suffixes.
 
     OMV tracks often have suffixes like "(Official Video)" that don't appear
     in the canonical track name. This function strips those for comparison.
+    Live / DJ / 现场 markers are preserved (see ``has_version_marker``).
 
     Args:
         title: Original track title.
@@ -163,10 +179,11 @@ def extract_base_title(title: str) -> str:
     Returns:
         Base title with all parenthetical content removed.
     """
-    # Remove all parenthetical content: (feat. X), (Radio Edit), etc.
+    # Remove all parenthetical content: (feat. X), (Radio Edit), （现场）, etc.
     base = re.sub(r"\s*\([^)]*\)\s*", " ", title)
-    # Also handle square brackets: [Explicit], [Remastered], etc.
     base = re.sub(r"\s*\[[^\]]*\]\s*", " ", base)
+    base = re.sub(r"\s*（[^）]*）\s*", " ", base)
+    base = re.sub(r"\s*【[^】]*】\s*", " ", base)
     return base.strip()
 
 

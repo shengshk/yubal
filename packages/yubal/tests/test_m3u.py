@@ -55,7 +55,7 @@ class TestGenerateM3U:
     ) -> None:
         """Should generate M3U content with proper header."""
         track_path = tmp_path / "Radiohead" / "1997 - OK Computer" / "01 - Airbag.opus"
-        m3u_path = tmp_path / "_Playlists" / "My Playlist.m3u"
+        m3u_path = tmp_path / "My Playlist.m3u"
 
         content = generate_m3u([(sample_track, track_path)], m3u_path, "My Playlist")
 
@@ -66,7 +66,7 @@ class TestGenerateM3U:
     ) -> None:
         """Should emit #PLAYLIST: directive as the second line."""
         track_path = tmp_path / "Radiohead" / "1997 - OK Computer" / "01 - Airbag.opus"
-        m3u_path = tmp_path / "_Playlists" / "Liked Songs.m3u"
+        m3u_path = tmp_path / "Liked Songs.m3u"
 
         content = generate_m3u([(sample_track, track_path)], m3u_path, "Liked Songs")
 
@@ -79,7 +79,7 @@ class TestGenerateM3U:
     ) -> None:
         """Should preserve unicode in #PLAYLIST: directive without sanitization."""
         track_path = tmp_path / "Radiohead" / "1997 - OK Computer" / "01 - Airbag.opus"
-        m3u_path = tmp_path / "_Playlists" / "Musique.m3u"
+        m3u_path = tmp_path / "Musique.m3u"
 
         content = generate_m3u(
             [(sample_track, track_path)], m3u_path, "Musique Française"
@@ -92,7 +92,7 @@ class TestGenerateM3U:
     ) -> None:
         """Should generate EXTINF lines with duration and display name."""
         track_path = tmp_path / "Radiohead" / "1997 - OK Computer" / "01 - Airbag.opus"
-        m3u_path = tmp_path / "_Playlists" / "My Playlist.m3u"
+        m3u_path = tmp_path / "My Playlist.m3u"
 
         content = generate_m3u([(sample_track, track_path)], m3u_path, "My Playlist")
 
@@ -103,12 +103,12 @@ class TestGenerateM3U:
     ) -> None:
         """Should use paths relative to M3U file location."""
         track_path = tmp_path / "Radiohead" / "1997 - OK Computer" / "01 - Airbag.opus"
-        m3u_path = tmp_path / "_Playlists" / "My Playlist.m3u"
+        m3u_path = tmp_path / "My Playlist.m3u"
 
         content = generate_m3u([(sample_track, track_path)], m3u_path, "My Playlist")
 
-        # Path should be relative and go up from _Playlists to find Radiohead
-        assert "../Radiohead/1997 - OK Computer/01 - Airbag.opus" in content
+        # Path should be relative and be relative to the save folder
+        assert "Radiohead/1997 - OK Computer/01 - Airbag.opus" in content
 
     def test_handles_multiple_tracks(
         self,
@@ -119,7 +119,7 @@ class TestGenerateM3U:
         """Should handle multiple tracks in correct order."""
         track1_path = tmp_path / "Radiohead" / "1997 - OK Computer" / "01 - Airbag.opus"
         track2_path = tmp_path / "Coldplay" / "2000 - Parachutes" / "03 - Sparks.opus"
-        m3u_path = tmp_path / "_Playlists" / "My Playlist.m3u"
+        m3u_path = tmp_path / "My Playlist.m3u"
 
         tracks = [
             (sample_track, track1_path),
@@ -135,16 +135,16 @@ class TestGenerateM3U:
         assert lines[0] == "#EXTM3U"
         assert lines[1] == "#PLAYLIST:My Playlist"
         assert lines[2] == "#EXTINF:-1,Radiohead - Airbag"
-        assert "../Radiohead/" in lines[3]
+        assert "Radiohead/" in lines[3]
         assert lines[4] == "#EXTINF:-1,Coldplay / Guest Artist - Sparks"
-        assert "../Coldplay/" in lines[5]
+        assert "Coldplay/" in lines[5]
 
     def test_multiple_artists_joined_with_slash(
         self, sample_track_multiple_artists: TrackMetadata, tmp_path: Path
     ) -> None:
         """Should join multiple artists with slash delimiter."""
         track_path = tmp_path / "Coldplay" / "2000 - Parachutes" / "03 - Sparks.opus"
-        m3u_path = tmp_path / "_Playlists" / "My Playlist.m3u"
+        m3u_path = tmp_path / "My Playlist.m3u"
 
         content = generate_m3u(
             [(sample_track_multiple_artists, track_path)], m3u_path, "My Playlist"
@@ -154,7 +154,7 @@ class TestGenerateM3U:
 
     def test_empty_tracks_list(self, tmp_path: Path) -> None:
         """Should generate valid M3U with header and #PLAYLIST: for empty tracks."""
-        m3u_path = tmp_path / "_Playlists" / "Empty.m3u"
+        m3u_path = tmp_path / "Empty.m3u"
 
         content = generate_m3u([], m3u_path, "Empty")
 
@@ -165,7 +165,7 @@ class TestGenerateM3U:
     ) -> None:
         """Should ensure content ends with a trailing newline."""
         track_path = tmp_path / "Radiohead" / "1997 - OK Computer" / "01 - Airbag.opus"
-        m3u_path = tmp_path / "_Playlists" / "My Playlist.m3u"
+        m3u_path = tmp_path / "My Playlist.m3u"
 
         content = generate_m3u([(sample_track, track_path)], m3u_path, "My Playlist")
 
@@ -178,15 +178,15 @@ class TestWriteM3U:
     def test_creates_playlists_directory(
         self, sample_track: TrackMetadata, tmp_path: Path
     ) -> None:
-        """Should create _Playlists directory if it doesn't exist."""
+        """Should create the save folder if it doesn't exist."""
         track_path = tmp_path / "Radiohead" / "1997 - OK Computer" / "01 - Airbag.opus"
 
-        write_m3u(
+        m3u_path = write_m3u(
             tmp_path, "My Favorites", "PLtest12345678", [(sample_track, track_path)]
         )
 
-        assert (tmp_path / "_Playlists").exists()
-        assert (tmp_path / "_Playlists").is_dir()
+        assert m3u_path.parent == tmp_path
+        assert m3u_path.exists()
 
     def test_writes_m3u_file(self, sample_track: TrackMetadata, tmp_path: Path) -> None:
         """Should write M3U file with correct content."""
@@ -210,7 +210,7 @@ class TestWriteM3U:
             tmp_path, "My Favorites", "PLtest12345678", [(sample_track, track_path)]
         )
 
-        assert m3u_path == tmp_path / "_Playlists" / "My Favorites [12345678].m3u"
+        assert m3u_path == tmp_path / "My Favorites [12345678].m3u"
 
     def test_sanitizes_playlist_name(
         self, sample_track: TrackMetadata, tmp_path: Path
@@ -267,9 +267,7 @@ class TestWriteM3U:
     ) -> None:
         """Should overwrite existing M3U file."""
         track_path = tmp_path / "Radiohead" / "1997 - OK Computer" / "01 - Airbag.opus"
-        playlists_dir = tmp_path / "_Playlists"
-        playlists_dir.mkdir()
-        existing_file = playlists_dir / "My Favorites [12345678].m3u"
+        existing_file = tmp_path / "My Favorites [12345678].m3u"
         existing_file.write_text("old content")
 
         m3u_path = write_m3u(
@@ -297,7 +295,7 @@ class TestWriteM3U:
     def test_relative_paths_go_up_from_playlists(
         self, sample_track: TrackMetadata, tmp_path: Path
     ) -> None:
-        """Should generate relative paths that go up from _Playlists directory."""
+        """Should generate relative paths that be relative within the save folder."""
         # Create the actual track path structure
         track_dir = tmp_path / "Radiohead" / "1997 - OK Computer"
         track_dir.mkdir(parents=True)
@@ -309,8 +307,8 @@ class TestWriteM3U:
         )
 
         content = m3u_path.read_text(encoding="utf-8")
-        # The relative path should go up one directory (from _Playlists)
-        assert "../Radiohead/1997 - OK Computer/01 - Airbag.opus" in content
+        # The relative path should point at Artist/Album under the save folder
+        assert "Radiohead/1997 - OK Computer/01 - Airbag.opus" in content
 
     def test_different_ids_create_different_files(
         self, sample_track: TrackMetadata, tmp_path: Path

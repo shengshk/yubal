@@ -1,222 +1,97 @@
-import { listSubscriptions } from "@/api/subscriptions";
-import { AnimatedThemeToggler } from "@/components/magicui/animated-theme-toggler";
-import { CookieDropdown } from "@/features/cookies/cookie-dropdown";
-import { useCookies } from "@/features/cookies/use-cookies";
+import { SettingsDrawer } from "@/features/settings/settings-drawer";
+import { LyricsAdjustLeaveModal } from "@/features/sync/lyrics-adjust";
+import { LyricsEditorModal } from "@/features/sync/lyrics-editor-modal";
+import {
+  CompactLyricsDisplay,
+  FullscreenLyrics,
+} from "@/features/sync/lyrics-panel";
+import { useLibraryAudio } from "@/features/sync/library-audio";
 import { useJobs } from "@/features/jobs/jobs-context";
 import { useVersionCheck } from "@/hooks/use-version-check";
-import {
-  Button,
-  Chip,
-  Link as HeroUILink,
-  Navbar,
-  NavbarBrand,
-  NavbarContent,
-  NavbarItem,
-  NavbarMenu,
-  NavbarMenuItem,
-  NavbarMenuToggle,
-} from "@heroui/react";
-import { Link, useRouterState } from "@tanstack/react-router";
-import {
-  Disc3Icon,
-  DownloadIcon,
-  ListMusicIcon,
-  RocketIcon,
-  StarIcon,
-} from "lucide-react";
-import { useEffect, useState } from "react";
-
-const navItems = [
-  { label: "Downloads", startIcon: DownloadIcon, href: "/" },
-  { label: "My playlists", startIcon: ListMusicIcon, href: "/playlists" },
-];
+import { Button, Navbar, NavbarBrand, NavbarContent, NavbarItem } from "@heroui/react";
+import { Link } from "@tanstack/react-router";
+import { Disc3Icon, RocketIcon, SettingsIcon } from "lucide-react";
+import { useState } from "react";
+import { useTranslation } from "react-i18next";
 
 export function Header() {
-  const [isMenuOpen, setIsMenuOpen] = useState(false);
-  const [subscriptionCount, setSubscriptionCount] = useState(0);
-  const routerState = useRouterState();
-  const currentPath = routerState.location.pathname;
-  const {
-    cookiesConfigured,
-    isUploading,
-    isDeleting,
-    fileInputRef,
-    handleFileSelect,
-    handleDropdownAction,
-    triggerFileUpload,
-  } = useCookies();
+  const { t } = useTranslation();
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const audio = useLibraryAudio();
   const { data: versionInfo } = useVersionCheck();
   const { hasActiveJobs } = useJobs();
 
-  useEffect(() => {
-    listSubscriptions().then((subs) => setSubscriptionCount(subs.length));
-  }, []);
-
   return (
-    <Navbar
-      isMenuOpen={isMenuOpen}
-      onMenuOpenChange={setIsMenuOpen}
-      classNames={{
-        wrapper: "max-w-5xl",
-        brand: "grow-0",
-      }}
-    >
-      {/* Mobile menu toggle + Brand */}
-      <NavbarContent className="sm:hidden" justify="start">
-        <NavbarMenuToggle
-          aria-label={isMenuOpen ? "Close menu" : "Open menu"}
-        />
-      </NavbarContent>
+    <>
+      <Navbar
+        classNames={{
+          wrapper: "max-w-5xl",
+          brand: "grow-0",
+        }}
+      >
+        <NavbarBrand>
+          <Link to="/" className="flex items-center">
+            <Disc3Icon
+              className={`text-primary h-7 w-7 ${hasActiveJobs ? "animate-[spin_4s_linear_infinite] motion-reduce:animate-none" : ""}`}
+            />
+            <p className="text-foreground ml-2 text-xl font-bold">yubal</p>
+          </Link>
+        </NavbarBrand>
 
-      <NavbarBrand className="mr-4">
-        <Link to="/" className="flex items-center">
-          <Disc3Icon
-            className={`text-primary h-7 w-7 ${hasActiveJobs ? "animate-[spin_4s_linear_infinite] motion-reduce:animate-none" : ""}`}
-          />
-          <p className="text-foreground ml-2 text-xl font-bold">yubal</p>
-        </Link>
-      </NavbarBrand>
-
-      {/* Desktop navigation */}
-      <NavbarContent justify="start" className="hidden gap-2 sm:flex">
-        {navItems.map((item) => (
-          <NavbarItem
-            key={item.href}
-            className="group"
-            isActive={currentPath === item.href}
-          >
-            <Link
-              to={item.href}
-              className="text-foreground-400 text-small group-data-[active=true]:text-foreground tap-highlight-transparent active:opacity-disabled inline-flex items-center gap-2 rounded-lg px-3 py-1.5 font-medium hover:opacity-80"
-            >
-              <item.startIcon className="h-4 w-4" />
-              {item.label}
-              {item.href === "/playlists" && subscriptionCount > 0 && (
-                <Chip
-                  size="sm"
-                  variant="flat"
-                  radius="sm"
-                  className="font-mono"
-                  classNames={{
-                    content:
-                      "text-foreground-400 text-xs group-data-[active=true]:text-foreground",
-                  }}
-                >
-                  {subscriptionCount}
-                </Chip>
-              )}
-            </Link>
-          </NavbarItem>
-        ))}
-      </NavbarContent>
-
-      {/* Actions */}
-      <NavbarContent className="items-center gap-2" justify="end">
-        {versionInfo?.updateAvailable && (
-          <NavbarItem className="hidden sm:flex">
+        <NavbarContent
+          justify="end"
+          className="min-w-0 max-w-[min(28rem,52vw)] grow-0 basis-auto items-center gap-0.5"
+        >
+          {audio.lyricsHeaderVisible ? (
+            <NavbarItem className="min-w-0">
+              <CompactLyricsDisplay
+                onOpenFullscreen={() => audio.openLyricsFullscreen()}
+              />
+            </NavbarItem>
+          ) : null}
+          {versionInfo?.updateAvailable && (
+            <NavbarItem className="shrink-0">
+              <Button
+                as="a"
+                disableAnimation
+                size="sm"
+                href={versionInfo.releaseUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                variant="flat"
+                color="success"
+                radius="lg"
+                startContent={<RocketIcon className="h-4 w-4" />}
+                className="text-small font-mono"
+              >
+                {versionInfo.latestVersion}
+              </Button>
+            </NavbarItem>
+          )}
+          <NavbarItem className="shrink-0">
             <Button
-              as="a"
-              disableAnimation
+              isIconOnly
               size="sm"
-              href={versionInfo.releaseUrl}
-              target="_blank"
-              rel="noopener noreferrer"
-              variant="flat"
-              color="success"
+              variant="light"
               radius="lg"
-              startContent={<RocketIcon className="h-4 w-4" />}
-              className="text-small font-mono"
+              aria-label={t("settings.title")}
+              title={t("settings.title")}
+              onPress={() => setSettingsOpen(true)}
+              className="h-8 min-w-8 w-8"
             >
-              {versionInfo.latestVersion}
+              <SettingsIcon className="h-5 w-5" />
             </Button>
           </NavbarItem>
-        )}
-        <NavbarItem className="hidden sm:flex">
-          <Button
-            as="a"
-            disableAnimation
-            size="sm"
-            href="https://github.com/guillevc/yubal"
-            target="_blank"
-            rel="noopener noreferrer"
-            variant="light"
-            radius="lg"
-            startContent={
-              <StarIcon
-                className="h-4 w-4 fill-amber-400 text-amber-400 dark:fill-amber-300 dark:text-amber-300"
-                strokeWidth={1}
-              />
-            }
-            className="text-small"
-          >
-            Star on GitHub
-          </Button>
-        </NavbarItem>
-        <NavbarItem className="hidden sm:flex">
-          <CookieDropdown
-            variant="desktop"
-            cookiesConfigured={cookiesConfigured}
-            isUploading={isUploading}
-            isDeleting={isDeleting}
-            onDropdownAction={handleDropdownAction}
-            onUploadClick={triggerFileUpload}
-          />
-        </NavbarItem>
-        <NavbarItem>
-          <AnimatedThemeToggler />
-        </NavbarItem>
-      </NavbarContent>
+        </NavbarContent>
+      </Navbar>
 
-      {/* Mobile menu */}
-      <NavbarMenu>
-        {navItems.map((item) => (
-          <NavbarMenuItem key={item.href} isActive={currentPath === item.href}>
-            <Link
-              to={item.href}
-              onClick={() => setIsMenuOpen(false)}
-              className={`flex w-full items-center gap-2 text-lg ${currentPath === item.href ? "text-primary" : "text-foreground"}`}
-            >
-              {item.label}
-              {item.href === "/playlists" && subscriptionCount > 0 && (
-                <Chip size="sm" variant="flat" color="primary">
-                  {subscriptionCount}
-                </Chip>
-              )}
-            </Link>
-          </NavbarMenuItem>
-        ))}
-        <NavbarMenuItem>
-          <CookieDropdown
-            variant="mobile"
-            cookiesConfigured={cookiesConfigured}
-            isUploading={isUploading}
-            isDeleting={isDeleting}
-            onDropdownAction={handleDropdownAction}
-            onUploadClick={triggerFileUpload}
-          />
-        </NavbarMenuItem>
-        <NavbarMenuItem>
-          <HeroUILink
-            href="https://github.com/guillevc/yubal"
-            isExternal
-            showAnchorIcon
-            color="foreground"
-            className="w-full"
-            size="lg"
-          >
-            Star on GitHub
-          </HeroUILink>
-        </NavbarMenuItem>
-      </NavbarMenu>
-
-      {/* Hidden file input for cookie upload */}
-      <input
-        ref={fileInputRef}
-        type="file"
-        accept=".txt"
-        onChange={handleFileSelect}
-        className="hidden"
+      <SettingsDrawer isOpen={settingsOpen} onOpenChange={setSettingsOpen} />
+      <FullscreenLyrics
+        open={audio.lyricsFullscreen}
+        onClose={() => audio.closeLyricsFullscreen()}
       />
-    </Navbar>
+      <LyricsEditorModal />
+      <LyricsAdjustLeaveModal />
+    </>
   );
 }

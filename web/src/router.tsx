@@ -2,14 +2,17 @@
 
 import { Footer } from "@/components/layout/footer";
 import { Header } from "@/components/layout/header";
+import { LibraryHealthModal } from "@/features/library/library-health-modal";
+import { LibraryAudioProvider } from "@/features/sync/library-audio";
 import { basePath } from "@/lib/base-path";
+import { layout } from "@/lib/ui-styles";
 import { JobsPage } from "@/pages/jobs";
-import { SubscriptionsPage } from "@/pages/subscriptions";
 import { HeroUIProvider, ToastProvider } from "@heroui/react";
 import {
   createRootRoute,
   createRoute,
   createRouter,
+  Navigate,
   NavigateOptions,
   Outlet,
   ToOptions,
@@ -27,13 +30,16 @@ function RootLayout() {
       useHref={(to) => router.buildLocation({ to }).href}
     >
       <ToastProvider />
-      <div className="flex min-h-screen flex-col">
-        <Header />
-        <main className="m-auto w-full max-w-5xl flex-1 px-4 py-6">
-          <Outlet />
-        </main>
-        <Footer />
-      </div>
+      <LibraryHealthModal />
+      <LibraryAudioProvider>
+        <div className="flex min-h-screen flex-col">
+          <Header />
+          <main className={`m-auto w-full max-w-5xl flex-1 px-4 ${layout.pageY}`}>
+            <Outlet />
+          </main>
+          <Footer />
+        </div>
+      </LibraryAudioProvider>
     </HeroUIProvider>
   );
 }
@@ -57,13 +63,13 @@ const jobsRoute = createRoute({
   component: JobsPage,
 });
 
-const subscriptionsRoute = createRoute({
+const playlistsRedirectRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/playlists",
-  component: SubscriptionsPage,
+  component: () => <Navigate to="/" replace />,
 });
 
-const routeTree = rootRoute.addChildren([jobsRoute, subscriptionsRoute]);
+const routeTree = rootRoute.addChildren([jobsRoute, playlistsRedirectRoute]);
 
 export const router = createRouter({ routeTree, basepath: basePath || "/" });
 

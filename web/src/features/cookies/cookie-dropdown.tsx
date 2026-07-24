@@ -8,6 +8,7 @@ import {
   Tooltip,
 } from "@heroui/react";
 import { CookieIcon, Trash2Icon, UploadIcon } from "lucide-react";
+import { useTranslation } from "react-i18next";
 
 interface CookieDropdownProps {
   cookiesConfigured: boolean;
@@ -26,6 +27,8 @@ export function CookieDropdown({
   onUploadClick,
   variant,
 }: CookieDropdownProps) {
+  const { t } = useTranslation();
+
   if (variant === "desktop") {
     return cookiesConfigured ? (
       <Dropdown>
@@ -34,7 +37,7 @@ export function CookieDropdown({
             isIconOnly
             size="sm"
             variant="light"
-            aria-label="Cookie options"
+            aria-label={t("cookies.options")}
             isLoading={isDeleting}
           >
             <CookieIcon className="h-5 w-5 text-amber-500 dark:text-orange-300" />
@@ -43,15 +46,12 @@ export function CookieDropdown({
         <CookieDropdownMenu onAction={onDropdownAction} />
       </Dropdown>
     ) : (
-      <Tooltip
-        content="Upload cookies.txt for age-restricted or Premium content"
-        closeDelay={0}
-      >
+      <Tooltip content={t("cookies.uploadTooltip")} closeDelay={0}>
         <Button
           isIconOnly
           size="sm"
           variant="light"
-          aria-label="Upload cookies"
+          aria-label={t("cookies.upload")}
           isLoading={isUploading}
           onPress={onUploadClick}
         >
@@ -66,7 +66,7 @@ export function CookieDropdown({
     <Dropdown>
       <DropdownTrigger>
         <Link as="button" color="foreground" className="w-full gap-2" size="lg">
-          Cookies configured
+          {t("cookies.configured")}
         </Link>
       </DropdownTrigger>
       <CookieDropdownMenu onAction={onDropdownAction} />
@@ -79,7 +79,7 @@ export function CookieDropdown({
       size="lg"
       onPress={onUploadClick}
     >
-      Upload cookies
+      {t("cookies.upload")}
     </Link>
   );
 }
@@ -89,13 +89,15 @@ interface CookieDropdownMenuProps {
 }
 
 function CookieDropdownMenu({ onAction }: CookieDropdownMenuProps) {
+  const { t } = useTranslation();
+
   return (
-    <DropdownMenu aria-label="Cookie actions" onAction={onAction}>
+    <DropdownMenu aria-label={t("cookies.actions")} onAction={onAction}>
       <DropdownItem
         key="upload"
         startContent={<UploadIcon className="h-4 w-4" />}
       >
-        Upload new cookies
+        {t("cookies.uploadNew")}
       </DropdownItem>
       <DropdownItem
         key="delete"
@@ -103,7 +105,7 @@ function CookieDropdownMenu({ onAction }: CookieDropdownMenuProps) {
         className="text-danger"
         startContent={<Trash2Icon className="h-4 w-4" />}
       >
-        Delete cookies
+        {t("cookies.delete")}
       </DropdownItem>
     </DropdownMenu>
   );

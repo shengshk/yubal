@@ -45,7 +45,10 @@ class CreateJobRequest(BaseModel):
         default=None,
         ge=1,
         le=10000,
-        description="Maximum number of tracks to download",
+        description=(
+            "Per-round cap on not-yet-local tracks. Already-local tracks do not "
+            "consume the budget. None means no cap."
+        ),
     )
 
 

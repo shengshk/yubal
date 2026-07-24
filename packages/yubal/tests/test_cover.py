@@ -128,16 +128,22 @@ class TestWritePlaylistCover:
     """Tests for write_playlist_cover function."""
 
     def test_returns_none_when_no_cover_url(self, tmp_path: Path) -> None:
-        """Should return None when cover_url is None."""
-        result = write_playlist_cover(tmp_path, "My Playlist", "PLtest12345678", None)
+        """Should return None when cover_url is None and no local file."""
+        path, status = write_playlist_cover(
+            tmp_path, "My Playlist", "PLtest12345678", None
+        )
 
-        assert result is None
+        assert path is None
+        assert status is None
 
     def test_returns_none_when_empty_cover_url(self, tmp_path: Path) -> None:
-        """Should return None when cover_url is empty string."""
-        result = write_playlist_cover(tmp_path, "My Playlist", "PLtest12345678", "")
+        """Should return None when cover_url is empty string and no local file."""
+        path, status = write_playlist_cover(
+            tmp_path, "My Playlist", "PLtest12345678", ""
+        )
 
-        assert result is None
+        assert path is None
+        assert status is None
 
     @patch("yubal.utils.cover.fetch_cover")
     def test_returns_none_when_fetch_fails(
@@ -146,26 +152,29 @@ class TestWritePlaylistCover:
         """Should return None when fetch_cover returns None."""
         mock_fetch.return_value = None
 
-        result = write_playlist_cover(
+        path, status = write_playlist_cover(
             tmp_path, "My Playlist", "PLtest12345678", "https://example.com/cover.jpg"
         )
 
-        assert result is None
+        assert path is None
+        assert status is None
         mock_fetch.assert_called_once_with("https://example.com/cover.jpg")
 
     @patch("yubal.utils.cover.fetch_cover")
     def test_creates_playlists_directory(
         self, mock_fetch: MagicMock, tmp_path: Path
     ) -> None:
-        """Should create _Playlists directory if it doesn't exist."""
+        """Should create the save folder if it doesn't exist."""
         mock_fetch.return_value = b"\xff\xd8\xff\xe0"  # JPEG magic bytes
 
-        write_playlist_cover(
+        cover_path, status = write_playlist_cover(
             tmp_path, "My Playlist", "PLtest12345678", "https://example.com/cover.jpg"
         )
 
-        assert (tmp_path / "_Playlists").exists()
-        assert (tmp_path / "_Playlists").is_dir()
+        assert cover_path is not None
+        assert status == "written"
+        assert cover_path.parent == tmp_path
+        assert cover_path.exists()
 
     @patch("yubal.utils.cover.fetch_cover")
     def test_writes_cover_file(self, mock_fetch: MagicMock, tmp_path: Path) -> None:
@@ -173,13 +182,31 @@ class TestWritePlaylistCover:
         cover_bytes = b"\xff\xd8\xff\xe0\x00\x10JFIF"
         mock_fetch.return_value = cover_bytes
 
-        cover_path = write_playlist_cover(
+        cover_path, status = write_playlist_cover(
             tmp_path, "My Favorites", "PLtest12345678", "https://example.com/cover.jpg"
         )
 
         assert cover_path is not None
+        assert status == "written"
         assert cover_path.exists()
         assert cover_path.read_bytes() == cover_bytes
+
+    @patch("yubal.utils.cover.fetch_cover")
+    def test_skips_fetch_when_cover_exists(
+        self, mock_fetch: MagicMock, tmp_path: Path
+    ) -> None:
+        """Existing non-empty sidecar must not trigger a network fetch."""
+        existing = tmp_path / "My Favorites [12345678].jpg"
+        existing.write_bytes(b"\xff\xd8\xff\xe0existing")
+
+        cover_path, status = write_playlist_cover(
+            tmp_path, "My Favorites", "PLtest12345678", "https://example.com/cover.jpg"
+        )
+
+        assert cover_path == existing
+        assert status == "skipped"
+        mock_fetch.assert_not_called()
+        assert existing.read_bytes() == b"\xff\xd8\xff\xe0existing"
 
     @patch("yubal.utils.cover.fetch_cover")
     def test_returns_correct_path_with_id_suffix(
@@ -188,11 +215,12 @@ class TestWritePlaylistCover:
         """Should return path with playlist ID suffix."""
         mock_fetch.return_value = b"\xff\xd8\xff\xe0"
 
-        cover_path = write_playlist_cover(
+        cover_path, status = write_playlist_cover(
             tmp_path, "My Favorites", "PLtest12345678", "https://example.com/cover.jpg"
         )
 
-        assert cover_path == tmp_path / "_Playlists" / "My Favorites [12345678].jpg"
+        assert status == "written"
+        assert cover_path == tmp_path / "My Favorites [12345678].jpg"
 
     @patch("yubal.utils.cover.fetch_cover")
     def test_sanitizes_playlist_name(
@@ -201,7 +229,7 @@ class TestWritePlaylistCover:
         """Should sanitize playlist name for safe filename."""
         mock_fetch.return_value = b"\xff\xd8\xff\xe0"
 
-        cover_path = write_playlist_cover(
+        cover_path, status = write_playlist_cover(
             tmp_path,
             "My/Favorites: Best<Songs>",
             "PLtest12345678",
@@ -209,6 +237,7 @@ class TestWritePlaylistCover:
         )
 
         assert cover_path is not None
+        assert status == "written"
         assert cover_path.exists()
         # Should not contain invalid characters (except the ID suffix brackets)
         name_without_suffix = cover_path.stem.rsplit(" [", 1)[0]
@@ -224,11 +253,12 @@ class TestWritePlaylistCover:
         """Should use fallback name for empty playlist name."""
         mock_fetch.return_value = b"\xff\xd8\xff\xe0"
 
-        cover_path = write_playlist_cover(
+        cover_path, status = write_playlist_cover(
             tmp_path, "", "PLtest12345678", "https://example.com/cover.jpg"
         )
 
         assert cover_path is not None
+        assert status == "written"
         assert cover_path.name == "Untitled Playlist [12345678].jpg"
 
     @patch("yubal.utils.cover.fetch_cover")
@@ -256,11 +286,12 @@ class TestWritePlaylistCover:
         m3u_path = write_m3u(
             tmp_path, "My Favorites", playlist_id, [(sample_track, track_path)]
         )
-        cover_path = write_playlist_cover(
+        cover_path, status = write_playlist_cover(
             tmp_path, "My Favorites", playlist_id, "https://example.com/cover.jpg"
         )
 
         assert cover_path is not None
+        assert status == "written"
         assert m3u_path.stem == cover_path.stem  # Same base name
         assert m3u_path.suffix == ".m3u"
         assert cover_path.suffix == ".jpg"
@@ -272,15 +303,17 @@ class TestWritePlaylistCover:
         """Should create separate covers for same-name playlists with different IDs."""
         mock_fetch.return_value = b"\xff\xd8\xff\xe0"
 
-        cover_path1 = write_playlist_cover(
+        cover_path1, status1 = write_playlist_cover(
             tmp_path, "Favorites", "PLuser1_abc123", "https://example.com/cover1.jpg"
         )
-        cover_path2 = write_playlist_cover(
+        cover_path2, status2 = write_playlist_cover(
             tmp_path, "Favorites", "PLuser2_xyz789", "https://example.com/cover2.jpg"
         )
 
         assert cover_path1 is not None
         assert cover_path2 is not None
+        assert status1 == "written"
+        assert status2 == "written"
         assert cover_path1 != cover_path2
         assert cover_path1.exists()
         assert cover_path2.exists()

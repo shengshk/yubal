@@ -1,6 +1,7 @@
 """Lyrics fetching service with composable sources (lrclib, YouTube Music)."""
 
 import logging
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +14,27 @@ from ytmusicapi.models.lyrics import LyricLine
 from yubal.client import YTMusicProtocol
 
 logger = logging.getLogger(__name__)
+
+# LRC timestamp like [mm:ss.xx] or [mm:ss]
+_LRC_TS_RE = re.compile(r"\[\d{1,3}:\d{2}(?:\.\d{1,3})?]")
+
+
+def lyrics_look_synced(text: str | None) -> bool:
+    """True when lyrics contain at least one LRC-style timestamp."""
+    if not text or not text.strip():
+        return False
+    return _LRC_TS_RE.search(text) is not None
+
+# LRC timestamp like [mm:ss.xx] or [mm:ss]
+_LRC_TS_RE = re.compile(r"\[\d{1,3}:\d{2}(?:\.\d{1,3})?]")
+
+
+def lyrics_look_synced(text: str | None) -> bool:
+    """True when lyrics contain at least one LRC-style timestamp."""
+    if not text or not text.strip():
+        return False
+    return _LRC_TS_RE.search(text) is not None
+
 
 
 @dataclass(frozen=True)
@@ -51,8 +73,13 @@ class LyricsServiceProtocol(Protocol):
         artist: str,
         duration_seconds: int,
         video_id: str | None = None,
-    ) -> str | None:
-        """Fetch lyrics for a track."""
+        *,
+        skip_sources: set[str] | None = None,
+    ) -> tuple[str | None, str | None, list[str]]:
+        """Fetch lyrics for a track.
+
+        Returns (lyrics, hit_source, missed_sources).
+        """
         ...
 
     def save_lyrics(self, lyrics: str, audio_path: Path) -> Path:
@@ -247,50 +274,115 @@ class LyricsService:
         artist: str,
         duration_seconds: int,
         video_id: str | None = None,
-    ) -> str | None:
-        """Try each fetcher in order until one returns lyrics.
+        *,
+        skip_sources: set[str] | None = None,
+    ) -> tuple[str | None, str | None, list[str]]:
+        """Try each fetcher in order; prefer synced lyrics in the same pass.
 
-        Emits one INFO log per source describing the outcome:
-        - hit: "Found lyrics from <source> for '<title>' by <artist>"
-        - miss with more sources: "No lyrics from <source> ..., falling back to <next>"
-        - all miss: "No lyrics found for '<title>' by <artist> (tried: <sources>)"
+        Plain (unsynced) hits do not stop the chain — later sources are still
+        tried for timestamps. If nobody returns synced text, the first plain
+        hit is kept as a fallback.
+
+        Returns:
+            (lyrics_or_none, hit_source_or_none, missed_sources_tried)
         """
+        skip = skip_sources or set()
         query = LyricsQuery(
             title=title,
             artist=artist,
             duration_seconds=duration_seconds,
             video_id=video_id,
         )
+        missed: list[str] = []
+        tried_names: list[str] = []
+        plain_lyrics: str | None = None
+        plain_source: str | None = None
+
         for i, fetcher in enumerate(self._fetchers):
-            lyrics = fetcher.fetch(query)
-            if lyrics is not None:
+            if fetcher.name in skip:
+                continue
+            tried_names.append(fetcher.name)
+            try:
+                lyrics = fetcher.fetch(query)
+            except Exception:
+                logger.debug(
+                    "Lyrics source %s failed for '%s' by %s",
+                    fetcher.name,
+                    title,
+                    artist,
+                    exc_info=True,
+                )
+                lyrics = None
+            if lyrics is None:
+                missed.append(fetcher.name)
+                remaining = [
+                    f for f in self._fetchers[i + 1 :] if f.name not in skip
+                ]
+                if remaining:
+                    logger.info(
+                        "No lyrics from %s for '%s' by %s, falling back to %s",
+                        fetcher.name,
+                        title,
+                        artist,
+                        remaining[0].name,
+                    )
+                continue
+
+            if lyrics_look_synced(lyrics):
                 logger.info(
-                    "Found lyrics from %s for '%s' by %s",
+                    "Found synced lyrics from %s for '%s' by %s",
                     fetcher.name,
                     title,
                     artist,
                 )
-                return lyrics
+                return lyrics, fetcher.name, missed
 
-            remaining = self._fetchers[i + 1 :]
+            if plain_lyrics is None:
+                plain_lyrics = lyrics
+                plain_source = fetcher.name
+                logger.info(
+                    "Plain lyrics from %s for '%s' by %s; "
+                    "continuing for synced sources",
+                    fetcher.name,
+                    title,
+                    artist,
+                )
+            else:
+                logger.debug(
+                    "Ignoring additional plain lyrics from %s for '%s'",
+                    fetcher.name,
+                    title,
+                )
+            remaining = [
+                f for f in self._fetchers[i + 1 :] if f.name not in skip
+            ]
             if remaining:
                 logger.info(
-                    "No lyrics from %s for '%s' by %s, falling back to %s",
+                    "Falling back from plain %s to %s for '%s' by %s",
                     fetcher.name,
+                    remaining[0].name,
                     title,
                     artist,
-                    remaining[0].name,
                 )
 
-        if self._fetchers:
-            sources = ", ".join(f.name for f in self._fetchers)
+        if plain_lyrics is not None:
+            logger.info(
+                "Using plain lyrics from %s for '%s' by %s "
+                "(no synced source hit)",
+                plain_source,
+                title,
+                artist,
+            )
+            return plain_lyrics, plain_source, missed
+
+        if tried_names:
             logger.info(
                 "No lyrics found for '%s' by %s (tried: %s)",
                 title,
                 artist,
-                sources,
+                ", ".join(tried_names),
             )
-        return None
+        return None, None, missed
 
     def save_lyrics(self, lyrics: str, audio_path: Path) -> Path:
         """Save lyrics to an LRC file alongside the audio file.

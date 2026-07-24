@@ -64,6 +64,12 @@ export default defineConfig({
     outDir: "dist",
     sourcemap: true,
     chunkSizeWarningLimit: 800,
+    watch:
+      process.env.VITE_BUILD_WATCH === "true"
+        ? {
+            exclude: ["**/dist/**", "**/node_modules/**"],
+          }
+        : null,
     rolldownOptions: {
       output: {
         codeSplitting: {

@@ -1,0 +1,583 @@
+"""External music library endpoints: playlists, scan, match, tracks."""
+
+import asyncio
+import logging
+from datetime import datetime
+from typing import Literal
+
+from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel, Field
+
+from yubal_api.api.deps import (
+    ExternalLibraryServiceDep,
+    LibraryHealthServiceDep,
+    PreferencesStoreDep,
+)
+from yubal_api.services.external_library_service import (
+    DeletePlaylistResult,
+    ExternalPlaylistView,
+    MatchBatchResult,
+    PlaylistTrackView,
+    ScanResult,
+    SyncPlaylistResult,
+)
+from yubal_api.services.preferences import PreferencesStore
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/external", tags=["external"])
+
+
+def _ensure_external_enabled(prefs: PreferencesStore) -> None:
+    if not prefs.effective().external_library_enabled:
+        raise HTTPException(
+            status_code=403,
+            detail="External library is disabled. Enable it in Settings.",
+        )
+
+
+class ExternalPlaylistResponse(BaseModel):
+    dir_name: str
+    allow_mutate: bool
+    show_raw: bool
+    show_junk: bool
+    unmatched_count: int
+    matched_count: int
+    cloud: int
+    local: int
+    offline: int
+    exclusive: int
+    shared: int
+    hardlink: int
+    enabled: bool
+    max_items: int
+    sync_jitter_seconds: int
+    offline_marking_enabled: bool
+    offline_cleanup_enabled: bool
+    offline_cleanup_action: str
+    offline_cleanup_delay_hours: int
+    last_synced_at: datetime | None = None
+    last_sync_status: str | None = None
+
+
+class PlaylistSettingsUpdate(BaseModel):
+    allow_mutate: bool | None = Field(default=None)
+    show_raw: bool | None = Field(default=None)
+    show_junk: bool | None = Field(default=None)
+    enabled: bool | None = Field(default=None)
+    max_items: int | None = Field(default=None, ge=1, le=10000)
+    sync_jitter_seconds: int | None = Field(default=None, ge=0, le=600)
+    offline_marking_enabled: bool | None = Field(default=None)
+    offline_cleanup_enabled: bool | None = Field(default=None)
+    offline_cleanup_action: str | None = Field(
+        default=None, pattern="^(delete|archive)$"
+    )
+    offline_cleanup_delay_hours: int | None = Field(default=None, ge=0, le=8760)
+
+
+class ScanResponse(BaseModel):
+    playlists: int
+    scanned: int
+    added: int
+    updated: int
+    removed: int
+    errors: int
+
+
+class MatchBatchRequest(BaseModel):
+    limit: int = Field(default=25, ge=1, le=200)
+    dir_name: str | None = Field(default=None)
+
+
+class MatchBatchResponse(BaseModel):
+    checked: int
+    matched: int
+    deferred: int
+    rejected: int
+    errors: int
+
+
+class SyncPlaylistRequest(BaseModel):
+    """Selectable steps for a single external-playlist sync."""
+
+    enrich: bool = True
+    raw_match: bool = True
+    junk_match: bool = False
+
+
+class SyncPlaylistResponse(BaseModel):
+    matched: int
+    recovered: int
+    checked: int
+    errors: int
+    deferred: int
+    rejected: int
+
+
+class DeletePlaylistResponse(BaseModel):
+    deleted_files: int
+    deleted_locations: int
+    deleted_raw: int
+    moved: int
+    reset_matches: int
+    errors: int
+
+
+class MatchOneRequest(BaseModel):
+    rel_path: str
+    mode: Literal["strict", "relaxed"] | None = None
+
+
+class MatchCandidateResponse(BaseModel):
+    video_id: str
+    title: str
+    artists: str
+    album: str = ""
+    thumbnail_url: str | None = None
+    title_score: float = 0
+    artist_score: float = 0
+    score: float = 0
+
+
+class MatchOneResponse(BaseModel):
+    rel_path: str
+    matched: bool
+    video_id: str | None = None
+    ingested: bool = False
+    mode_used: Literal["strict", "relaxed"] = "strict"
+    candidates: list[MatchCandidateResponse] = Field(default_factory=list)
+
+
+class MatchAcceptRequest(BaseModel):
+    rel_path: str
+    video_id: str
+    score: float | None = None
+
+
+class ExternalTrackResponse(BaseModel):
+    rel_path: str
+    dir_name: str
+    title: str
+    artist: str
+    album: str
+    video_id: str | None
+    match_status: str
+    is_raw: bool
+    tags_complete: bool = False
+    is_junk: bool = False
+    junk_kind: str | None = None
+    cover_url: str | None = None
+    cover_source: str | None = None
+    album_artist: str | None = None
+    year: str | None = None
+    track_number: int | None = None
+    in_direct: bool = False
+
+
+def _to_playlist_response(v: ExternalPlaylistView) -> ExternalPlaylistResponse:
+    return ExternalPlaylistResponse(
+        dir_name=v.dir_name,
+        allow_mutate=v.allow_mutate,
+        show_raw=v.show_raw,
+        show_junk=v.show_junk,
+        unmatched_count=v.unmatched_count,
+        matched_count=v.matched_count,
+        cloud=v.cloud,
+        local=v.local,
+        offline=v.offline,
+        exclusive=v.exclusive,
+        shared=v.shared,
+        hardlink=v.hardlink,
+        enabled=v.enabled,
+        max_items=v.max_items,
+        sync_jitter_seconds=v.sync_jitter_seconds,
+        offline_marking_enabled=v.offline_marking_enabled,
+        offline_cleanup_enabled=v.offline_cleanup_enabled,
+        offline_cleanup_action=v.offline_cleanup_action,
+        offline_cleanup_delay_hours=v.offline_cleanup_delay_hours,
+        last_synced_at=v.last_synced_at,
+        last_sync_status=v.last_sync_status,
+    )
+
+
+def _to_scan_response(r: ScanResult) -> ScanResponse:
+    return ScanResponse(
+        playlists=r.playlists,
+        scanned=r.scanned,
+        added=r.added,
+        updated=r.updated,
+        removed=r.removed,
+        errors=r.errors,
+    )
+
+
+def _to_match_batch_response(r: MatchBatchResult) -> MatchBatchResponse:
+    return MatchBatchResponse(
+        checked=r.checked,
+        matched=r.matched,
+        deferred=r.deferred,
+        rejected=r.rejected,
+        errors=r.errors,
+    )
+
+
+def _to_sync_playlist_response(r: SyncPlaylistResult) -> SyncPlaylistResponse:
+    return SyncPlaylistResponse(
+        matched=r.matched,
+        recovered=r.recovered,
+        checked=r.checked,
+        errors=r.errors,
+        deferred=r.deferred,
+        rejected=r.rejected,
+    )
+
+
+def _to_delete_playlist_response(r: DeletePlaylistResult) -> DeletePlaylistResponse:
+    return DeletePlaylistResponse(
+        deleted_files=r.deleted_files,
+        deleted_locations=r.deleted_locations,
+        deleted_raw=r.deleted_raw,
+        moved=r.moved,
+        reset_matches=r.reset_matches,
+        errors=r.errors,
+    )
+
+
+def _to_track_response(v: PlaylistTrackView) -> ExternalTrackResponse:
+    return ExternalTrackResponse(
+        rel_path=v.rel_path,
+        dir_name=v.dir_name,
+        title=v.title,
+        artist=v.artist,
+        album=v.album,
+        video_id=v.video_id,
+        match_status=v.match_status,
+        is_raw=v.is_raw,
+        tags_complete=v.tags_complete,
+        is_junk=v.is_junk,
+        junk_kind=v.junk_kind,
+        cover_url=v.cover_url,
+        cover_source=v.cover_source,
+        album_artist=v.album_artist,
+        year=v.year,
+        track_number=v.track_number,
+        in_direct=v.in_direct,
+    )
+
+
+@router.get("/playlists", response_model=list[ExternalPlaylistResponse])
+def list_playlists(
+    service: ExternalLibraryServiceDep,
+    prefs: PreferencesStoreDep,
+) -> list[ExternalPlaylistResponse]:
+    if not prefs.effective().external_library_enabled:
+        return []
+    return [_to_playlist_response(v) for v in service.list_playlists()]
+
+
+@router.patch("/playlists/{dir_name}", response_model=ExternalPlaylistResponse)
+def update_playlist_settings(
+    dir_name: str,
+    body: PlaylistSettingsUpdate,
+    service: ExternalLibraryServiceDep,
+    prefs: PreferencesStoreDep,
+) -> ExternalPlaylistResponse:
+    _ensure_external_enabled(prefs)
+    try:
+        playlist = service.update_playlist_settings(
+            dir_name,
+            allow_mutate=body.allow_mutate,
+            show_raw=body.show_raw,
+            show_junk=body.show_junk,
+            enabled=body.enabled,
+            max_items=body.max_items,
+            sync_jitter_seconds=body.sync_jitter_seconds,
+            offline_marking_enabled=body.offline_marking_enabled,
+            offline_cleanup_enabled=body.offline_cleanup_enabled,
+            offline_cleanup_action=body.offline_cleanup_action,
+            offline_cleanup_delay_hours=body.offline_cleanup_delay_hours,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    if playlist is None:
+        raise HTTPException(status_code=404, detail=f"playlist not found: {dir_name}")
+    view = service.get_playlist_view(dir_name)
+    if view is None:
+        raise HTTPException(status_code=404, detail=f"playlist not found: {dir_name}")
+    return _to_playlist_response(view)
+
+
+@router.get(
+    "/playlists/{dir_name}/tracks", response_model=list[ExternalTrackResponse]
+)
+def list_playlist_tracks(
+    dir_name: str,
+    service: ExternalLibraryServiceDep,
+    prefs: PreferencesStoreDep,
+    show_raw: bool | None = None,
+) -> list[ExternalTrackResponse]:
+    _ensure_external_enabled(prefs)
+    return [
+        _to_track_response(v)
+        for v in service.list_playlist_tracks(dir_name, show_raw=show_raw)
+    ]
+
+
+@router.post("/playlists/{dir_name}/sync", response_model=SyncPlaylistResponse)
+async def sync_playlist(
+    dir_name: str,
+    service: ExternalLibraryServiceDep,
+    health: LibraryHealthServiceDep,
+    prefs: PreferencesStoreDep,
+    body: SyncPlaylistRequest | None = None,
+) -> SyncPlaylistResponse:
+    _ensure_external_enabled(prefs)
+    req = body if body is not None else SyncPlaylistRequest()
+    if not (req.enrich or req.raw_match or req.junk_match):
+        raise HTTPException(
+            status_code=400,
+            detail="at least one of enrich, raw_match, junk_match is required",
+        )
+    try:
+        result = await asyncio.to_thread(
+            service.sync_playlist,
+            dir_name,
+            health,
+            enrich=req.enrich,
+            raw_match=req.raw_match,
+            junk_match=req.junk_match,
+        )
+    except ValueError as e:
+        detail = str(e)
+        code = 400 if "at least one of" in detail else 404
+        raise HTTPException(status_code=code, detail=detail) from e
+    return _to_sync_playlist_response(result)
+
+
+@router.delete("/playlists/{dir_name}", response_model=DeletePlaylistResponse)
+async def delete_playlist(
+    dir_name: str,
+    service: ExternalLibraryServiceDep,
+    prefs: PreferencesStoreDep,
+    confirm: bool = Query(default=False),
+    mode: str = Query(
+        ...,
+        pattern=(
+            "^(forget_matched|"
+            "delete_matched|move_matched_to_direct|add_matched_to_direct|"
+            "delete_unmatched|delete_all|"
+            "clear_offline_delete|clear_offline_to_raw_delete)$"
+        ),
+    ),
+    direct_folder: str = Query(default="direct"),
+) -> DeletePlaylistResponse:
+    _ensure_external_enabled(prefs)
+    if not confirm:
+        raise HTTPException(status_code=400, detail="confirm=true required")
+    try:
+        result = await asyncio.to_thread(
+            service.delete_playlist, dir_name, mode, direct_folder=direct_folder
+        )
+    except ValueError as e:
+        detail = str(e)
+        code = 400 if "read-only" in detail or "unknown delete" in detail else 404
+        raise HTTPException(status_code=code, detail=detail) from e
+    return _to_delete_playlist_response(result)
+
+
+@router.post("/scan", response_model=ScanResponse)
+async def scan_external(
+    service: ExternalLibraryServiceDep,
+    health: LibraryHealthServiceDep,
+    prefs: PreferencesStoreDep,
+) -> ScanResponse:
+    """Scan External/Raw for new/changed/removed files (raises 503 if unhealthy)."""
+    _ensure_external_enabled(prefs)
+    try:
+        result = await asyncio.to_thread(service.scan_raw, health)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return _to_scan_response(result)
+
+
+@router.post("/match/batch", response_model=MatchBatchResponse)
+async def match_batch(
+    body: MatchBatchRequest,
+    service: ExternalLibraryServiceDep,
+    health: LibraryHealthServiceDep,
+    prefs: PreferencesStoreDep,
+) -> MatchBatchResponse:
+    """Attempt YTM matches for a batch of raw tracks (respects backoff)."""
+    _ensure_external_enabled(prefs)
+    result = await asyncio.to_thread(
+        service.match_batch,
+        health,
+        limit=body.limit,
+        dir_name=body.dir_name,
+        ignore_backoff=False,
+        include_junk=False,
+        enabled_only=body.dir_name is None,
+    )
+    return _to_match_batch_response(result)
+
+
+@router.post("/match/one", response_model=MatchOneResponse)
+async def match_one(
+    body: MatchOneRequest,
+    service: ExternalLibraryServiceDep,
+    health: LibraryHealthServiceDep,
+    prefs: PreferencesStoreDep,
+) -> MatchOneResponse:
+    """Attempt a single match + ingest for one raw track by rel_path.
+
+    Manual match resets backoff counters first (plan: manual → from zero).
+    Incomplete tags: scrape once (file write when mutable, index-only when
+    readonly), then match.
+    """
+    _ensure_external_enabled(prefs)
+    health.ensure_healthy()
+    try:
+        matched, video_id, ingested, mode_used, candidates = await asyncio.to_thread(
+            service.match_one_manual, body.rel_path, mode=body.mode
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    return MatchOneResponse(
+        rel_path=body.rel_path,
+        matched=matched,
+        video_id=video_id,
+        ingested=ingested,
+        mode_used=mode_used,  # type: ignore[arg-type]
+        candidates=[
+            MatchCandidateResponse(
+                video_id=c.video_id,
+                title=c.title,
+                artists=c.artists,
+                album=c.album,
+                thumbnail_url=c.thumbnail_url,
+                title_score=c.title_score,
+                artist_score=c.artist_score,
+                score=c.score,
+            )
+            for c in candidates
+        ],
+    )
+
+
+@router.post("/match/accept", response_model=MatchOneResponse)
+async def accept_match(
+    body: MatchAcceptRequest,
+    service: ExternalLibraryServiceDep,
+    health: LibraryHealthServiceDep,
+    prefs: PreferencesStoreDep,
+) -> MatchOneResponse:
+    """Accept a manually chosen YTM candidate for one raw track."""
+    _ensure_external_enabled(prefs)
+    health.ensure_healthy()
+    try:
+        matched, video_id, ingested = await asyncio.to_thread(
+            service.accept_match,
+            body.rel_path,
+            body.video_id,
+            confidence=float(body.score or 0.0),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    return MatchOneResponse(
+        rel_path=body.rel_path,
+        matched=matched,
+        video_id=video_id,
+        ingested=ingested,
+    )
+
+
+class DeleteTrackResponse(BaseModel):
+    deleted_files: int = 0
+    deleted_locations: int = 0
+    reset_matches: int = 0
+    errors: int = 0
+    ok: bool = True
+
+
+@router.delete(
+    "/playlists/{dir_name}/tracks", response_model=DeleteTrackResponse
+)
+async def delete_playlist_track(
+    dir_name: str,
+    service: ExternalLibraryServiceDep,
+    prefs: PreferencesStoreDep,
+    rel_path: str = Query(...),
+    mode: str = Query(
+        ...,
+        pattern="^(keep_match|clear_match|delete_raw|move_to_direct|add_to_direct)$",
+    ),
+) -> DeleteTrackResponse:
+    """Delete one external playlist track (matched Organized or unmatched Raw)."""
+    _ensure_external_enabled(prefs)
+    try:
+        if mode in ("move_to_direct", "add_to_direct"):
+            direct_folder = prefs.effective().direct_folder
+            fn = (
+                service.add_one_matched_to_direct
+                if mode == "add_to_direct"
+                else service.move_one_matched_to_direct
+            )
+            result = await asyncio.to_thread(
+                fn,
+                dir_name,
+                rel_path=rel_path,
+                direct_folder=direct_folder,
+            )
+            return DeleteTrackResponse(
+                deleted_files=int(result.get("moved", 0)),
+                deleted_locations=int(result.get("deleted_locations", 0)),
+                reset_matches=0,
+                errors=int(result.get("errors", 0)),
+                ok=bool(result.get("ok")),
+            )
+        result = await asyncio.to_thread(
+            service.delete_track, dir_name, rel_path=rel_path, mode=mode
+        )
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    return DeleteTrackResponse(**result)
+
+
+@router.post("/reset", response_model=ExternalTrackResponse)
+def reset_match(
+    body: MatchOneRequest,
+    service: ExternalLibraryServiceDep,
+    prefs: PreferencesStoreDep,
+) -> ExternalTrackResponse:
+    """Manually clear backoff/fail state so a track is retried on next batch."""
+    _ensure_external_enabled(prefs)
+    raw_rel = body.rel_path.strip().replace("\\", "/").lstrip("/")
+    if raw_rel.startswith("External/"):
+        raw_rel = raw_rel[len("External/") :]
+    if raw_rel.startswith("raw/"):
+        raw_rel = raw_rel[len("raw/") :]
+    row = service.reset_match(raw_rel)
+    if row is None:
+        raise HTTPException(
+            status_code=404, detail=f"raw track not found: {body.rel_path}"
+        )
+    return ExternalTrackResponse(
+        rel_path=f"Raw/{row.rel_path}",
+        dir_name=row.dir_name,
+        title=row.title,
+        artist=row.artists,
+        album=row.album,
+        video_id=row.video_id,
+        match_status=row.match_status,
+        is_raw=True,
+        tags_complete=service.tags_complete_enough(
+            row.title, row.artists, row.album
+        ),
+        is_junk=False,
+        junk_kind=None,
+        album_artist=row.album_artist,
+        year=row.year,
+        track_number=row.track_number,
+    )

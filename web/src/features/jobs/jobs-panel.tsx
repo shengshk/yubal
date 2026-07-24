@@ -3,6 +3,7 @@ import { EmptyState } from "@/components/common/empty-state";
 import { Panel, PanelContent, PanelHeader } from "@/components/common/panel";
 import { isActive } from "@/lib/job-status";
 import { DownloadIcon, InboxIcon } from "lucide-react";
+import { useTranslation } from "react-i18next";
 import { JobCard } from "./job-card";
 
 type Props = {
@@ -13,6 +14,8 @@ type Props = {
 };
 
 export function JobsPanel({ jobs, isLoading, onCancel, onDelete }: Props) {
+  const { t } = useTranslation();
+
   return (
     <Panel>
       <PanelHeader
@@ -25,17 +28,17 @@ export function JobsPanel({ jobs, isLoading, onCancel, onDelete }: Props) {
           )
         }
       >
-        Downloads
+        {t("downloads.title")}
       </PanelHeader>
       <PanelContent height="h-124" className="space-y-2">
         {isLoading ? (
           <div className="flex h-full items-center justify-center">
             <span className="text-foreground-400 text-small font-mono">
-              Loading...
+              {t("common.loading")}
             </span>
           </div>
         ) : jobs.length === 0 ? (
-          <EmptyState icon={InboxIcon} title="No downloads yet" />
+          <EmptyState icon={InboxIcon} title={t("downloads.empty")} />
         ) : (
           <div className="flex flex-col gap-2">
             {jobs.map((job) => (

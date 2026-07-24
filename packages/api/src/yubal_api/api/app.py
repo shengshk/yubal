@@ -13,6 +13,7 @@ from importlib.metadata import version
 from importlib.resources import files
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 from alembic import command
 from alembic.config import Config
@@ -27,19 +28,41 @@ from starlette.responses import HTMLResponse, Response
 from starlette.staticfiles import StaticFiles
 from starlette.types import Scope
 from yubal import cleanup_part_files
+from yubal.services.track_index import repair_track_index
+from yubal.utils.cleanup import cleanup_startup_temps
+from yubal.utils.library import DOWNLOAD_ROOT, EXTERNAL_ROOT, ensure_external_layout
 
 from yubal_api.api.container import Services
 from yubal_api.api.exceptions import register_exception_handlers
 from yubal_api.api.routes import (
+    auth,
     cookies,
+    external,
     health,
     info,
     jobs,
+    library,
     logs,
     scheduler,
     subscriptions,
+    sync_ledger,
 )
+from yubal_api.api.routes import (
+    search as search_routes,
+)
+from yubal_api.api.routes import (
+    settings as settings_routes,
+)
+from yubal_api.api.routes.auth import AuthMiddleware
 from yubal_api.db import SubscriptionRepository, create_db_engine
+from yubal_api.db.external_library_repository import ExternalLibraryRepository
+from yubal_api.db.preselect_repository import PreselectRepository
+from yubal_api.db.subscription_membership_repository import (
+    SubscriptionMembershipRepository,
+    SubscriptionSnapshotRepository,
+)
+from yubal_api.db.sync_ledger_repository import SyncLedgerRepository
+from yubal_api.db.track_catalog_repository import TrackCatalogRepository
 from yubal_api.schemas.jobs import (
     ClearedEvent,
     CreatedEvent,
@@ -48,14 +71,37 @@ from yubal_api.schemas.jobs import (
     UpdatedEvent,
 )
 from yubal_api.schemas.logs import LogEntry
+from yubal_api.services.auth import AuthManager
+from yubal_api.services.catalog_folder_presence import CatalogFolderPresence
+from yubal_api.services.external_library_service import ExternalLibraryService
 from yubal_api.services.job_event_bus import JobEventBus
 from yubal_api.services.job_executor import JobExecutor
 from yubal_api.services.job_store import JobStore
+from yubal_api.services.library_dedup_service import LibraryDedupService
+from yubal_api.services.library_enrichment_service import LibraryEnrichmentService
+from yubal_api.services.library_health_service import LibraryHealthService
+from yubal_api.services.library_lookup_service import LibraryLookupService
 from yubal_api.services.log_buffer import BufferHandler, LogBuffer
+from yubal_api.services.operation_gate import OperationGate
 from yubal_api.services.playlist_info_service import PlaylistInfoService
+from yubal_api.services.preferences import (
+    DOWNLOAD_CACHE_ROOT,
+    PreferencesStore,
+    preferences_from_settings,
+)
+from yubal_api.services.preselect_service import PreselectService
 from yubal_api.services.scheduler import Scheduler
+from yubal_api.services.search_service import SearchService
 from yubal_api.services.shutdown_coordinator import ShutdownCoordinator
+from yubal_api.services.subscription_membership_service import (
+    SubscriptionMembershipService,
+)
 from yubal_api.services.subscription_service import SubscriptionService
+from yubal_api.services.sync_ledger_service import SyncLedgerService
+from yubal_api.services.telegram import TelegramBotService
+from yubal_api.services.track_metadata_service import TrackMetadataService
+from yubal_api.services.track_retag_service import TrackRetagService
+from yubal_api.services.wash_service import WashService
 from yubal_api.settings import get_settings
 
 # Global reference for shutdown suppression
@@ -159,7 +205,104 @@ def create_services(repository: SubscriptionRepository) -> Services:
     subscription_service = SubscriptionService(
         repository=repository,
         playlist_info=playlist_info,
+        data_path=settings.data,
+        ascii_filenames=settings.ascii_filenames,
     )
+
+    preferences_store = PreferencesStore(
+        settings.preferences_file,
+        settings.data,
+        defaults=preferences_from_settings(settings),
+    )
+
+    track_catalog = TrackCatalogRepository(repository.engine)
+    membership_service = SubscriptionMembershipService(
+        membership_repo=SubscriptionMembershipRepository(repository.engine),
+        snapshot_repo=SubscriptionSnapshotRepository(repository.engine),
+        subscription_repo=repository,
+        track_catalog=track_catalog,
+        data_path=settings.data,
+        archive_folder=preferences_store.effective().direct_folder,
+    )
+    subscription_service.bind_membership(membership_service)
+
+    sync_ledger_service = SyncLedgerService(
+        SyncLedgerRepository(repository.engine),
+        data_path=settings.data,
+        preferences_store=preferences_store,
+        track_catalog=track_catalog,
+    )
+
+    preview_root = (
+        DOWNLOAD_CACHE_ROOT / "SearchPreview"
+        if DOWNLOAD_CACHE_ROOT.is_dir()
+        else settings.temp / "SearchPreview"
+    )
+    search_service = SearchService(
+        state_path=settings.config / "search_results.json",
+        preview_root=preview_root,
+        data_path=settings.data,
+        cookies_path=cookies_path,
+        preferences=preferences_store,
+        track_catalog=track_catalog,
+        sync_ledger=sync_ledger_service,
+    )
+
+    preselect_service = PreselectService(
+        PreselectRepository(repository.engine),
+        preferences_store,
+        settings.data,
+    )
+    wash_service = WashService(
+        preselect_service,
+        TrackCatalogRepository(repository.engine),
+        settings.data,
+    )
+
+    operation_gate = OperationGate()
+
+    library_health = LibraryHealthService(settings.config / "library_health.json")
+    library_health.bind_require_external(
+        lambda: preferences_store.effective().external_library_enabled
+    )
+    operation_gate.bind_health(library_health)
+
+    external_library_service = ExternalLibraryService(
+        ExternalLibraryRepository(repository.engine),
+        track_catalog,
+        preferences_store,
+        cookies_path=cookies_path,
+    )
+    sync_ledger_service.bind_external_library(external_library_service)
+    membership_service.bind_external_library(external_library_service)
+    library_dedup_service = LibraryDedupService(track_catalog)
+    library_lookup_service = LibraryLookupService(
+        catalog=track_catalog,
+        subscriptions=subscription_service,
+        preferences=preferences_store,
+        sync_ledger=sync_ledger_service,
+    )
+
+    folder_presence = CatalogFolderPresence(track_catalog, settings.data)
+
+    track_retag_service = TrackRetagService(
+        track_catalog,
+        settings.data,
+        ascii_filenames=settings.ascii_filenames,
+    )
+    cookies_path = settings.cookies_file if settings.cookies_file.exists() else None
+    track_metadata_service = TrackMetadataService(
+        catalog=track_catalog,
+        cookies_path=cookies_path,
+        preferences=preferences_store,
+    )
+    library_enrichment_service = LibraryEnrichmentService(
+        catalog=track_catalog,
+        data_path=settings.data,
+        preferences=preferences_store,
+        cookies_path=cookies_path,
+    )
+    external_library_service.bind_enrichment(library_enrichment_service)
 
     job_executor = JobExecutor(
         job_store=job_store,
@@ -169,12 +312,18 @@ def create_services(repository: SubscriptionRepository) -> Services:
         cookies_path=settings.cookies_file,
         fetch_lyrics=settings.fetch_lyrics,
         ytmusic_lyrics_fallback=settings.ytmusic_lyrics_fallback,
+        qq_lyrics_fallback=settings.qq_lyrics_fallback,
         apply_replaygain=settings.replaygain,
         ascii_filenames=settings.ascii_filenames,
         download_ugc=settings.download_ugc,
         subscription_service=subscription_service,
+        membership_service=membership_service,
+        sync_ledger_service=sync_ledger_service,
+        preferences_store=preferences_store,
         cache_path=settings.cache_path,
         job_timeout=settings.job_timeout_seconds,
+        operation_gate=operation_gate,
+        folder_presence=folder_presence,
     )
 
     # Create scheduler
@@ -182,19 +331,72 @@ def create_services(repository: SubscriptionRepository) -> Services:
         subscription_service=subscription_service,
         job_executor=job_executor,
         settings=settings,
+        preferences_store=preferences_store,
+        operation_gate=operation_gate,
+        sync_ledger_service=sync_ledger_service,
+        library_health=library_health,
+        external_library_service=external_library_service,
+        membership_service=membership_service,
+        library_enrichment_service=library_enrichment_service,
+        library_dedup_service=library_dedup_service,
     )
+
+    subscription_service.bind_maintenance(operation_gate, job_executor)
+    sync_ledger_service.bind_maintenance(operation_gate, job_executor)
+
+    def _subscription_folder(subscription_id: UUID) -> str | None:
+        try:
+            sub = subscription_service.get(subscription_id)
+        except Exception:
+            return None
+        return sub.save_folder or sub.name
+
+    sync_ledger_service.bind_subscription_folders(_subscription_folder)
 
     # Wire up coordinator with executor
     shutdown_coordinator.set_job_executor(job_executor)
+
+    telegram_bot = TelegramBotService(
+        preferences=preferences_store,
+        catalog=track_catalog,
+        library_lookup=library_lookup_service,
+        search=search_service,
+        playlist_info=playlist_info,
+        job_executor=job_executor,
+        job_store=job_store,
+        subscriptions=subscription_service,
+        data_path=settings.data,
+        config_path=settings.config,
+        tg_api_url=settings.tg_api_url,
+        scheduler=scheduler_service,
+        library_health=library_health,
+        db_engine=repository.engine,
+    )
 
     return Services(
         job_store=job_store,
         job_executor=job_executor,
         shutdown_coordinator=shutdown_coordinator,
         subscription_service=subscription_service,
+        membership_service=membership_service,
+        sync_ledger_service=sync_ledger_service,
+        preferences_store=preferences_store,
         scheduler=scheduler_service,
         job_event_bus=job_event_bus,
         log_buffer=log_buffer,
+        operation_gate=operation_gate,
+        preselect_service=preselect_service,
+        wash_service=wash_service,
+        search_service=search_service,
+        track_retag_service=track_retag_service,
+        track_metadata_service=track_metadata_service,
+        library_enrichment_service=library_enrichment_service,
+        library_health=library_health,
+        external_library_service=external_library_service,
+        library_dedup_service=library_dedup_service,
+        library_lookup_service=library_lookup_service,
+        telegram_bot=telegram_bot,
+        playlist_info=playlist_info,
     )
 
 
@@ -203,11 +405,17 @@ def create_api_router() -> APIRouter:
     base_path = get_settings().base_path
     api_router = APIRouter(prefix=f"{base_path}/api")
     api_router.include_router(health.router)
+    api_router.include_router(auth.router)
     api_router.include_router(info.router)
+    api_router.include_router(search_routes.router)
     api_router.include_router(jobs.router)
     api_router.include_router(logs.router)
     api_router.include_router(cookies.router)
     api_router.include_router(subscriptions.router)
+    api_router.include_router(library.router)
+    api_router.include_router(sync_ledger.router)
+    api_router.include_router(settings_routes.router)
+    api_router.include_router(external.router)
     api_router.include_router(scheduler.router)
     return api_router
 
@@ -217,6 +425,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Application lifespan handler for startup/shutdown."""
     settings = get_settings()
     logger.info("Starting application...")
+
+    auth_manager: AuthManager = app.state.auth
+    if auth_manager.enabled:
+        logger.info("Built-in auth enabled (%s)", settings.auth_file)
+    else:
+        logger.info("Built-in auth disabled (use external auth if needed)")
 
     # Run database migrations (in thread to avoid blocking event loop)
     await asyncio.to_thread(run_migrations)
@@ -232,12 +446,71 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.state.services = services
     logger.info("Services initialized")
 
+    # Ensure External/Raw + External/Organized exist (no-op if unmounted), then
+    # probe mount health so jobs/scheduler start with an accurate status.
+    await asyncio.to_thread(ensure_external_layout)
+    health = await asyncio.to_thread(services.library_health.check)
+    if not health.ok:
+        logger.warning(
+            "Library health at startup: %s (%s)", health.status, health.reason
+        )
+
+    # One-shot rename of legacy "NN - Title" filenames → "Artist - Title"
+    if health.ok:
+        from yubal_api.services.naming_migration_service import NamingConventionMigrator
+
+        migrator = NamingConventionMigrator(
+            TrackCatalogRepository(repository.engine),
+            settings.data,
+            ascii_filenames=settings.ascii_filenames,
+        )
+        naming = await asyncio.to_thread(migrator.run)
+        if naming.renamed or naming.errors:
+            logger.info(
+                "Naming migration: renamed=%d errors=%d",
+                naming.renamed,
+                naming.errors,
+            )
+
+    save_folders = [
+        sub.save_folder or sub.name for sub in repository.list()
+    ]
+    repaired = repair_track_index(settings.data, save_folders=save_folders)
+    if repaired:
+        logger.info("Repaired %d stale track index entries on startup", repaired)
+
+    # Jobs are in-memory: a restart mid-sync leaves ledger rows stuck at
+    # "running". Resolve them to "interrupted" so the UI never mislabels a
+    # previously-synced folder as "never run".
+    interrupted = services.sync_ledger_service.reconcile_interrupted_jobs()
+    if interrupted:
+        logger.info(
+            "Marked %d interrupted sync ledger row(s) on startup", interrupted
+        )
+
+    # Leftover .part / abandoned Cache staging from crashed downloads.
+    cache_root = DOWNLOAD_CACHE_ROOT if DOWNLOAD_CACHE_ROOT.is_dir() else None
+    temps = cleanup_startup_temps(DOWNLOAD_ROOT, cache_root)
+    if EXTERNAL_ROOT.is_dir() and EXTERNAL_ROOT.resolve() != DOWNLOAD_ROOT.resolve():
+        temps["part_files"] += cleanup_part_files(EXTERNAL_ROOT)
+    if temps["part_files"] or temps["staging_files"]:
+        logger.info(
+            "Startup temp cleanup: part_files=%d staging_files=%d",
+            temps["part_files"],
+            temps["staging_files"],
+        )
+
     # Start scheduler
     services.scheduler.start()
+
+    # Start Telegram bot when token is configured
+    await services.telegram_bot.start()
 
     yield
 
     # Shutdown sequence
+    await services.telegram_bot.stop()
+
     # Stop scheduler first
     await services.scheduler.stop()
 
@@ -342,11 +615,14 @@ class SPAStaticFiles(StaticFiles):
         self._base_path = base_path
         self._dir = Path(directory)
         self._cached_index: str | None = None
+        self._cached_mtime_ns: int | None = None
 
     def _get_index_html(self) -> str:
-        """Get index.html content with base path injected (cached)."""
-        if self._cached_index is None:
-            html = (self._dir / "index.html").read_text()
+        """Get index.html with base path injected; reload when file changes."""
+        index_path = self._dir / "index.html"
+        mtime_ns = index_path.stat().st_mtime_ns
+        if self._cached_index is None or self._cached_mtime_ns != mtime_ns:
+            html = index_path.read_text()
             base_href = f"{self._base_path}/" if self._base_path else "/"
             html = re.sub(
                 r'<base\s+href="/"\s*/?>',
@@ -355,6 +631,7 @@ class SPAStaticFiles(StaticFiles):
                 count=1,
             )
             self._cached_index = html
+            self._cached_mtime_ns = mtime_ns
         return self._cached_index
 
     async def get_response(self, path: str, scope: Scope) -> Response:
@@ -387,6 +664,18 @@ def create_app() -> FastAPI:
 
     # Register exception handlers
     register_exception_handlers(app)
+
+    # Built-in auth (created early so middleware can use it; state also set in lifespan)
+    auth_manager = AuthManager(
+        enabled=settings.auth_login,
+        auth_file=settings.auth_file,
+    )
+    app.state.auth = auth_manager
+    app.add_middleware(
+        AuthMiddleware,  # type: ignore[arg-type]
+        auth=auth_manager,
+        base_path=base_path,
+    )
 
     # CORS middleware (type ignore needed due to Starlette typing limitations)
     app.add_middleware(

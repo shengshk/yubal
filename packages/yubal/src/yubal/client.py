@@ -86,19 +86,47 @@ class YTMusicClient:
     ) -> None:
         """Initialize the client.
 
+        Construction is deliberately network-free: the underlying ``YTMusic``
+        session (which contacts music.youtube.com for a visitor id) is created
+        lazily on first API use. That way a transient SSL/network blip at
+        process startup cannot take down the whole HTTP server.
+
         Args:
             ytmusic: Optional YTMusic instance. Creates one if not provided.
             config: Optional API configuration. Uses defaults if not provided.
             cookies_path: Optional path to cookies.txt for authentication.
                          If provided and valid, enables authenticated requests.
         """
-        if ytmusic:
-            self._ytm = ytmusic
-        else:
-            self._ytm = self._create_ytmusic(cookies_path)
+        # Injected clients (tests/mocks) skip lazy creation entirely.
+        self._ytm_override = ytmusic
+        self._cookies_path = cookies_path
+        self._ytm_instance: YTMusic | None = None
+        self._ytm_anon_instance: YTMusic | None = None
         self._config = config or APIConfig()
         # LRU cache for albums with size limit
         self._album_cache: OrderedDict[str, Album] = OrderedDict()
+
+    @property
+    def _ytm(self) -> YTMusic:
+        """Underlying ytmusicapi session; created on first use.
+
+        Failures are not cached — a later call retries after a transient
+        outage, so scraping recovers without restarting the process.
+        """
+        if self._ytm_override is not None:
+            return self._ytm_override
+        if self._ytm_instance is None:
+            self._ytm_instance = self._create_ytmusic(self._cookies_path)
+        return self._ytm_instance
+
+    @property
+    def _ytm_anon(self) -> YTMusic:
+        """Cookieless ytmusicapi session for public catalog queries."""
+        if self._ytm_override is not None:
+            return self._ytm_override
+        if self._ytm_anon_instance is None:
+            self._ytm_anon_instance = self._create_ytmusic(None)
+        return self._ytm_anon_instance
 
     def _create_ytmusic(self, cookies_path: Path | None) -> YTMusic:
         """Create YTMusic instance with optional authentication.
@@ -108,17 +136,31 @@ class YTMusicClient:
 
         Returns:
             Configured YTMusic instance.
-        """
-        if cookies_path:
-            auth = cookies_to_ytmusic_auth(cookies_path)
-            if auth:
-                logger.info("Using cookies for ytmusicapi requests")
-                return YTMusic(auth=auth)
-            logger.info("No valid cookies for ytmusicapi requests (missing SAPISID)")
-            return YTMusic()
 
-        logger.info("No cookies configured for ytmusicapi requests")
-        return YTMusic()
+        Raises:
+            Exception: Propagates network/SSL errors from ytmusicapi so the
+                caller can surface them as an API failure rather than a
+                process-level crash.
+        """
+        try:
+            if cookies_path:
+                auth = cookies_to_ytmusic_auth(cookies_path)
+                if auth:
+                    logger.info("Using cookies for ytmusicapi requests")
+                    return YTMusic(auth=auth)
+                logger.info(
+                    "No valid cookies for ytmusicapi requests (missing SAPISID)"
+                )
+                return YTMusic()
+
+            logger.info("No cookies configured for ytmusicapi requests")
+            return YTMusic()
+        except Exception:
+            logger.exception(
+                "Failed to initialize ytmusicapi session "
+                "(will retry on next request)"
+            )
+            raise
 
     def get_playlist(self, playlist_id: str) -> Playlist:
         """Fetch a playlist by ID.
@@ -300,6 +342,10 @@ class YTMusicClient:
     def search_songs(self, query: str) -> list[SearchResult]:
         """Search for songs.
 
+        Prefers an anonymous session for public catalog search (cookies can
+        skew results / fail oddly). Falls back to the authenticated session
+        when anonymous search fails and cookies are configured.
+
         Args:
             query: Search query string.
 
@@ -310,21 +356,47 @@ class YTMusicClient:
             UpstreamAPIError: If API request fails.
         """
         logger.debug("Searching songs: %s", query)
-        try:
-            data = self._ytm.search(
+
+        def _run(ytm: YTMusic) -> list[SearchResult]:
+            data = ytm.search(
                 query,
                 filter="songs",
                 limit=self._config.search_limit,
                 ignore_spelling=self._config.ignore_spelling,
             )
-        except (YTMusicServerError, YTMusicUserError) as e:
-            logger.warning("YTMusic API error for search '%s': %s", query, e)
-            raise UpstreamAPIError(f"Search failed: {e}") from e
-        except YTMusicError as e:
-            logger.warning("YTMusic error for search '%s': %s", query, e)
-            raise UpstreamAPIError(f"Search failed: {e}") from e
+            return [SearchResult.model_validate(r) for r in data]
 
-        return [SearchResult.model_validate(r) for r in data]
+        # Injected mocks always use the override path once.
+        if self._ytm_override is not None:
+            try:
+                return _run(self._ytm)
+            except (YTMusicServerError, YTMusicUserError) as e:
+                logger.warning("YTMusic API error for search '%s': %s", query, e)
+                raise UpstreamAPIError(f"Search failed: {e}") from e
+            except YTMusicError as e:
+                logger.warning("YTMusic error for search '%s': %s", query, e)
+                raise UpstreamAPIError(f"Search failed: {e}") from e
+
+        last_error: Exception | None = None
+        # Prefer cookieless for public song search when cookies exist.
+        sessions: list[YTMusic] = []
+        if self._cookies_path and self._cookies_path.exists():
+            sessions.append(self._ytm_anon)
+            sessions.append(self._ytm)
+        else:
+            sessions.append(self._ytm)
+
+        for ytm in sessions:
+            try:
+                return _run(ytm)
+            except (YTMusicServerError, YTMusicUserError) as e:
+                last_error = e
+                logger.warning("YTMusic API error for search '%s': %s", query, e)
+            except YTMusicError as e:
+                last_error = e
+                logger.warning("YTMusic error for search '%s': %s", query, e)
+
+        raise UpstreamAPIError(f"Search failed: {last_error}") from last_error
 
     def get_track(self, video_id: str) -> PlaylistTrack:
         """Fetch a single track by video ID using get_watch_playlist().

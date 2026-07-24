@@ -20,4 +20,6 @@ class SchedulerStatus(BaseModel):
     cron_expression: str
     timezone: str
     next_run_at: UTCDateTime | None
+    next_run_subscription_id: str | None = None
+    next_run_subscription_name: str | None = None
     subscription_counts: SubscriptionCounts

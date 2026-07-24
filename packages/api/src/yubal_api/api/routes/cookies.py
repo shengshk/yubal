@@ -7,6 +7,7 @@ Cookies enable access to private playlists and age-restricted content.
 import asyncio
 
 from fastapi import APIRouter
+from yubal.utils.cookies import inspect_cookies_file
 
 from yubal_api.api.deps import CookiesFileDep, YtdlpDirDep
 from yubal_api.api.exceptions import CookieValidationError
@@ -39,9 +40,9 @@ def _validate_netscape_cookies(content: str) -> None:
 
 @router.get("/status")
 async def cookies_status(cookies_file: CookiesFileDep) -> CookiesStatusResponse:
-    """Check if cookies file is configured."""
-    exists = await asyncio.to_thread(cookies_file.exists)
-    return CookiesStatusResponse(configured=exists)
+    """Check cookies file presence, auth completeness, and calendar expiry."""
+    info = await asyncio.to_thread(inspect_cookies_file, cookies_file)
+    return CookiesStatusResponse.model_validate(info)
 
 
 @router.post("")

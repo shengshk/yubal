@@ -99,6 +99,9 @@ class TestCreate:
         mock_repo.get_by_url.assert_called_once()
         mock_playlist_info.get_playlist_metadata.assert_called_once()
         mock_repo.create.assert_called_once()
+        created_arg = mock_repo.create.call_args[0][0]
+        assert created_arg.save_folder == "My Playlist"
+        assert created_arg.sync_jitter_seconds == 600
 
     def test_create_conflict(
         self,

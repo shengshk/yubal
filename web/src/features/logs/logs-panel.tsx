@@ -7,6 +7,7 @@ import { Chip, Spinner } from "@heroui/react";
 import { ChevronDownIcon, CloudOffIcon, TerminalIcon } from "lucide-react";
 import { AnimatePresence, motion } from "motion/react";
 import { useEffect, useRef } from "react";
+import { useTranslation } from "react-i18next";
 import { LogLine } from "./log-line";
 import { useLogs } from "./use-logs";
 
@@ -15,6 +16,7 @@ type Props = {
 };
 
 export function LogsPanel({ jobs = [] }: Props) {
+  const { t } = useTranslation();
   const containerRef = useRef<HTMLDivElement>(null);
   const { lines, isOffline } = useLogs();
   const [isExpanded, setIsExpanded] = useLocalStorage(
@@ -46,7 +48,7 @@ export function LogsPanel({ jobs = [] }: Props) {
               variant="flat"
               startContent={<CloudOffIcon size={16} className="mr-1 ml-1" />}
             >
-              offline
+              {t("common.offline")}
             </Chip>
           ) : hasActiveJobs ? (
             <span className="flex items-center">
@@ -72,7 +74,7 @@ export function LogsPanel({ jobs = [] }: Props) {
           </motion.div>
         }
       >
-        logs
+        {t("logs.title")}
       </PanelHeader>
       <AnimatePresence initial={false}>
         {isExpanded && (
@@ -89,7 +91,11 @@ export function LogsPanel({ jobs = [] }: Props) {
               className="logs-container space-y-0.5 p-4 font-mono text-xs"
             >
               {lines.length === 0 ? (
-                <EmptyState icon={TerminalIcon} title="No activity yet" mono />
+                <EmptyState
+                  icon={TerminalIcon}
+                  title={t("logs.empty")}
+                  mono
+                />
               ) : (
                 <AnimatePresence initial={false}>
                   {lines.map((line) => (

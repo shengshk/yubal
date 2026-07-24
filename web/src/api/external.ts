@@ -1,0 +1,319 @@
+import { basePath } from "@/lib/base-path";
+
+/** "raw" = scanned but unmatched (no video_id); others mirror sync-ledger tiers. */
+export type ExternalTrackTier = "raw" | "draft" | "complete" | "premium";
+export type ExternalMatchStatus = "matched" | "unmatched" | "pending" | "rejected";
+
+export type ExternalDeleteMode =
+  | "forget_matched"
+  | "delete_matched"
+  | "move_matched_to_direct"
+  | "add_matched_to_direct"
+  | "delete_unmatched"
+  | "delete_all"
+  | "clear_offline_delete"
+  | "clear_offline_to_raw_delete";
+
+export type ExternalPlaylist = {
+  dir_name: string;
+  allow_mutate: boolean;
+  show_raw: boolean;
+  show_junk: boolean;
+  unmatched_count: number;
+  matched_count: number;
+  cloud: number;
+  local: number;
+  offline: number;
+  exclusive: number;
+  shared: number;
+  hardlink: number;
+  enabled: boolean;
+  max_items: number;
+  sync_jitter_seconds: number;
+  offline_marking_enabled: boolean;
+  offline_cleanup_enabled: boolean;
+  offline_cleanup_action: "delete" | "archive";
+  offline_cleanup_delay_hours: number;
+  last_synced_at: string | null;
+  last_sync_status: string | null;
+  /** @deprecated prefer unmatched_count + matched_count */
+  raw_count?: number;
+  total_count?: number;
+};
+
+export type ExternalPlaylistUpdate = Partial<{
+  allow_mutate: boolean;
+  show_raw: boolean;
+  show_junk: boolean;
+  enabled: boolean;
+  max_items: number;
+  sync_jitter_seconds: number;
+  offline_marking_enabled: boolean;
+  offline_cleanup_enabled: boolean;
+  offline_cleanup_action: "delete" | "archive";
+  offline_cleanup_delay_hours: number;
+}>;
+
+export type ExternalTrack = {
+  rel_path: string;
+  title: string;
+  artist: string | null;
+  album?: string | null;
+  album_artist?: string | null;
+  year?: string | null;
+  track_number?: number | null;
+  match_status: ExternalMatchStatus;
+  video_id?: string | null;
+  tier?: ExternalTrackTier | null;
+  cover_source?: string | null;
+  cover_url?: string | null;
+  exists?: boolean;
+  is_raw?: boolean;
+  tags_complete?: boolean;
+  /** Readonly incomplete / rejected — junk tier for UI. */
+  is_junk?: boolean;
+  /** Writable (rw) vs readonly (ro) junk grade. */
+  junk_kind?: "rw" | "ro" | null;
+  /** Already present under Direct (catalog); add button should stay disabled. */
+  in_direct?: boolean;
+};
+
+export type ExternalScanResult = {
+  scanned: number;
+  added: number;
+  updated: number;
+  removed: number;
+  errors: number;
+};
+
+export type ExternalMatchCandidate = {
+  video_id: string;
+  title: string;
+  artists: string;
+  album?: string;
+  thumbnail_url?: string | null;
+  title_score?: number;
+  artist_score?: number;
+  score?: number;
+};
+
+export type ExternalMatchResult = {
+  rel_path?: string;
+  matched: boolean;
+  video_id?: string | null;
+  ingested?: boolean;
+  mode_used?: "strict" | "relaxed";
+  candidates?: ExternalMatchCandidate[];
+  match_status?: ExternalMatchStatus;
+};
+
+export type ExternalMatchBatchResult = {
+  checked: number;
+  matched: number;
+  deferred: number;
+  rejected: number;
+  errors: number;
+};
+
+export type ExternalSyncResult = {
+  matched: number;
+  recovered: number;
+  checked: number;
+  errors: number;
+  deferred: number;
+  rejected: number;
+};
+
+export type ExternalDeleteResult = {
+  deleted_files: number;
+  deleted_locations: number;
+  deleted_raw: number;
+  moved: number;
+  reset_matches: number;
+  errors: number;
+};
+
+function errorMessage(body: { detail?: string; message?: string } | null) {
+  return body?.detail ?? body?.message ?? "Request failed";
+}
+
+async function errorFromResponse(res: Response): Promise<{ error: string }> {
+  const body = (await res.json().catch(() => null)) as {
+    detail?: string;
+    message?: string;
+  } | null;
+  return { error: errorMessage(body) };
+}
+
+export async function listExternalPlaylists(): Promise<ExternalPlaylist[]> {
+  const res = await fetch(`${basePath}/api/external/playlists`, {
+    credentials: "include",
+  });
+  if (!res.ok) return [];
+  const data = (await res.json()) as
+    | ExternalPlaylist[]
+    | { items?: ExternalPlaylist[] };
+  return Array.isArray(data) ? data : (data.items ?? []);
+}
+
+export async function updateExternalPlaylist(
+  dirName: string,
+  updates: ExternalPlaylistUpdate,
+): Promise<ExternalPlaylist | { error: string }> {
+  const res = await fetch(
+    `${basePath}/api/external/playlists/${encodeURIComponent(dirName)}`,
+    {
+      method: "PATCH",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(updates),
+    },
+  );
+  if (!res.ok) return errorFromResponse(res);
+  return (await res.json()) as ExternalPlaylist;
+}
+
+export async function listExternalPlaylistTracks(
+  dirName: string,
+): Promise<ExternalTrack[]> {
+  const res = await fetch(
+    `${basePath}/api/external/playlists/${encodeURIComponent(dirName)}/tracks`,
+    { credentials: "include" },
+  );
+  if (!res.ok) return [];
+  const data = (await res.json()) as
+    | ExternalTrack[]
+    | { items?: ExternalTrack[] };
+  return Array.isArray(data) ? data : (data.items ?? []);
+}
+
+export async function scanExternal(): Promise<
+  ExternalScanResult | { error: string }
+> {
+  const res = await fetch(`${basePath}/api/external/scan`, {
+    method: "POST",
+    credentials: "include",
+  });
+  if (!res.ok) return errorFromResponse(res);
+  return (await res.json()) as ExternalScanResult;
+}
+
+export async function syncExternalPlaylist(
+  dirName: string,
+  actions?: {
+    enrich?: boolean;
+    raw_match?: boolean;
+    junk_match?: boolean;
+  },
+): Promise<ExternalSyncResult | { error: string }> {
+  const body = {
+    enrich: actions?.enrich ?? true,
+    raw_match: actions?.raw_match ?? true,
+    junk_match: actions?.junk_match ?? false,
+  };
+  const res = await fetch(
+    `${basePath}/api/external/playlists/${encodeURIComponent(dirName)}/sync`,
+    {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+  );
+  if (!res.ok) return errorFromResponse(res);
+  return (await res.json()) as ExternalSyncResult;
+}
+
+export async function deleteExternalPlaylist(
+  dirName: string,
+  mode: ExternalDeleteMode,
+  directFolder = "direct",
+): Promise<ExternalDeleteResult | { error: string }> {
+  const params = new URLSearchParams({
+    confirm: "true",
+    mode,
+    direct_folder: directFolder,
+  });
+  const res = await fetch(
+    `${basePath}/api/external/playlists/${encodeURIComponent(dirName)}?${params}`,
+    { method: "DELETE", credentials: "include" },
+  );
+  if (!res.ok) return errorFromResponse(res);
+  return (await res.json()) as ExternalDeleteResult;
+}
+
+/** Match a single raw file by its path relative to External (Raw/… or Raw-relative). */
+export async function matchExternalTrack(
+  relPath: string,
+  mode?: "strict" | "relaxed",
+): Promise<ExternalMatchResult | { error: string }> {
+  const body: { rel_path: string; mode?: "strict" | "relaxed" } = {
+    rel_path: relPath,
+  };
+  if (mode) body.mode = mode;
+  const res = await fetch(`${basePath}/api/external/match/one`, {
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) return errorFromResponse(res);
+  return (await res.json()) as ExternalMatchResult;
+}
+
+/** Accept a manually chosen YTM candidate for a raw external track. */
+export async function acceptExternalMatch(
+  relPath: string,
+  videoId: string,
+  score?: number,
+): Promise<ExternalMatchResult | { error: string }> {
+  const res = await fetch(`${basePath}/api/external/match/accept`, {
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      rel_path: relPath,
+      video_id: videoId,
+      score: score ?? null,
+    }),
+  });
+  if (!res.ok) return errorFromResponse(res);
+  return (await res.json()) as ExternalMatchResult;
+}
+
+export type ExternalTrackDeleteMode =
+  | "keep_match"
+  | "clear_match"
+  | "delete_raw"
+  | "move_to_direct"
+  | "add_to_direct";
+
+export async function deleteExternalTrack(
+  dirName: string,
+  relPath: string,
+  mode: ExternalTrackDeleteMode,
+): Promise<{ ok: boolean } | { error: string }> {
+  const params = new URLSearchParams({ rel_path: relPath, mode });
+  const res = await fetch(
+    `${basePath}/api/external/playlists/${encodeURIComponent(dirName)}/tracks?${params}`,
+    { method: "DELETE", credentials: "include" },
+  );
+  if (!res.ok) return errorFromResponse(res);
+  const data = (await res.json()) as { ok?: boolean };
+  return { ok: data.ok !== false };
+}
+
+/** Batch-match up to `limit` unmatched raw tracks (optionally in one DIR). */
+export async function matchExternalPlaylist(
+  dirName: string,
+  limit = 50,
+): Promise<ExternalMatchBatchResult | { error: string }> {
+  const res = await fetch(`${basePath}/api/external/match/batch`, {
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ dir_name: dirName, limit }),
+  });
+  if (!res.ok) return errorFromResponse(res);
+  return (await res.json()) as ExternalMatchBatchResult;
+}

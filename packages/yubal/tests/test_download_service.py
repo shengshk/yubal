@@ -26,10 +26,24 @@ def _mock_network_calls() -> Iterator[None]:
     """Mock network calls to avoid slow HTTP requests in tests."""
     with (
         patch(
-            "yubal.services.download_service.fetch_cover", return_value=b"fake cover"
+            "yubal.utils.apple_cover.fetch_cover",
+            return_value=b"fake cover",
+        ),
+        patch("yubal.utils.apple_cover.search_apple_cover", return_value=None),
+        patch(
+            "yubal.utils.apple_cover.search_apple_cover_url",
+            return_value=None,
+        ),
+        patch(
+            "yubal.utils.apple_cover.probe_image_dimensions",
+            return_value=None,
         ),
         patch(
             "yubal.services.lyrics.httpx.get", return_value=MagicMock(status_code=404)
+        ),
+        patch(
+            "yubal.services.qq_lyrics.httpx.Client",
+            side_effect=RuntimeError("qq network blocked in tests"),
         ),
     ):
         yield
@@ -126,6 +140,44 @@ class TestDownloadService:
         assert result.video_id_used == "atv456"  # Should prefer ATV
         assert len(mock_downloader.downloads) == 1
 
+    def test_staged_download_is_hidden_until_atomic_publish(
+        self,
+        sample_track: TrackMetadata,
+        tmp_path: Path,
+    ) -> None:
+        library = tmp_path / "library"
+        cache = tmp_path / "cache"
+        config = DownloadConfig(
+            base_path=library,
+            download_cache_path=cache,
+            cache_min_free_gb=0,
+            data_min_free_gb=0,
+        )
+        mock_downloader = MockDownloader()
+        service = DownloadService(config, mock_downloader)
+
+        staged = service.download_track(sample_track)
+
+        assert staged.status == DownloadStatus.SUCCESS
+        assert staged.output_path is not None
+        assert staged.final_path is not None
+        assert staged.output_path.is_relative_to(cache)
+        assert staged.output_path.exists()
+        assert not staged.final_path.exists()
+        staged.output_path.with_suffix(".lrc").write_text(
+            "[00:00.00]test", encoding="utf-8"
+        )
+
+        published = service.publish_staged(staged)
+
+        assert published.status == DownloadStatus.SUCCESS
+        assert published.final_path is None
+        assert published.output_path is not None
+        assert published.output_path.is_relative_to(library)
+        assert published.output_path.exists()
+        assert published.output_path.with_suffix(".lrc").is_file()
+        assert not staged.output_path.exists()
+
     def test_download_track_prefers_atv(
         self,
         sample_track: TrackMetadata,
@@ -202,10 +254,11 @@ class TestDownloadService:
         service.download_track(sample_track)
 
         _, output_path = mock_downloader.downloads[0]
-        # Check path structure: base/Artist/YEAR - Album/NN - Title
+        # Check path structure: base/Direct/Artist/YEAR - Album/Artist - Title
+        assert "Direct" in str(output_path)
         assert "Test Artist" in str(output_path)
         assert "2024 - Test Album" in str(output_path)
-        assert "05 - Test Song" in str(output_path)
+        assert "Test Artist - Test Song" in str(output_path)
 
     def test_download_tracks_multiple(
         self,
@@ -350,7 +403,7 @@ class TestDownloadService:
         download_config: DownloadConfig,
         tmp_path: Path,
     ) -> None:
-        """Should route unmatched tracks to _Unmatched/ folder."""
+        """Should route unmatched tracks to Unmatched/ folder."""
         track = TrackMetadata(
             source_video_id="omv123",
             omv_video_id="omv123",
@@ -368,7 +421,7 @@ class TestDownloadService:
 
         assert result.status == DownloadStatus.SUCCESS
         _, output_path = mock_downloader.downloads[0]
-        assert "_Unmatched" in str(output_path)
+        assert "Unmatched" in str(output_path)
         assert "Wiz Khalifa - Mercury Retrograde [omv123]" in str(output_path)
 
     def test_download_unofficial_track_routes_to_unofficial_folder(
@@ -376,7 +429,7 @@ class TestDownloadService:
         download_config: DownloadConfig,
         tmp_path: Path,
     ) -> None:
-        """Should route unofficial (UGC) tracks to _Unofficial/ folder."""
+        """Should route unofficial (UGC) tracks to Unofficial/ folder."""
         track = TrackMetadata(
             source_video_id="ugc123",
             omv_video_id=None,
@@ -395,7 +448,7 @@ class TestDownloadService:
 
         assert result.status == DownloadStatus.SUCCESS
         _, output_path = mock_downloader.downloads[0]
-        assert "_Unofficial" in str(output_path)
+        assert "Unofficial" in str(output_path)
         assert "Some User - User Upload [ugc123]" in str(output_path)
 
     def test_track_metadata_match_result_defaults_to_matched(
@@ -417,7 +470,7 @@ class TestDownloadService:
         with (
             patch.object(service._tagger, "apply_metadata_tags") as mock_tag,
             patch(
-                "yubal.services.download_service.fetch_cover",
+                "yubal.utils.apple_cover.fetch_cover",
                 return_value=b"cover data",
             ),
         ):
@@ -677,6 +730,100 @@ class TestYTDLPDownloaderRetry:
             call_count += 1
             if call_count < 2:
                 raise Exception("HTTP Error 503: Service Unavailable")
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            Path(f"{output_path}.opus").touch()
+
+        with patch("yt_dlp.YoutubeDL") as mock_ydl:
+            mock_instance = mock_ydl.return_value.__enter__.return_value
+            mock_instance.download = mock_download
+
+            with patch("time.sleep"):
+                result = downloader.download("test_video_id", output_path)
+
+        assert call_count == 2
+        assert result.exists()
+
+    def test_retry_with_cookies_on_auth_required(
+        self, download_config: DownloadConfig, tmp_path: Path
+    ) -> None:
+        """Public-first: escalate to cookies only when YouTube demands sign-in."""
+        cookies = tmp_path / "cookies.txt"
+        cookies.write_text("# Netscape\n.youtube.com\tTRUE\t/\tFALSE\t0\tSAPISID\tx\n")
+        downloader = YTDLPDownloader(download_config, cookies_path=cookies)
+        output_path = tmp_path / "test_track"
+        call_count = 0
+        saw_cookiefile: list[bool] = []
+
+        def mock_download(urls: list[str]) -> None:
+            nonlocal call_count
+            call_count += 1
+            opts = mock_ydl.call_args[0][0]
+            saw_cookiefile.append("cookiefile" in opts)
+            if call_count == 1:
+                raise Exception("Sign in to confirm you're not a bot")
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            Path(f"{output_path}.opus").touch()
+
+        with patch("yt_dlp.YoutubeDL") as mock_ydl:
+            mock_instance = mock_ydl.return_value.__enter__.return_value
+            mock_instance.download = mock_download
+            result = downloader.download("test_video_id", output_path)
+
+        assert call_count == 2
+        assert saw_cookiefile == [False, True]
+        assert result.exists()
+
+    def test_retry_without_cookies_when_format_unavailable(
+        self, download_config: DownloadConfig, tmp_path: Path
+    ) -> None:
+        """After auth escalate, poisoned cookies → fall back anonymously."""
+        cookies = tmp_path / "cookies.txt"
+        cookies.write_text("# Netscape\n.youtube.com\tTRUE\t/\tFALSE\t0\tSAPISID\tx\n")
+        downloader = YTDLPDownloader(download_config, cookies_path=cookies)
+        output_path = tmp_path / "test_track"
+        call_count = 0
+        saw_cookiefile: list[bool] = []
+
+        def mock_download(urls: list[str]) -> None:
+            nonlocal call_count
+            call_count += 1
+            opts = mock_ydl.call_args[0][0]
+            saw_cookiefile.append("cookiefile" in opts)
+            if call_count == 1:
+                raise Exception("Sign in to confirm you're not a bot")
+            if call_count == 2:
+                raise Exception(
+                    "ERROR: [youtube] abc: Requested format is not available. "
+                    "Use --list-formats for a list of available formats"
+                )
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            Path(f"{output_path}.opus").touch()
+
+        with patch("yt_dlp.YoutubeDL") as mock_ydl:
+            mock_instance = mock_ydl.return_value.__enter__.return_value
+            mock_instance.download = mock_download
+            result = downloader.download("test_video_id", output_path)
+
+        assert call_count == 3
+        assert saw_cookiefile == [False, True, False]
+        assert result.exists()
+
+    def test_retry_on_ssl_eof(
+        self, download_config: DownloadConfig, tmp_path: Path
+    ) -> None:
+        """Should retry on TLS EOF from flaky YouTube CDN connections."""
+        downloader = YTDLPDownloader(download_config)
+        output_path = tmp_path / "test_track"
+        call_count = 0
+
+        def mock_download(urls: list[str]) -> None:
+            nonlocal call_count
+            call_count += 1
+            if call_count < 2:
+                raise Exception(
+                    "[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in "
+                    "violation of protocol (_ssl.c:1010)"
+                )
             output_path.parent.mkdir(parents=True, exist_ok=True)
             Path(f"{output_path}.opus").touch()
 

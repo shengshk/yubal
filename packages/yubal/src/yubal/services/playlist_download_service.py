@@ -26,6 +26,7 @@ from yubal.services.cache import ExtractionCache
 from yubal.services.download_service import DownloadService
 from yubal.services.extractor import MetadataExtractorService
 from yubal.services.replaygain import ReplayGainProtocol, ReplayGainService
+from yubal.utils.library import resolve_default_library_folder
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +86,7 @@ class PlaylistDownloadService:
         composer: PlaylistArtifactsProtocol | None = None,
         replaygain: ReplayGainProtocol | None = None,
         cookies_path: Path | None = None,
+        folder_presence: object | None = None,
     ) -> None:
         """Initialize the service.
 
@@ -111,6 +113,7 @@ class PlaylistDownloadService:
             config.download,
             cookies_path=cookies_path,
             ytmusic_client=client,
+            folder_presence=folder_presence,  # type: ignore[arg-type]
         )
         self._composer = composer or PlaylistArtifactsService(
             ascii_filenames=config.download.ascii_filenames,
@@ -176,8 +179,8 @@ class PlaylistDownloadService:
 
         # Log pipeline start
         logger.info(
-            "Starting new download",
-            extra={"header": "New Download"},
+            "Starting import",
+            extra={"header": "Import"},
         )
         logger.info("URL: %s", url)
 
@@ -195,35 +198,80 @@ class PlaylistDownloadService:
                 playlist_info = extract_progress.playlist_info
                 yield progress
 
-            # Early exit if no tracks found
-            if not extracted_tracks or not playlist_info:
+            # Missing playlist metadata is an extraction failure. A playlist with
+            # zero available tracks is still a valid remote snapshot.
+            if not playlist_info:
                 logger.warning("No tracks extracted, nothing to download")
                 self._last_result = None
                 return
+            if not extracted_tracks:
+                logger.info("Remote playlist currently contains no available tracks")
+                self._last_result = self._build_final_result(
+                    playlist_info,
+                    [],
+                    ArtifactPaths(),
+                    source_tracks=[],
+                )
+                return
 
-            # Phase 2: Download tracks to disk
+            # Resolve top-level library folder (playlist save folder or Direct)
+            library_folder = self._resolve_library_folder(playlist_info)
+            self._downloader.set_library_folder(library_folder)
+            logger.info("Library folder: %s", library_folder)
+
+            # ``extracted_tracks`` is the authoritative remote membership. Apply
+            # max_items only to the download budget, never to membership discovery.
+            download_tracks = self._select_download_tracks(extracted_tracks)
+
+            # Phase 2: Download selected tracks to disk
             download_results: list[DownloadResult] = []
+            staging_enabled = self._config.download.download_cache_path is not None
+            defer_album_publish = (
+                staging_enabled
+                and self._config.apply_replaygain
+                and playlist_info.kind == ContentKind.ALBUM
+                and self._config.max_items is None
+            )
 
             for progress, result in self._download_phase(
-                extracted_tracks, cancel_token
+                download_tracks,
+                cancel_token,
+                publish_staged=not defer_album_publish,
             ):
                 download_results.append(result)
                 yield progress
 
-            # Log download statistics
+            # Complete albums remain in the SSD cache until album + track gain has
+            # been written. Failed/partial albums automatically use track-only mode.
+            if defer_album_publish:
+                yield from self._normalize_phase(
+                    playlist_info,
+                    download_results,
+                    expected_count=len(extracted_tracks),
+                    cancel_token=cancel_token,
+                )
+                download_results = [
+                    self._downloader.publish_staged(result)
+                    for result in download_results
+                ]
+
+            # Include publication failures in the final download statistics.
             self._log_download_stats(download_results)
 
             # Phase 3: Generate playlist artifacts
             artifacts = ArtifactPaths()
 
             for progress, phase_artifacts in self._compose_phase(
-                playlist_info, download_results, cancel_token
+                playlist_info,
+                download_results,
+                cancel_token,
+                library_folder=library_folder,
             ):
                 artifacts = phase_artifacts
                 yield progress
 
             # Phase 4: Apply ReplayGain tags (optional)
-            if self._config.apply_replaygain:
+            if self._config.apply_replaygain and not staging_enabled:
                 yield from self._normalize_phase(
                     playlist_info,
                     download_results,
@@ -233,7 +281,10 @@ class PlaylistDownloadService:
 
             # Store complete result for retrieval via get_result()
             self._last_result = self._build_final_result(
-                playlist_info, download_results, artifacts
+                playlist_info,
+                download_results,
+                artifacts,
+                source_tracks=extracted_tracks,
             )
 
             self._log_failed_downloads(download_results)
@@ -347,9 +398,10 @@ class PlaylistDownloadService:
 
         for progress in self._extractor.extract(
             url,
-            max_items=self._config.max_items,
+            max_items=None,
             cancel_token=cancel_token,
             cache=self._cache,
+            is_already_local=self._downloader.has_local_copy,
         ):
             yield (
                 PlaylistProgress(
@@ -361,6 +413,27 @@ class PlaylistDownloadService:
                 progress,
             )
 
+    def _select_download_tracks(
+        self,
+        tracks: list[TrackMetadata],
+    ) -> list[TrackMetadata]:
+        """Apply max_items to new downloads while retaining already-local tracks."""
+        excluded = self._config.excluded_video_ids or frozenset()
+        if excluded:
+            tracks = [t for t in tracks if t.video_id not in excluded]
+        limit = self._config.max_items
+        if limit is None:
+            return tracks
+        selected: list[TrackMetadata] = []
+        new_count = 0
+        for track in tracks:
+            if self._downloader.has_local_copy(track.video_id):
+                selected.append(track)
+            elif new_count < limit:
+                selected.append(track)
+                new_count += 1
+        return selected
+
     # ============================================================================
     # PHASE 2: DOWNLOAD - Download tracks to disk via yt-dlp
     # ============================================================================
@@ -369,6 +442,8 @@ class PlaylistDownloadService:
         self,
         tracks: list[TrackMetadata],
         cancel_token: CancelToken | None,
+        *,
+        publish_staged: bool = True,
     ) -> Iterator[tuple[PlaylistProgress, DownloadResult]]:
         """Execute track download phase with progress updates.
 
@@ -386,25 +461,41 @@ class PlaylistDownloadService:
         self._check_cancellation(cancel_token)
 
         logger.info(
-            "Downloading %d tracks",
+            "Processing %d tracks",
             len(tracks),
             extra={"phase": "downloading", "phase_num": 2},
         )
 
         for progress in self._downloader.download_tracks(tracks, cancel_token):
+            result = progress.result
+            if (
+                publish_staged
+                and result.status == DownloadStatus.SUCCESS
+                and result.final_path is not None
+            ):
+                if self._config.apply_replaygain and result.output_path is not None:
+                    self._replaygain.apply_replaygain(
+                        [result.output_path],
+                        self._config.download.codec,
+                        album_mode=False,
+                    )
+                result = self._downloader.publish_staged(result)
             yield (
                 PlaylistProgress(
                     phase="downloading",
                     current=progress.current,
                     total=progress.total,
-                    download_progress=progress,
+                    download_progress=progress.model_copy(update={"result": result}),
                 ),
-                progress.result,
+                result,
             )
 
     def _log_download_stats(self, results: list[DownloadResult]) -> None:
         """Log download statistics after download phase completes."""
         success_count = sum(1 for r in results if r.status == DownloadStatus.SUCCESS)
+        hardlinked_count = sum(
+            1 for r in results if r.status == DownloadStatus.HARDLINKED
+        )
         failed_count = sum(1 for r in results if r.status == DownloadStatus.FAILED)
         skipped_by_reason = aggregate_skip_reasons(results)
 
@@ -414,6 +505,7 @@ class PlaylistDownloadService:
                 "stats": {
                     "stats_type": "download",
                     "success": success_count,
+                    "hardlinked": hardlinked_count,
                     "failed": failed_count,
                     "skipped_by_reason": {
                         k.value: v for k, v in skipped_by_reason.items()
@@ -449,11 +541,24 @@ class PlaylistDownloadService:
     # PHASE 3: COMPOSITION - Generate M3U playlists and save cover art
     # ============================================================================
 
+    def _resolve_library_folder(self, playlist_info: PlaylistInfo) -> str:
+        """Resolve the top-level folder for this download."""
+        configured = self._config.download.library_folder
+        if configured:
+            return configured
+        return resolve_default_library_folder(
+            playlist_info.kind.value,
+            playlist_info.title,
+            ascii_filenames=self._config.download.ascii_filenames,
+        )
+
     def _compose_phase(
         self,
         playlist_info: PlaylistInfo,
         results: list[DownloadResult],
         cancel_token: CancelToken | None,
+        *,
+        library_folder: str,
     ) -> Iterator[tuple[PlaylistProgress, ArtifactPaths]]:
         """Execute playlist composition phase with progress updates.
 
@@ -465,6 +570,7 @@ class PlaylistDownloadService:
             playlist_info: Playlist metadata for file generation.
             results: Download results to include in M3U files.
             cancel_token: Optional cancellation token.
+            library_folder: Top-level folder under base_path for this content.
 
         Yields:
             Tuples of (PlaylistProgress, ArtifactPaths).
@@ -504,8 +610,9 @@ class PlaylistDownloadService:
             ArtifactPaths(),
         )
 
+        playlist_dir = self._config.download.base_path / library_folder
         artifact_paths = self._composer.compose(
-            self._config.download.base_path,
+            playlist_dir,
             playlist_info,
             results,
             generate_m3u=self._config.generate_m3u,
@@ -620,6 +727,8 @@ class PlaylistDownloadService:
         playlist_info: PlaylistInfo,
         results: list[DownloadResult],
         artifacts: ArtifactPaths,
+        *,
+        source_tracks: list[TrackMetadata],
     ) -> PlaylistDownloadResult:
         """Construct final result object with all download outcomes.
 
@@ -634,6 +743,7 @@ class PlaylistDownloadService:
         return PlaylistDownloadResult(
             playlist_info=playlist_info,
             download_results=results,
+            source_tracks=source_tracks,
             m3u_path=artifacts.m3u,
             cover_path=artifacts.cover,
         )

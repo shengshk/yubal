@@ -402,6 +402,22 @@ export interface components {
         CookiesStatusResponse: {
             /** Configured */
             configured: boolean;
+            /** Authenticated */
+            authenticated?: boolean;
+            /** Auth Complete */
+            auth_complete?: boolean;
+            /** Expired */
+            expired?: boolean;
+            /** Expiring Soon */
+            expiring_soon?: boolean;
+            /** Expires At */
+            expires_at?: string | null;
+            /** Days Remaining */
+            days_remaining?: number | null;
+            /** Status */
+            status?: "missing" | "ok" | "expired" | "incomplete" | "expiring_soon";
+            /** Missing */
+            missing?: string[];
         };
         /**
          * CookiesUploadRequest
@@ -655,7 +671,7 @@ export interface components {
              * @description Operation result status
              * @default null
              */
-            status: ("success" | "skipped" | "failed") | null;
+            status: ("success" | "skipped" | "failed" | "hardlinked") | null;
             /**
              * @description Aggregate statistics for batch operations
              * @default null
@@ -718,6 +734,11 @@ export interface components {
              */
             success: number;
             /**
+             * Hardlinked
+             * @default 0
+             */
+            hardlinked?: number;
+            /**
              * Cached
              * @default 0
              */
@@ -769,6 +790,11 @@ export interface components {
              */
             success: number;
             /**
+             * Hardlinked
+             * @default 0
+             */
+            hardlinked?: number;
+            /**
              * Failed
              * @default 0
              */
@@ -793,6 +819,10 @@ export interface components {
             timezone: string;
             /** Next Run At */
             next_run_at: string | null;
+            /** Next Run Subscription Id */
+            next_run_subscription_id?: string | null;
+            /** Next Run Subscription Name */
+            next_run_subscription_name?: string | null;
             subscription_counts: components["schemas"]["SubscriptionCounts"];
         };
         /**
@@ -854,10 +884,39 @@ export interface components {
             url: string;
             /** Name */
             name: string;
+            /** Save Folder */
+            save_folder: string;
             /** Enabled */
             enabled: boolean;
             /** Max Items */
             max_items: number | null;
+            /** Sync Jitter Seconds */
+            sync_jitter_seconds?: number;
+            /**
+             * Sync Mode
+             * @default incremental
+             */
+            sync_mode?: "incremental" | "mirror";
+            /**
+             * Offline Marking Enabled
+             * @default true
+             */
+            offline_marking_enabled?: boolean;
+            /**
+             * Offline Cleanup Enabled
+             * @default false
+             */
+            offline_cleanup_enabled?: boolean;
+            /**
+             * Offline Cleanup Action
+             * @default archive
+             */
+            offline_cleanup_action?: "delete" | "archive";
+            /**
+             * Offline Cleanup Delay Hours
+             * @default 72
+             */
+            offline_cleanup_delay_hours?: number;
             /**
              * Thumbnail Url
              * Format: uri
@@ -884,6 +943,24 @@ export interface components {
         SubscriptionUpdate: {
             /** Enabled */
             enabled?: boolean | null;
+            /** Save Folder */
+            save_folder?: string | null;
+            /** Max Items */
+            max_items?: number | null;
+            /** Sync Jitter Seconds */
+            sync_jitter_seconds?: number | null;
+            /** Sync Mode */
+            sync_mode?: ("incremental" | "mirror") | null;
+            /** Offline Marking Enabled */
+            offline_marking_enabled?: boolean | null;
+            /** Offline Cleanup Enabled */
+            offline_cleanup_enabled?: boolean | null;
+            /** Offline Cleanup Action */
+            offline_cleanup_action?: ("delete" | "archive") | null;
+            /** Offline Cleanup Delay Hours */
+            offline_cleanup_delay_hours?: number | null;
+            /** Confirm Folder Move */
+            confirm_folder_move?: boolean;
         };
         /**
          * SyncResponse

@@ -103,35 +103,35 @@ class TestLogLevel:
         assert settings.log_level == "INFO"
 
 
-class TestRootRequired:
-    """Tests for root directory requirement."""
+class TestRootOptional:
+    """Tests for optional root (defaults to /app)."""
 
-    def test_raises_when_root_missing(self) -> None:
-        """Should raise error when root is not provided."""
-        with pytest.raises(
-            ValidationError, match="YUBAL_ROOT environment variable is required"
-        ):
-            Settings(data=TEST_DATA, config=TEST_CONFIG)  # type: ignore[call-arg]
+    def test_defaults_without_root(self) -> None:
+        """Should use /app and /data layout when nothing is provided."""
+        settings = Settings()  # type: ignore[call-arg]
+        assert settings.root == Path("/app")
+        assert settings.data == Path("/data/download")
+        assert settings.config == Path("/config")
 
 
 class TestPathDefaults:
-    """Tests for path default values based on root."""
+    """Tests for path default values."""
 
-    def test_data_defaults_to_root_data(self) -> None:
-        """Should default data to root/data."""
+    def test_data_defaults_to_data_download(self) -> None:
+        """Should default data to /data/download."""
         settings = Settings(
             root=TEST_ROOT,
             config=TEST_CONFIG,
         )  # type: ignore[call-arg]
-        assert settings.data == Path("/tmp/test/data")
+        assert settings.data == Path("/data/download")
 
-    def test_config_defaults_to_root_config(self) -> None:
-        """Should default config to root/config."""
+    def test_config_defaults_to_config(self) -> None:
+        """Should default config to /config."""
         settings = Settings(
             root=TEST_ROOT,
             data=TEST_DATA,
         )  # type: ignore[call-arg]
-        assert settings.config == Path("/tmp/test/config")
+        assert settings.config == Path("/config")
 
 
 class TestTimezone:

@@ -4,7 +4,7 @@ Available via `from yubal.utils import ...` for power users.
 Not re-exported at the top-level `yubal` package.
 """
 
-from yubal.utils.cleanup import cleanup_part_files
+from yubal.utils.cleanup import cleanup_part_files, cleanup_startup_temps
 from yubal.utils.cookies import cookies_to_ytmusic_auth, is_authenticated_cookies
 from yubal.utils.cover import (
     clear_cover_cache,
@@ -23,6 +23,7 @@ __all__ = [
     "build_track_path",
     "clean_filename",
     "cleanup_part_files",
+    "cleanup_startup_temps",
     "clear_cover_cache",
     "cookies_to_ytmusic_auth",
     "fetch_cover",

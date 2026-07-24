@@ -314,7 +314,7 @@ class TestBuildTrackPathAsciiMode:
             title="Jóga",
             ascii_filenames=True,
         )
-        assert result == Path("/music/Bjork/1997 - Homogenic/02 - Joga")
+        assert result == Path("/music/Bjork/1997 - Homogenic/Bjork - Joga")
 
     def test_default_preserves_unicode(self) -> None:
         """Default should preserve unicode in path components."""
@@ -326,7 +326,7 @@ class TestBuildTrackPathAsciiMode:
             track_number=2,
             title="Jóga",
         )
-        assert result == Path("/music/Björk/1997 - Homogenic/02 - Jóga")
+        assert result == Path("/music/Björk/1997 - Homogenic/Björk - Jóga")
 
 
 class TestBuildUnmatchedTrackPathAsciiMode:
@@ -341,7 +341,7 @@ class TestBuildUnmatchedTrackPathAsciiMode:
             video_id="abc123",
             ascii_filenames=True,
         )
-        assert result == Path("/music/_Unmatched/Bjork - Joga [abc123]")
+        assert result == Path("/music/Unmatched/Bjork - Joga [abc123]")
 
 
 class TestBuildTrackPath:
@@ -352,7 +352,7 @@ class TestBuildTrackPath:
     def test_docstring_example(self) -> None:
         """Should pass docstring example."""
         result = build_track_path(Path("/music"), "Artist", "2024", "Album", 1, "Song")
-        assert result == Path("/music/Artist/2024 - Album/01 - Song")
+        assert result == Path("/music/Artist/2024 - Album/Artist - Song")
 
     # === Normal Inputs ===
 
@@ -366,7 +366,9 @@ class TestBuildTrackPath:
             track_number=5,
             title="Test Song",
         )
-        assert result == Path("/music/Test Artist/2024 - Test Album/05 - Test Song")
+        assert result == Path(
+            "/music/Test Artist/2024 - Test Album/Test Artist - Test Song"
+        )
 
     def test_build_path_preserves_unicode(self) -> None:
         """Should preserve unicode characters in path components."""
@@ -378,7 +380,7 @@ class TestBuildTrackPath:
             track_number=2,
             title="Jóga",
         )
-        assert result == Path("/music/Björk/1997 - Homogenic/02 - Jóga")
+        assert result == Path("/music/Björk/1997 - Homogenic/Björk - Jóga")
 
     def test_limits_composed_path_components(self) -> None:
         """Should cap final path components after adding prefixes."""
@@ -419,7 +421,7 @@ class TestBuildTrackPath:
     # === Optional Parameters (None values) ===
 
     def test_build_path_without_track_number(self) -> None:
-        """Should handle None track number (no prefix)."""
+        """Track number is ignored; filename is always Artist - Title."""
         result = build_track_path(
             base=Path("/music"),
             artist="Artist",
@@ -428,7 +430,7 @@ class TestBuildTrackPath:
             track_number=None,
             title="Song",
         )
-        assert result == Path("/music/Artist/2024 - Album/Song")
+        assert result == Path("/music/Artist/2024 - Album/Artist - Song")
 
     def test_build_path_without_year(self) -> None:
         """Should omit year prefix when year is None."""
@@ -440,7 +442,7 @@ class TestBuildTrackPath:
             track_number=1,
             title="Song",
         )
-        assert result == Path("/music/Artist/Album/01 - Song")
+        assert result == Path("/music/Artist/Album/Artist - Song")
 
     def test_build_path_without_year_and_track_number(self) -> None:
         """Should handle both None year and None track number."""
@@ -452,7 +454,7 @@ class TestBuildTrackPath:
             track_number=None,
             title="Song",
         )
-        assert result == Path("/music/Artist/Album/Song")
+        assert result == Path("/music/Artist/Album/Artist - Song")
 
     # === Empty String Fallbacks ===
 
@@ -500,18 +502,11 @@ class TestBuildTrackPath:
         assert expected_album in str(result)
         assert expected_title in str(result)
 
-    # === Track Number Formatting ===
+    # === Track Number Is Ignored In The Filename ===
 
     @pytest.mark.parametrize(
-        ("track_number", "expected_prefix"),
-        [
-            (1, "01 - "),
-            (9, "09 - "),
-            (10, "10 - "),
-            (12, "12 - "),
-            (99, "99 - "),
-            (100, "100 - "),
-        ],
+        "track_number",
+        [1, 9, 10, 12, 99, 100, 0, None],
         ids=[
             "single_digit_1",
             "single_digit_9",
@@ -519,12 +514,14 @@ class TestBuildTrackPath:
             "double_digit_12",
             "double_digit_99",
             "triple_digit",
+            "zero",
+            "none",
         ],
     )
-    def test_track_number_formatting(
-        self, track_number: int, expected_prefix: str
+    def test_track_number_does_not_affect_filename(
+        self, track_number: int | None
     ) -> None:
-        """Should format track numbers with leading zeros (at least 2 digits)."""
+        """track_number is accepted for compatibility but never used."""
         result = build_track_path(
             base=Path("/music"),
             artist="Artist",
@@ -533,19 +530,7 @@ class TestBuildTrackPath:
             track_number=track_number,
             title="Song",
         )
-        assert expected_prefix in str(result)
-
-    def test_track_number_zero(self) -> None:
-        """Should handle track number 0."""
-        result = build_track_path(
-            base=Path("/music"),
-            artist="Artist",
-            year="2024",
-            album="Album",
-            track_number=0,
-            title="Song",
-        )
-        assert "00 - Song" in str(result)
+        assert result == Path("/music/Artist/2024 - Album/Artist - Song")
 
     # === Sanitization of Components ===
 
@@ -664,7 +649,7 @@ class TestBuildTrackPath:
             track_number=1,
             title="Song",
         )
-        assert result == Path("/home/user/music/Artist/2024 - Album/01 - Song")
+        assert result == Path("/home/user/music/Artist/2024 - Album/Artist - Song")
 
     def test_build_path_with_nested_base(self) -> None:
         """Should work with deeply nested base path."""
@@ -676,7 +661,7 @@ class TestBuildTrackPath:
             track_number=1,
             title="Song",
         )
-        assert result == Path("/a/b/c/d/music/Artist/2024 - Album/01 - Song")
+        assert result == Path("/a/b/c/d/music/Artist/2024 - Album/Artist - Song")
 
     # === Year Format Variations ===
 
@@ -704,7 +689,7 @@ class TestBuildTrackPath:
     # === Path Structure Verification ===
 
     def test_path_structure(self) -> None:
-        """Should follow convention: base/Artist/YEAR - Album/NN - Title."""
+        """Should follow convention: base/Artist/YEAR - Album/Artist - Title."""
         result = build_track_path(
             base=Path("/music"),
             artist="The Beatles",
@@ -717,7 +702,20 @@ class TestBuildTrackPath:
         assert parts[-4] == "music"
         assert parts[-3] == "The Beatles"
         assert parts[-2] == "1969 - Abbey Road"
-        assert parts[-1] == "07 - Here Comes The Sun"
+        assert parts[-1] == "The Beatles - Here Comes The Sun"
+
+    def test_video_id_suffix_disambiguates_collisions(self) -> None:
+        """Passing video_id appends a [last6] suffix to the filename."""
+        result = build_track_path(
+            base=Path("/music"),
+            artist="Artist",
+            year="2024",
+            album="Album",
+            track_number=1,
+            title="Song",
+            video_id="dQw4w9WgXcQ",
+        )
+        assert result == Path("/music/Artist/2024 - Album/Artist - Song [9WgXcQ]")
 
     def test_returns_path_object(self) -> None:
         """Should return a Path object, not a string."""
@@ -743,7 +741,7 @@ class TestBuildUnmatchedTrackPath:
             Path("/music"), "Wiz Khalifa", "Mercury Retrograde", "-HJ0ZGkdlTk"
         )
         assert result == Path(
-            "/music/_Unmatched/Wiz Khalifa - Mercury Retrograde [-HJ0ZGkdlTk]"
+            "/music/Unmatched/Wiz Khalifa - Mercury Retrograde [-HJ0ZGkdlTk]"
         )
 
     # === Normal Inputs ===
@@ -756,7 +754,7 @@ class TestBuildUnmatchedTrackPath:
             title="Test Song",
             video_id="abc123",
         )
-        assert result == Path("/music/_Unmatched/Test Artist - Test Song [abc123]")
+        assert result == Path("/music/Unmatched/Test Artist - Test Song [abc123]")
 
     def test_build_path_preserves_unicode(self) -> None:
         """Should preserve unicode characters in path components."""
@@ -766,7 +764,7 @@ class TestBuildUnmatchedTrackPath:
             title="Jóga",
             video_id="xyz789",
         )
-        assert result == Path("/music/_Unmatched/Björk - Jóga [xyz789]")
+        assert result == Path("/music/Unmatched/Björk - Jóga [xyz789]")
 
     def test_limits_filename_and_preserves_video_id_suffix(self) -> None:
         """Should cap flat filenames while keeping the video ID."""
@@ -804,7 +802,7 @@ class TestBuildUnmatchedTrackPath:
         # Check that invalid chars don't appear in non-base parts
         path_after_base = str(result).replace("/music/", "")
         if invalid_char == "/":
-            # Only the directory separator between _Unmatched and filename
+            # Only the directory separator between Unmatched and filename
             assert path_after_base.count("/") == 1
         else:
             assert invalid_char not in path_after_base
@@ -841,7 +839,7 @@ class TestBuildUnmatchedTrackPath:
         # No invalid filesystem chars in the result
         for char in ':*?"<>|':
             assert char not in path_after_base
-        # Should have exactly 1 slash (directory separator for _Unmatched/)
+        # Should have exactly 1 slash (directory separator for Unmatched/)
         assert path_after_base.count("/") == 1
 
     # === Empty String Fallbacks ===
@@ -879,7 +877,7 @@ class TestBuildUnmatchedTrackPath:
     # === Path Structure Verification ===
 
     def test_path_structure(self) -> None:
-        """Should follow convention: base/_Unmatched/Artist - Title [videoId]."""
+        """Should follow convention: base/Unmatched/Artist - Title [videoId]."""
         result = build_unmatched_track_path(
             base=Path("/music"),
             artist="The Beatles",
@@ -888,7 +886,7 @@ class TestBuildUnmatchedTrackPath:
         )
         parts = result.parts
         assert parts[-3] == "music"
-        assert parts[-2] == "_Unmatched"
+        assert parts[-2] == "Unmatched"
         assert parts[-1] == "The Beatles - Here Comes The Sun [dQw4w9WgXcQ]"
 
     # === Return Type ===
@@ -912,7 +910,7 @@ class TestBuildUnofficialTrackPath:
         result = build_unofficial_track_path(
             Path("/music"), "Some User", "Cool Song", "abc123"
         )
-        assert result == Path("/music/_Unofficial/Some User - Cool Song [abc123]")
+        assert result == Path("/music/Unofficial/Some User - Cool Song [abc123]")
 
     def test_basic_path_construction(self) -> None:
         """Should build complete path with all components."""
@@ -922,10 +920,10 @@ class TestBuildUnofficialTrackPath:
             title="Test Song",
             video_id="xyz789",
         )
-        assert result == Path("/music/_Unofficial/Test Artist - Test Song [xyz789]")
+        assert result == Path("/music/Unofficial/Test Artist - Test Song [xyz789]")
 
     def test_path_structure(self) -> None:
-        """Should follow convention: base/_Unofficial/Artist - Title [videoId]."""
+        """Should follow convention: base/Unofficial/Artist - Title [videoId]."""
         result = build_unofficial_track_path(
             base=Path("/music"),
             artist="Some User",
@@ -934,7 +932,7 @@ class TestBuildUnofficialTrackPath:
         )
         parts = result.parts
         assert parts[-3] == "music"
-        assert parts[-2] == "_Unofficial"
+        assert parts[-2] == "Unofficial"
         assert parts[-1] == "Some User - Upload Title [dQw4w9WgXcQ]"
 
     def test_transliterates_components(self) -> None:
@@ -946,7 +944,7 @@ class TestBuildUnofficialTrackPath:
             video_id="abc123",
             ascii_filenames=True,
         )
-        assert result == Path("/music/_Unofficial/Bjork - Joga [abc123]")
+        assert result == Path("/music/Unofficial/Bjork - Joga [abc123]")
 
     def test_limits_filename_and_preserves_video_id_suffix(self) -> None:
         """Should cap unofficial filenames while keeping the video ID."""

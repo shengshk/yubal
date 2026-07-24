@@ -15,24 +15,16 @@ class PhaseStats(BaseModel):
     Adding new skip reasons only requires updating the SkipReason enum.
 
     Attributes:
-        success: Number of successfully processed items.
+        success: Number of newly downloaded files (real downloads).
+        hardlinked: Number of tracks linked to an existing local file.
         failed: Number of failed items.
         skipped_by_reason: Count of skipped items by reason.
-
-    Example:
-        >>> stats = PhaseStats(
-        ...     success=8,
-        ...     failed=1,
-        ...     skipped_by_reason={SkipReason.FILE_EXISTS: 2}
-        ... )
-        >>> stats.skipped  # 2
-        >>> stats.total    # 11
-        >>> stats.success_rate  # 72.7...
     """
 
     model_config = ConfigDict(frozen=True)
 
     success: int = 0
+    hardlinked: int = 0
     failed: int = 0
     skipped_by_reason: dict[SkipReason, int] = Field(default_factory=dict)
 
@@ -43,8 +35,8 @@ class PhaseStats(BaseModel):
 
     @property
     def total(self) -> int:
-        """Total items processed (success + failed + skipped)."""
-        return self.success + self.failed + self.skipped
+        """Total items processed (success + hardlinked + failed + skipped)."""
+        return self.success + self.hardlinked + self.failed + self.skipped
 
 
 class DownloadResult(BaseModel):
@@ -57,6 +49,7 @@ class DownloadResult(BaseModel):
         error: Error message (if failed).
         video_id_used: The video ID that was used for download.
         skip_reason: Why the track was skipped (if status is SKIPPED).
+        origin: How the file entered B (download / preselect_link / …).
     """
 
     model_config = ConfigDict(frozen=True)
@@ -64,9 +57,11 @@ class DownloadResult(BaseModel):
     track: TrackMetadata
     status: DownloadStatus
     output_path: Path | None = None
+    final_path: Path | None = None
     error: str | None = None
     video_id_used: str | None = None
     skip_reason: SkipReason | None = None
+    origin: str | None = None
 
 
 def get_audio_bitrate(path: Path | None) -> int | None:
@@ -130,14 +125,31 @@ class PlaylistDownloadResult(BaseModel):
 
     playlist_info: PlaylistInfo
     download_results: list[DownloadResult]
+    source_tracks: list[TrackMetadata] = Field(default_factory=list)
     m3u_path: Path | None = None
     cover_path: Path | None = None
 
     @property
     def success_count(self) -> int:
-        """Number of successfully downloaded tracks."""
+        """Newly acquired tracks (yt-dlp download or preselect into B)."""
         return sum(
-            1 for r in self.download_results if r.status == DownloadStatus.SUCCESS
+            1
+            for r in self.download_results
+            if r.status in (DownloadStatus.SUCCESS, DownloadStatus.PRESELECTED)
+        )
+
+    @property
+    def preselected_count(self) -> int:
+        """Tracks placed from the preselect library."""
+        return sum(
+            1 for r in self.download_results if r.status == DownloadStatus.PRESELECTED
+        )
+
+    @property
+    def hardlinked_count(self) -> int:
+        """Number of tracks hardlinked to an existing local file."""
+        return sum(
+            1 for r in self.download_results if r.status == DownloadStatus.HARDLINKED
         )
 
     @property
@@ -159,6 +171,7 @@ class PlaylistDownloadResult(BaseModel):
         """Compute download phase statistics with skip reason breakdown."""
         return PhaseStats(
             success=self.success_count,
+            hardlinked=self.hardlinked_count,
             failed=self.failed_count,
             skipped_by_reason=aggregate_skip_reasons(self.download_results),
         )

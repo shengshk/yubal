@@ -1,0 +1,46 @@
+# Public compose example — copy to compose.yaml and edit locally.
+# 公开示例：复制为 compose.yaml 后本地修改（勿把密钥提交进仓库）。
+#
+# Default: pull published image. 默认拉取发布镜像。
+# Optional: uncomment build: and use image: yubal:local instead.
+# 可选：取消注释 build:，并改用 image: yubal:local 自行构建。
+
+services:
+  yubal:
+    image: ghcr.io/shengshk/yubal:latest
+    # build: .
+    # image: yubal:local
+    container_name: yubal
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      PUID: 1000
+      PGID: 1000
+      YUBAL_TZ: Asia/Shanghai
+      YUBAL_AUTH_LOGIN: "true"
+      # YUBAL_SCHEDULER_CRON: "0 * * * *"
+      # Local Bot API (large file path upload). Omit to use official Telegram API.
+      # 本地 Bot API（大文件按路径上传）。不设则走官方 API。
+      YUBAL_TG_API_URL: http://tgapi:8081
+    volumes:
+      - ./data:/data
+      - ./config:/config
+      # - /mnt/ssd/yubal-cache:/data/cache
+
+  # Optional; recommended for Telegram large uploads.
+  # 可选；Telegram 大文件上传建议启用。
+  # Same Docker network as yubal; mount the same ./data read-only.
+  # 须与 yubal 同网；只读挂载同一 ./data。
+  tgapi:
+    image: aiogram/telegram-bot-api:latest
+    container_name: yubal-tgapi
+    restart: unless-stopped
+    environment:
+      # https://my.telegram.org — replace placeholders; never commit real secrets
+      TELEGRAM_API_ID: "YOUR_API_ID"
+      TELEGRAM_API_HASH: "YOUR_API_HASH"
+      # TELEGRAM_PROXY: "socks5://host:port"
+    volumes:
+      - ./tgapi:/var/lib/telegram-bot-api
+      - ./data:/data:ro

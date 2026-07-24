@@ -1,7 +1,9 @@
 /data/
 /config/
+/tgapi/
 /.env
 /.private/
+/compose.yaml
 
 __pycache__/
 *.tsbuildinfo
@@ -23,3 +25,4 @@ __pycache__/
 /.agents/
 /.claude/
 /.codegraph/
+web/core.1

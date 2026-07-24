@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { isValidUrl, YOUTUBE_URL_PATTERN } from "./url";
+import {
+  classifyUnifiedInput,
+  isValidUrl,
+  YOUTUBE_URL_PATTERN,
+} from "./url";
 
 const VALID_YOUTUBE_MUSIC_URLS = [
   "https://music.youtube.com/playlist?list=OLAK5uy_abc123",
@@ -94,5 +98,30 @@ describe("isValidUrl", () => {
 describe("YOUTUBE_URL_PATTERN", () => {
   test("is a valid RegExp", () => {
     expect(YOUTUBE_URL_PATTERN).toBeInstanceOf(RegExp);
+  });
+});
+
+describe("classifyUnifiedInput", () => {
+  test("classifies valid search text", () => {
+    expect(classifyUnifiedInput(" artist title ")).toBe("text");
+  });
+
+  test("classifies a supported URL", () => {
+    expect(
+      classifyUnifiedInput(
+        "https://music.youtube.com/playlist?list=PLxyz123",
+      ),
+    ).toBe("ytm_url");
+  });
+
+  test("rejects unsupported URLs and invalid text", () => {
+    expect(classifyUnifiedInput("https://spotify.com/track/abc")).toBe(
+      "invalid_url",
+    );
+    expect(classifyUnifiedInput("youtube.com/watch?v=abc")).toBe(
+      "invalid_url",
+    );
+    expect(classifyUnifiedInput("a".repeat(201))).toBe("invalid_text");
+    expect(classifyUnifiedInput("")).toBe("empty");
   });
 });

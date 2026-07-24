@@ -1,3 +1,4 @@
+import i18n from "@/i18n";
 import { AlertTriangleIcon } from "lucide-react";
 import { Component, type ErrorInfo, type ReactNode } from "react";
 
@@ -34,9 +35,9 @@ export class ErrorBoundary extends Component<Props, State> {
       return (
         <div className="bg-background text-foreground dark flex min-h-screen flex-col items-center justify-center gap-1">
           <AlertTriangleIcon className="text-danger h-12 w-12" />
-          <h1 className="text-lg font-semibold">Something went wrong</h1>
+          <h1 className="text-lg font-semibold">{i18n.t("error.title")}</h1>
           <p className="text-foreground-500 max-w-md text-center text-sm">
-            An unexpected error occurred. Please refresh the page.
+            {i18n.t("error.description")}
           </p>
           {this.state.error && (
             <pre className="bg-content1 text-content1-foreground mt-4 max-w-lg overflow-auto rounded-lg p-4 font-mono text-xs">

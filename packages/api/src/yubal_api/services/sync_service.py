@@ -104,6 +104,7 @@ class SyncResult:
         success: Whether the operation completed successfully.
         content_info: Metadata about the synced content (if extraction succeeded).
         download_stats: Statistics from the download phase.
+        download_results: Per-track download results (for catalog persistence).
         destination: Path to the directory containing downloaded files.
         error: Error message if the operation failed.
     """
@@ -111,6 +112,9 @@ class SyncResult:
     success: bool
     content_info: ContentInfo | None = None
     download_stats: PhaseStats | None = None
+    download_results: list | None = None
+    remote_tracks: list[TrackMetadata] | None = None
+    unavailable_track_count: int = 0
     destination: str | None = None
     error: str | None = None
 
@@ -237,6 +241,10 @@ def _download_status_text(status: DownloadStatus, skip_reason: Any) -> str:
     """Convert download status to human-readable text."""
     if status == DownloadStatus.SUCCESS:
         return "downloaded"
+    if status == DownloadStatus.PRESELECTED:
+        return "preselected"
+    if status == DownloadStatus.HARDLINKED:
+        return "hardlinked"
     if status == DownloadStatus.SKIPPED and skip_reason:
         return f"skipped ({skip_reason.label})"
     return status.value
@@ -272,11 +280,17 @@ class SyncService:
     cookies_path: Path | None = None
     fetch_lyrics: bool = True
     ytmusic_lyrics_fallback: bool = True
+    qq_lyrics_fallback: bool = True
     apply_replaygain: bool = False
     ascii_filenames: bool = False
     download_ugc: bool = False
     cache_path: Path | None = None
     audio_quality: int = 0
+    scrape_cooldown_hours: int = 24
+    folder_presence: object | None = None
+    download_cache_path: Path | None = None
+    cache_min_free_gb: float = 2.0
+    data_min_free_gb: float = 2.0
     _codec: AudioCodec = field(init=False)
 
     def __post_init__(self) -> None:
@@ -288,6 +302,8 @@ class SyncService:
         on_progress: ProgressCallback | None,
         cancel_token: CancelToken,
         max_items: int | None = None,
+        library_folder: str | None = None,
+        excluded_video_ids: frozenset[str] | set[str] | None = None,
     ) -> SyncResult:
         """Execute the full extraction and download workflow.
 
@@ -301,6 +317,11 @@ class SyncService:
             on_progress: Optional callback for progress updates.
             cancel_token: Token for cooperative cancellation.
             max_items: Maximum number of tracks to download (None for all).
+            library_folder: Optional top-level folder under base_path
+                (subscription save_folder). When unset, playlists use the
+                sanitized title and albums/tracks use ``Direct``.
+            excluded_video_ids: Skip these video IDs during download
+                (e.g. user sync blacklist).
 
         Returns:
             SyncResult with operation outcome and metadata.
@@ -316,11 +337,21 @@ class SyncService:
             cookies_path=self.cookies_path,
             fetch_lyrics=self.fetch_lyrics,
             ytmusic_lyrics_fallback=self.ytmusic_lyrics_fallback,
+            qq_lyrics_fallback=self.qq_lyrics_fallback,
             apply_replaygain=self.apply_replaygain,
             ascii_filenames=self.ascii_filenames,
             download_ugc=self.download_ugc,
             cache_path=self.cache_path,
             audio_quality=self.audio_quality,
+            scrape_cooldown_hours=self.scrape_cooldown_hours,
+            library_folder=library_folder,
+            folder_presence=self.folder_presence,
+            download_cache_path=self.download_cache_path,
+            cache_min_free_gb=self.cache_min_free_gb,
+            data_min_free_gb=self.data_min_free_gb,
+            excluded_video_ids=(
+                frozenset(excluded_video_ids) if excluded_video_ids else None
+            ),
         )
         return workflow.execute()
 
@@ -348,11 +379,19 @@ class _SyncWorkflow:
     cookies_path: Path | None
     fetch_lyrics: bool
     ytmusic_lyrics_fallback: bool
+    qq_lyrics_fallback: bool
     apply_replaygain: bool
     ascii_filenames: bool
     download_ugc: bool
     cache_path: Path | None
     audio_quality: int
+    scrape_cooldown_hours: int = 24
+    library_folder: str | None = None
+    folder_presence: object | None = None
+    download_cache_path: Path | None = None
+    cache_min_free_gb: float = 2.0
+    data_min_free_gb: float = 2.0
+    excluded_video_ids: frozenset[str] | None = None
 
     # Workflow state
     content_info: ContentInfo | None = field(default=None, init=False)
@@ -401,16 +440,27 @@ class _SyncWorkflow:
                 quiet=True,
                 fetch_lyrics=self.fetch_lyrics,
                 ytmusic_lyrics_fallback=self.ytmusic_lyrics_fallback,
+                qq_lyrics_fallback=self.qq_lyrics_fallback,
+                scrape_cooldown_hours=self.scrape_cooldown_hours,
                 ascii_filenames=self.ascii_filenames,
                 download_ugc=self.download_ugc,
+                library_folder=self.library_folder,
+                download_cache_path=self.download_cache_path,
+                cache_min_free_gb=self.cache_min_free_gb,
+                data_min_free_gb=self.data_min_free_gb,
             ),
-            generate_m3u=True,
+            generate_m3u=False,
             save_cover=True,
             max_items=self.max_items,
             apply_replaygain=self.apply_replaygain,
             cache_path=self.cache_path,
+            excluded_video_ids=self.excluded_video_ids,
         )
-        return create_playlist_downloader(config, cookies_path=self.cookies_path)
+        return create_playlist_downloader(
+            config,
+            cookies_path=self.cookies_path,
+            folder_presence=self.folder_presence,
+        )
 
     def _handle_progress(self, progress: PlaylistProgress) -> None:
         """Route progress update to appropriate phase handler."""
@@ -547,7 +597,11 @@ class _SyncWorkflow:
             return
 
         result = progress.download_progress.result
-        if result.status == DownloadStatus.SUCCESS:
+        if result.status in (
+            DownloadStatus.SUCCESS,
+            DownloadStatus.PRESELECTED,
+            DownloadStatus.HARDLINKED,
+        ):
             bitrate = get_audio_bitrate(result.output_path)
             if bitrate:
                 self.content_info.audio_bitrate = bitrate
@@ -571,6 +625,9 @@ class _SyncWorkflow:
             success=True,
             content_info=self.content_info,
             download_stats=result.download_stats,
+            download_results=list(result.download_results),
+            remote_tracks=list(result.source_tracks),
+            unavailable_track_count=len(result.playlist_info.unavailable_tracks),
             destination=destination,
         )
 

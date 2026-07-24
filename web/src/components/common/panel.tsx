@@ -1,3 +1,4 @@
+import { cardShadow } from "@/lib/ui-styles";
 import { Card, CardBody, CardHeader, ScrollShadow } from "@heroui/react";
 import type { HTMLAttributes, ReactNode, Ref } from "react";
 
@@ -8,6 +9,7 @@ type Props = HTMLAttributes<HTMLElement> & {
 export function Panel({ children, className = "" }: Props) {
   return (
     <Card
+      shadow={cardShadow}
       className={className}
       classNames={{
         body: "px-0",

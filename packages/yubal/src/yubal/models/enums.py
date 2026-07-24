@@ -19,6 +19,8 @@ class DownloadStatus(StrEnum):
     """Status of a download operation."""
 
     SUCCESS = "success"
+    PRESELECTED = "preselected"  # placed from local preselect library (A → B)
+    HARDLINKED = "hardlinked"  # B-internal dedupe hardlink
     SKIPPED = "skipped"
     FAILED = "failed"
 
@@ -57,9 +59,9 @@ class MatchResult(StrEnum):
     """Track matching outcome for download routing.
 
     Determines which folder a track is downloaded to:
-    - MATCHED: Album-structured path (Artist/Year - Album/NN - Title)
-    - UNMATCHED: Flat _Unmatched/ folder (OMVs with no confident album match)
-    - UNOFFICIAL: Flat _Unofficial/ folder (UGC tracks with unreliable metadata)
+    - MATCHED: Album-structured path under playlist folder or Direct/
+    - UNMATCHED: Flat Unmatched/ folder (OMVs with no confident album match)
+    - UNOFFICIAL: Flat Unofficial/ folder (UGC tracks with unreliable metadata)
     """
 
     MATCHED = "matched"

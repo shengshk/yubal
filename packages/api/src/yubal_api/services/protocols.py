@@ -48,6 +48,10 @@ class JobExecutionStore(Protocol):
         """Update job status atomically."""
         ...
 
+    def get(self, job_id: str) -> Job | None:
+        """Get a job by id."""
+        ...
+
     def pop_next_pending(self) -> Job | None:
         """Get and activate the next pending job."""
         ...

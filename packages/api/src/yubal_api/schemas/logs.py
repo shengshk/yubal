@@ -49,6 +49,7 @@ class LogStats(BaseModel):
         ..., description="Type of stats: 'extraction' or 'download'"
     )
     success: int = 0
+    hardlinked: int = 0
     cached: int = 0
     unmatched: int = 0
     failed: int = 0
@@ -95,7 +96,7 @@ class LogEntry(BaseModel):
     total: int | None = Field(
         None, description="Total number of items to process", ge=0
     )
-    status: Literal["success", "skipped", "failed"] | None = Field(
+    status: Literal["success", "skipped", "failed", "hardlinked"] | None = Field(
         None, description="Operation result status"
     )
     stats: LogStats | None = Field(

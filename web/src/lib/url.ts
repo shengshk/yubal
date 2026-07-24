@@ -6,3 +6,29 @@ export const YOUTUBE_URL_PATTERN =
 export function isValidUrl(url: string): boolean {
   return YOUTUBE_URL_PATTERN.test(url);
 }
+
+export type UnifiedInputKind =
+  | "empty"
+  | "ytm_url"
+  | "text"
+  | "invalid_url"
+  | "invalid_text";
+
+export function classifyUnifiedInput(value: string): UnifiedInputKind {
+  const normalized = value.trim();
+  if (!normalized) return "empty";
+  if (isValidUrl(normalized)) return "ytm_url";
+  if (
+    /^[a-z][a-z\d+.-]*:\/\//i.test(normalized) ||
+    /^(?:www\.)?[\w-]+(?:\.[\w-]+)+(?:[/:?#]|$)/i.test(normalized)
+  ) {
+    return "invalid_url";
+  }
+  if (
+    normalized.length > 200 ||
+    Array.from(normalized).some((char) => char.charCodeAt(0) < 32)
+  ) {
+    return "invalid_text";
+  }
+  return "text";
+}

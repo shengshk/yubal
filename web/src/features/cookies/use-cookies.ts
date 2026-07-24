@@ -1,9 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { deleteCookies, getCookiesStatus, uploadCookies } from "@/api/cookies";
+import { useTranslation } from "react-i18next";
+import {
+  deleteCookies,
+  getCookiesStatus,
+  uploadCookies,
+  type CookiesStatus,
+} from "@/api/cookies";
 import { showErrorToast, showSuccessToast } from "@/lib/toast";
 
 interface UseCookiesReturn {
   cookiesConfigured: boolean;
+  cookiesStatus: CookiesStatus;
   isUploading: boolean;
   isDeleting: boolean;
   fileInputRef: React.RefObject<HTMLInputElement | null>;
@@ -11,21 +18,40 @@ interface UseCookiesReturn {
   handleDelete: () => Promise<void>;
   handleDropdownAction: (key: React.Key) => void;
   triggerFileUpload: () => void;
+  refreshCookiesStatus: () => Promise<void>;
 }
 
+const EMPTY_STATUS: CookiesStatus = {
+  configured: false,
+  authenticated: false,
+  auth_complete: false,
+  expired: false,
+  expiring_soon: false,
+  expires_at: null,
+  days_remaining: null,
+  status: "missing",
+  missing: [],
+};
+
 export function useCookies(): UseCookiesReturn {
-  const [cookiesConfigured, setCookiesConfigured] = useState(false);
+  const { t } = useTranslation();
+  const [cookiesStatus, setCookiesStatus] =
+    useState<CookiesStatus>(EMPTY_STATUS);
   const [isUploading, setIsUploading] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  useEffect(() => {
-    getCookiesStatus()
-      .then(setCookiesConfigured)
-      .catch(() => {
-        // Fail silently - cookies status is non-critical
-      });
+  const refreshCookiesStatus = useCallback(async () => {
+    try {
+      setCookiesStatus(await getCookiesStatus());
+    } catch {
+      // Fail silently - cookies status is non-critical
+    }
   }, []);
+
+  useEffect(() => {
+    void refreshCookiesStatus();
+  }, [refreshCookiesStatus]);
 
   const handleFileSelect = useCallback(
     async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -38,16 +64,35 @@ export function useCookies(): UseCookiesReturn {
         const success = await uploadCookies(content);
 
         if (success) {
-          setCookiesConfigured(true);
-          showSuccessToast(
-            "Cookies uploaded",
-            "YouTube cookies configured successfully",
-          );
+          const next = await getCookiesStatus();
+          setCookiesStatus(next);
+          if (next.status === "expired" || next.status === "incomplete") {
+            showErrorToast(
+              t("cookies.uploadedTitle"),
+              t("cookies.uploadedButInvalidDesc"),
+            );
+          } else if (next.status === "expiring_soon") {
+            showSuccessToast(
+              t("cookies.uploadedTitle"),
+              t("cookies.expiringSoon", { days: next.days_remaining ?? 0 }),
+            );
+          } else {
+            showSuccessToast(
+              t("cookies.uploadedTitle"),
+              t("cookies.uploadedDesc"),
+            );
+          }
         } else {
-          showErrorToast("Upload failed", "Failed to upload cookies file");
+          showErrorToast(
+            t("cookies.uploadFailedTitle"),
+            t("cookies.uploadFailedDesc"),
+          );
         }
       } catch {
-        showErrorToast("Upload failed", "Could not read the file");
+        showErrorToast(
+          t("cookies.uploadFailedTitle"),
+          t("cookies.readFailedDesc"),
+        );
       } finally {
         setIsUploading(false);
         if (fileInputRef.current) {
@@ -55,7 +100,7 @@ export function useCookies(): UseCookiesReturn {
         }
       }
     },
-    [],
+    [t],
   );
 
   const handleDelete = useCallback(async () => {
@@ -63,17 +108,23 @@ export function useCookies(): UseCookiesReturn {
     try {
       const success = await deleteCookies();
       if (success) {
-        setCookiesConfigured(false);
-        showSuccessToast("Cookies deleted", "YouTube cookies removed");
+        setCookiesStatus(EMPTY_STATUS);
+        showSuccessToast(t("cookies.deletedTitle"), t("cookies.deletedDesc"));
       } else {
-        showErrorToast("Delete failed", "Failed to delete cookies");
+        showErrorToast(
+          t("cookies.deleteFailedTitle"),
+          t("cookies.deleteFailedDesc"),
+        );
       }
     } catch {
-      showErrorToast("Delete failed", "Could not delete cookies");
+      showErrorToast(
+        t("cookies.deleteFailedTitle"),
+        t("cookies.deleteErrorDesc"),
+      );
     } finally {
       setIsDeleting(false);
     }
-  }, []);
+  }, [t]);
 
   const triggerFileUpload = useCallback(() => {
     fileInputRef.current?.click();
@@ -91,7 +142,8 @@ export function useCookies(): UseCookiesReturn {
   );
 
   return {
-    cookiesConfigured,
+    cookiesConfigured: cookiesStatus.configured,
+    cookiesStatus,
     isUploading,
     isDeleting,
     fileInputRef,
@@ -99,5 +151,6 @@ export function useCookies(): UseCookiesReturn {
     handleDelete,
     handleDropdownAction,
     triggerFileUpload,
+    refreshCookiesStatus,
   };
 }

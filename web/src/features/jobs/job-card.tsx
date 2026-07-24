@@ -23,6 +23,7 @@ import {
   XIcon,
   ZapIcon,
 } from "lucide-react";
+import { useTranslation } from "react-i18next";
 import { JobChip } from "./job-chip";
 
 type Props = {
@@ -157,6 +158,8 @@ function ContentInfo({
   source: "manual" | "scheduler";
   createdAt: string | undefined;
 }) {
+  const { t } = useTranslation();
+
   return (
     <div className="min-w-0">
       <div className="flex flex-col gap-1">
@@ -175,8 +178,8 @@ function ContentInfo({
           <Tooltip
             content={
               createdAt
-                ? `Synced @ ${formatDateTime(createdAt)}`
-                : "Synced by the scheduler"
+                ? t("downloads.syncedAt", { time: formatDateTime(createdAt) })
+                : t("downloads.syncedByScheduler")
             }
             closeDelay={0}
           >
@@ -186,13 +189,13 @@ function ContentInfo({
               startContent={<ZapIcon size={14} className="mx-1" />}
               className="bg-sky-500/15 font-mono text-sky-600 dark:bg-sky-500/20 dark:text-sky-300"
             >
-              Auto
+              {t("downloads.auto")}
             </Chip>
           </Tooltip>
         )}
         {kind && (
           <JobChip variant={kind}>
-            <span className="capitalize">{kind}</span>
+            <span>{t(`downloads.kind.${kind}`)}</span>
           </JobChip>
         )}
         {audioCodec && (
@@ -202,7 +205,7 @@ function ContentInfo({
         )}
         {trackCount && kind !== "track" && (
           <JobChip variant="flat" className="max-md:hidden">
-            {trackCount} {trackCount === 1 ? "track" : "tracks"}
+            {t("downloads.track", { count: trackCount })}
           </JobChip>
         )}
       </div>
@@ -211,6 +214,7 @@ function ContentInfo({
 }
 
 export function JobCard({ job, onCancel, onDelete }: Props) {
+  const { t } = useTranslation();
   const isJobActive = isActive(job.status);
   const isJobRunning = isRunning(job.status);
   const isJobFinished = isFinished(job.status);
@@ -220,7 +224,10 @@ export function JobCard({ job, onCancel, onDelete }: Props) {
   const opacity = `${job.status === "cancelled" ? "opacity - 50" : ""}`;
 
   return (
-    <Card className={`group bg-content2 transition-colors ${opacity}`}>
+    <Card
+      shadow="sm"
+      className={`group bg-content2 transition-colors ${opacity}`}
+    >
       <CardBody className="flex flex-row items-center gap-3">
         <Thumbnail
           url={content_info?.thumbnail_url ?? null}
@@ -297,7 +304,7 @@ export function JobCard({ job, onCancel, onDelete }: Props) {
             classNames={{
               indicator: "transition-all duration-500 ease-out",
             }}
-            aria-label="Job progress"
+            aria-label={t("downloads.progress")}
           />
           <span className="text-foreground-500 text-small w-8 text-right font-mono">
             {Math.round(job.progress)}%

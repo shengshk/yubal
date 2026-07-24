@@ -221,7 +221,12 @@ class PlaylistArtifactsService:
         return [
             (result.track, result.output_path)
             for result in results
-            if result.status in (DownloadStatus.SUCCESS, DownloadStatus.SKIPPED)
+            if result.status in (
+                DownloadStatus.SUCCESS,
+                DownloadStatus.PRESELECTED,
+                DownloadStatus.HARDLINKED,
+                DownloadStatus.SKIPPED,
+            )
             and result.output_path
         ]
 
@@ -249,9 +254,6 @@ class PlaylistArtifactsService:
         Returns:
             Path to saved cover file, or None if no cover URL or save failed.
         """
-        if not playlist_info.cover_url:
-            return None
-
         # Skip single tracks (cover saved with the track file, not separately)
         if playlist_info.kind == ContentKind.TRACK:
             logger.debug(
@@ -260,14 +262,21 @@ class PlaylistArtifactsService:
             )
             return None
 
-        cover_path = write_playlist_cover(
+        # Existing sidecar skips fetch even when cover_url is empty.
+        cover_path, status = write_playlist_cover(
             base_path,
             playlist_name,
             playlist_info.playlist_id,
             playlist_info.cover_url,
             ascii_filenames=self._ascii_filenames,
         )
-        if cover_path:
+        if cover_path and status == "skipped":
+            logger.info(
+                "Cover exists, skipped: '%s'",
+                cover_path,
+                extra={"file_type": "cover", "file_path": str(cover_path)},
+            )
+        elif cover_path:
             logger.info(
                 "Saved cover: '%s'",
                 cover_path,

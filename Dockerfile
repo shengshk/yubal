@@ -25,6 +25,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends git \
 WORKDIR /app
 COPY pyproject.toml uv.lock ./
 COPY packages/ ./packages/
+# Slightly longer download timeout for large wheels (e.g. pydantic-core).
+ENV UV_HTTP_TIMEOUT=120
 RUN uv sync --package yubal-api --no-dev --frozen --no-cache --no-editable
 
 # Final runtime image

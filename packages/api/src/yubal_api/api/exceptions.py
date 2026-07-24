@@ -77,6 +77,21 @@ class QueueFullError(APIError):
         super().__init__("Job queue is full. Wait for existing jobs to complete.")
 
 
+class DirectDownloadLimitExceededError(APIError):
+    """Raised when direct content exceeds the configured track limit."""
+
+    status_code = status.HTTP_422_UNPROCESSABLE_CONTENT
+    error_code = "direct_download_limit_exceeded"
+
+    def __init__(self, *, track_count: int, limit: int) -> None:
+        self.track_count = track_count
+        self.limit = limit
+        super().__init__(
+            f"Content contains {track_count} tracks, exceeding the "
+            f"direct download limit of {limit}."
+        )
+
+
 # -- Subscription Exceptions --
 
 
@@ -98,6 +113,24 @@ class SubscriptionConflictError(APIError):
     error_code = "subscription_conflict"
 
     def __init__(self, message: str, subscription_id: UUID | None = None) -> None:
+        self.subscription_id = subscription_id
+        super().__init__(message)
+
+
+class FolderConflictError(APIError):
+    """Raised when renaming a save folder would merge into a non-empty target."""
+
+    status_code = status.HTTP_409_CONFLICT
+    error_code = "folder_conflict"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        save_folder: str,
+        subscription_id: UUID | None = None,
+    ) -> None:
+        self.save_folder = save_folder
         self.subscription_id = subscription_id
         super().__init__(message)
 
@@ -128,6 +161,91 @@ class CookieValidationError(APIError):
 
     status_code = status.HTTP_400_BAD_REQUEST
     error_code = "invalid_cookies"
+
+
+class InsufficientDiskSpaceError(APIError):
+    """Raised when free space on the data mount is below the configured minimum."""
+
+    status_code = status.HTTP_507_INSUFFICIENT_STORAGE
+    error_code = "insufficient_disk_space"
+
+    def __init__(
+        self,
+        *,
+        free_gb: float,
+        required_gb: float,
+        path: str,
+    ) -> None:
+        self.free_gb = round(free_gb, 2)
+        self.required_gb = required_gb
+        self.path = path
+        super().__init__(
+            f"Not enough free space on {path}: "
+            f"{self.free_gb:g} GiB free, need at least {required_gb:g} GiB"
+        )
+
+
+class MigrationInProgressError(APIError):
+    """Raised when library migration (or other exclusive maintenance) is running."""
+
+    status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    error_code = "migration_in_progress"
+
+    def __init__(self, reason: str = "library migration") -> None:
+        self.reason = reason
+        super().__init__(
+            f"System is busy ({reason}). Jobs and sync are paused until it finishes."
+        )
+
+
+class MigrationConfirmationRequiredError(APIError):
+    """Raised when changing library_layout without confirm_library_migration."""
+
+    status_code = status.HTTP_409_CONFLICT
+    error_code = "migration_confirmation_required"
+
+    def __init__(self, *, from_layout: str, to_layout: str) -> None:
+        self.from_layout = from_layout
+        self.to_layout = to_layout
+        super().__init__(
+            f"Changing save mode from {from_layout} to {to_layout} reorganizes "
+            "the music library on disk. Confirm to proceed; all sync/download "
+            "jobs will be stopped for the duration."
+        )
+
+
+class MigrationFailedError(APIError):
+    """Raised when layout migration fails; preferences are not updated."""
+
+    status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
+    error_code = "migration_failed"
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+
+
+# -- External Library Exceptions --
+
+
+class LibraryUnhealthyError(APIError):
+    """Raised when the Download/External mounts are unsafe for library ops."""
+
+    status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    error_code = "library_unhealthy"
+
+    def __init__(self, message: str, *, status: str | None = None) -> None:
+        self.health_status = status
+        super().__init__(message)
+
+
+class TrackImmutableError(APIError):
+    """Raised when an operation would mutate a track sourced read-only."""
+
+    status_code = status.HTTP_403_FORBIDDEN
+    error_code = "track_immutable"
+
+    def __init__(self, message: str = "Track is immutable (read-only source)") -> None:
+        super().__init__(message)
 
 
 # -- Exception Handlers --
@@ -176,7 +294,21 @@ def register_exception_handlers(app: FastAPI) -> None:
         }
 
         # Add context fields if present on the exception
-        for field in ("job_id", "subscription_id", "upstream_error"):
+        for field in (
+            "job_id",
+            "subscription_id",
+            "upstream_error",
+            "save_folder",
+            "free_gb",
+            "required_gb",
+            "path",
+            "track_count",
+            "limit",
+            "reason",
+            "from_layout",
+            "to_layout",
+            "health_status",
+        ):
             value = getattr(exc, field, None)
             if value is not None:
                 content[field] = str(value)

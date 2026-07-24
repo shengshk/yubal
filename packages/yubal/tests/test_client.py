@@ -46,6 +46,59 @@ def sample_album_data() -> dict:
 
 
 # ============================================================================
+# Lazy session init
+# ============================================================================
+
+
+class TestLazySessionInit:
+    """Cold-start must not contact YouTube; session is built on first use."""
+
+    def test_constructor_does_not_create_ytmusic(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        created: list[object] = []
+
+        def boom(*_a: object, **_k: object) -> None:
+            created.append(1)
+            raise AssertionError("YTMusic must not be constructed at __init__")
+
+        monkeypatch.setattr("yubal.client.YTMusic", boom)
+        client = YTMusicClient(cookies_path=None)
+        assert created == []
+        assert client._ytm_instance is None
+
+    def test_first_api_use_creates_session(
+        self, monkeypatch: pytest.MonkeyPatch, mock_ytmusic: MagicMock
+    ) -> None:
+        mock_ytmusic.search.return_value = []
+        monkeypatch.setattr("yubal.client.YTMusic", lambda *a, **k: mock_ytmusic)
+        client = YTMusicClient(cookies_path=None)
+        assert client._ytm_instance is None
+        client.search_songs("hello")
+        assert client._ytm_instance is mock_ytmusic
+        assert mock_ytmusic.search.call_count == 1
+
+    def test_failed_init_is_retried_on_next_call(
+        self, monkeypatch: pytest.MonkeyPatch, mock_ytmusic: MagicMock
+    ) -> None:
+        attempts = {"n": 0}
+
+        def flaky(*_a: object, **_k: object) -> MagicMock:
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise OSError("ssl eof")
+            return mock_ytmusic
+
+        mock_ytmusic.search.return_value = []
+        monkeypatch.setattr("yubal.client.YTMusic", flaky)
+        client = YTMusicClient(cookies_path=None)
+        with pytest.raises(OSError):
+            client.search_songs("a")
+        assert client._ytm_instance is None
+        client.search_songs("a")
+        assert attempts["n"] == 2
+        assert client._ytm_instance is mock_ytmusic
+
+
+# ============================================================================
 # Album Caching Tests
 # ============================================================================
 

@@ -25,7 +25,7 @@ export function EmptyState({
     <div
       className={`flex h-full flex-col items-center justify-center gap-3 py-8 ${className}`}
     >
-      <div className="bg-content2 rounded-xl p-3">
+      <div className="bg-default-100 rounded-xl p-3">
         <Icon className="text-foreground-400 h-5 w-5" strokeWidth={1.5} />
       </div>
       <div className="flex flex-col items-center gap-1">

@@ -135,15 +135,35 @@ class TestLyricsServiceComposite:
         first = _fake_fetcher("first", "[00:00.00]hi")
         second = _fake_fetcher("second", None)
         service = LyricsService(fetchers=[first, second])
-        assert service.fetch_lyrics("t", "a", 200) == "[00:00.00]hi"
+        assert service.fetch_lyrics("t", "a", 200)[0] == "[00:00.00]hi"
         first.fetch.assert_called_once()
         second.fetch.assert_not_called()
+
+    def test_plain_continues_for_synced(self) -> None:
+        first = _fake_fetcher("first", "plain only")
+        second = _fake_fetcher("second", "[00:01.00]synced")
+        service = LyricsService(fetchers=[first, second])
+        lyrics, source, missed = service.fetch_lyrics("t", "a", 200)
+        assert lyrics == "[00:01.00]synced"
+        assert source == "second"
+        assert missed == []
+        first.fetch.assert_called_once()
+        second.fetch.assert_called_once()
+
+    def test_plain_kept_when_no_synced(self) -> None:
+        first = _fake_fetcher("first", "plain only")
+        second = _fake_fetcher("second", None)
+        service = LyricsService(fetchers=[first, second])
+        lyrics, source, missed = service.fetch_lyrics("t", "a", 200)
+        assert lyrics == "plain only"
+        assert source == "first"
+        assert missed == ["second"]
 
     def test_falls_through_on_none(self) -> None:
         first = _fake_fetcher("first", None)
         second = _fake_fetcher("second", "fallback lyrics")
         service = LyricsService(fetchers=[first, second])
-        assert service.fetch_lyrics("t", "a", 200, video_id="vid") == "fallback lyrics"
+        assert service.fetch_lyrics("t", "a", 200, video_id="vid")[0] == "fallback lyrics"
         first.fetch.assert_called_once()
         second.fetch.assert_called_once()
         # Both fetchers should receive the same query payload.
@@ -154,25 +174,25 @@ class TestLyricsServiceComposite:
     def test_all_none_returns_none(self) -> None:
         first = _fake_fetcher("first", None)
         service = LyricsService(fetchers=[first])
-        assert service.fetch_lyrics("t", "a", 200) is None
+        assert service.fetch_lyrics("t", "a", 200)[0] is None
 
     def test_logs_source_on_hit(self, caplog: pytest.LogCaptureFixture) -> None:
-        service = LyricsService(fetchers=[_fake_fetcher("lrclib", "lyrics body")])
+        service = LyricsService(fetchers=[_fake_fetcher("lrclib", "[00:00.00]hi")])
         with caplog.at_level("INFO", logger="yubal.services.lyrics"):
             service.fetch_lyrics("Song", "Artist", 200)
-        assert "Found lyrics from lrclib for 'Song' by Artist" in caplog.text
+        assert "Found synced lyrics from lrclib for 'Song' by Artist" in caplog.text
 
     def test_logs_fallback_chain_on_first_miss(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
         first = _fake_fetcher("lrclib", None)
-        second = _fake_fetcher("YouTube Music", "lyrics body")
+        second = _fake_fetcher("YouTube Music", "[00:00.00]lyrics body")
         service = LyricsService(fetchers=[first, second])
         with caplog.at_level("INFO", logger="yubal.services.lyrics"):
             service.fetch_lyrics("Song", "Artist", 200)
         assert "No lyrics from lrclib" in caplog.text
         assert "falling back to YouTube Music" in caplog.text
-        assert "Found lyrics from YouTube Music" in caplog.text
+        assert "Found synced lyrics from YouTube Music" in caplog.text
 
     def test_logs_all_sources_when_all_miss(
         self, caplog: pytest.LogCaptureFixture

@@ -14,8 +14,11 @@ from yubal_api.api.deps import (
     JobEventBusDep,
     JobExecutorDep,
     JobStoreDep,
+    PlaylistInfoServiceDep,
+    PreferencesStoreDep,
 )
 from yubal_api.api.exceptions import (
+    DirectDownloadLimitExceededError,
     ErrorResponse,
     JobConflictError,
     JobNotFoundError,
@@ -50,12 +53,26 @@ def _get_job_or_raise(job_store: JobStore, job_id: str) -> Job:
 async def create_job(
     request: CreateJobRequest,
     job_executor: JobExecutorDep,
+    playlist_info: PlaylistInfoServiceDep,
+    preferences: PreferencesStoreDep,
 ) -> JobCreatedResponse:
     """Create a new sync job.
 
     Jobs are queued and executed sequentially. Returns 409 if queue is full.
     """
-    job = job_executor.create_and_start_job(request.url, request.max_items)
+    content = await asyncio.to_thread(playlist_info.get_content_info, str(request.url))
+    track_count = content.track_count or 1
+    limit = preferences.effective().direct_download_limit
+    if track_count > limit:
+        raise DirectDownloadLimitExceededError(
+            track_count=track_count,
+            limit=limit,
+        )
+
+    # Direct downloads are all-or-nothing after passing the configured limit.
+    # The request max_items field remains accepted for API compatibility but no
+    # longer controls direct jobs.
+    job = job_executor.create_and_start_job(str(request.url), None)
 
     if job is None:
         raise QueueFullError()
