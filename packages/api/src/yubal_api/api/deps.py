@@ -25,6 +25,7 @@ from yubal_api.services.library_dedup_service import LibraryDedupService
 from yubal_api.services.library_enrichment_service import LibraryEnrichmentService
 from yubal_api.services.library_health_service import LibraryHealthService
 from yubal_api.services.library_lookup_service import LibraryLookupService
+from yubal_api.services.library_stats_service import LibraryStatsService
 from yubal_api.services.log_buffer import LogBuffer
 from yubal_api.services.operation_gate import OperationGate
 from yubal_api.services.playlist_info_service import PlaylistInfoService
@@ -37,8 +38,10 @@ from yubal_api.services.subscription_membership_service import (
 )
 from yubal_api.services.subscription_service import SubscriptionService
 from yubal_api.services.sync_ledger_service import SyncLedgerService
+from yubal_api.services.sync_pipeline_service import SyncPipelineService
 from yubal_api.services.track_metadata_service import TrackMetadataService
 from yubal_api.services.track_retag_service import TrackRetagService
+from yubal_api.services.wanted_service import WantedService
 from yubal_api.services.wash_service import WashService
 from yubal_api.settings import Settings, get_settings
 
@@ -101,13 +104,26 @@ MembershipServiceDep = Annotated[
 SyncLedgerServiceDep = Annotated[SyncLedgerService, Depends(_get_sync_ledger_service)]
 PreferencesStoreDep = Annotated[PreferencesStore, Depends(_get_preferences_store)]
 
+
+def _get_sync_pipeline_service(services: ServicesDep) -> SyncPipelineService:
+    return services.sync_pipeline_service
+
+
+SyncPipelineServiceDep = Annotated[
+    SyncPipelineService, Depends(_get_sync_pipeline_service)
+]
+
+
 def _get_preselect_service(services: ServicesDep) -> PreselectService:
     return services.preselect_service
 
+
 PreselectServiceDep = Annotated[PreselectService, Depends(_get_preselect_service)]
+
 
 def _get_wash_service(services: ServicesDep) -> WashService:
     return services.wash_service
+
 
 WashServiceDep = Annotated[WashService, Depends(_get_wash_service)]
 OperationGateDep = Annotated[OperationGate, Depends(_get_operation_gate)]
@@ -163,6 +179,13 @@ ExternalLibraryServiceDep = Annotated[
 ]
 
 
+def _get_wanted_service(services: ServicesDep) -> WantedService:
+    return services.wanted_service
+
+
+WantedServiceDep = Annotated[WantedService, Depends(_get_wanted_service)]
+
+
 def _get_library_dedup_service(services: ServicesDep) -> LibraryDedupService:
     return services.library_dedup_service
 
@@ -178,6 +201,15 @@ def _get_library_lookup_service(services: ServicesDep) -> LibraryLookupService:
 
 LibraryLookupServiceDep = Annotated[
     LibraryLookupService, Depends(_get_library_lookup_service)
+]
+
+
+def _get_library_stats_service(services: ServicesDep) -> LibraryStatsService:
+    return services.library_stats_service
+
+
+LibraryStatsServiceDep = Annotated[
+    LibraryStatsService, Depends(_get_library_stats_service)
 ]
 
 

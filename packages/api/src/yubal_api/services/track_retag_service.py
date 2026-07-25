@@ -8,6 +8,7 @@ import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlparse
 
 from yubal.models.enums import MatchResult
 from yubal.models.track import TrackMetadata
@@ -69,6 +70,24 @@ def _load_cover_bytes(url: str | None) -> bytes | None:
         # Non-base64 data URLs are not expected for images.
         return None
     return fetch_cover(url)
+
+
+def _cover_source_from_url(url: str | None) -> str | None:
+    """Record the provider selected in the editor before embedding the bytes."""
+    if not url:
+        return None
+    if url.startswith("data:"):
+        return "manual"
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except ValueError:
+        return "manual"
+    if "mzstatic" in host or "apple" in host:
+        return "apple"
+    if "googleusercontent" in host or "ytimg" in host:
+        return "ytm"
+    # Any other URL reached this service through an explicit editor action.
+    return "manual"
 
 
 @dataclass(frozen=True, slots=True)
@@ -422,6 +441,9 @@ class TrackRetagService:
             track_number=merged.track_number,
             year=merged.year,
             cover_url=stored_cover_url,
+            cover_source=(
+                _cover_source_from_url(new_cover_url) if cover_applied else None
+            ),
             lyrics=catalog_lyrics,
             has_embedded_cover=cover_applied or record.has_embedded_cover,
             has_lyrics_embedded=lyrics_applied or record.has_lyrics_embedded,

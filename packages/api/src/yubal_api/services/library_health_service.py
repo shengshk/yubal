@@ -127,13 +127,11 @@ class LibraryHealthService:
 
         dl_ok = DOWNLOAD_ROOT.is_dir()
         ext_ok = EXTERNAL_ROOT.is_dir()
-        dl_sent_ok = (
-            DOWNLOAD_MOUNT_SENTINEL.is_file()
-            and os_access_readable(DOWNLOAD_MOUNT_SENTINEL)
+        dl_sent_ok = DOWNLOAD_MOUNT_SENTINEL.is_file() and os_access_readable(
+            DOWNLOAD_MOUNT_SENTINEL
         )
-        ext_sent_ok = (
-            EXTERNAL_MOUNT_SENTINEL.is_file()
-            and os_access_readable(EXTERNAL_MOUNT_SENTINEL)
+        ext_sent_ok = EXTERNAL_MOUNT_SENTINEL.is_file() and os_access_readable(
+            EXTERNAL_MOUNT_SENTINEL
         )
         same_fs = False
         if dl_ok and ext_ok:
@@ -191,7 +189,19 @@ class LibraryHealthService:
             prev = self._cached
             self._last_check_at = now
             self._cached = health
-            self._persist()
+            # The browser may probe health periodically. Persist only on the
+            # first check or when the effective mount state changes; writing
+            # the same JSON on every poll needlessly wakes the disk.
+            state_changed = (
+                prev is None
+                or prev.status != health.status
+                or prev.reason != health.reason
+                or prev.same_filesystem != health.same_filesystem
+                or prev.download_sentinel_ok != health.download_sentinel_ok
+                or prev.external_sentinel_ok != health.external_sentinel_ok
+            )
+            if state_changed:
+                self._persist()
         if not health.ok:
             # Log once per distinct unhealthy state — scheduled checks must
             # not spam the UI log ring every tick.
@@ -201,9 +211,7 @@ class LibraryHealthService:
                 or prev.reason != health.reason
             )
             if changed:
-                logger.error(
-                    "Library unhealthy (%s): %s", health.status, health.reason
-                )
+                logger.error("Library unhealthy (%s): %s", health.status, health.reason)
         elif prev is not None and not prev.ok:
             logger.info("Library health restored (%s)", health.status)
         return health
@@ -225,9 +233,7 @@ class LibraryHealthService:
             )
 
 
-MOUNT_SENTINEL_HINT = (
-    f"{DOWNLOAD_ROOT}/.yubal-mount and {EXTERNAL_ROOT}/.yubal-mount"
-)
+MOUNT_SENTINEL_HINT = f"{DOWNLOAD_ROOT}/.yubal-mount and {EXTERNAL_ROOT}/.yubal-mount"
 
 
 def os_access_readable(path: Path) -> bool:
@@ -242,11 +248,11 @@ def os_access_readable(path: Path) -> bool:
 __all__ = [
     "EMPTY_GUARD_MIN_INDEXED",
     "EMPTY_GUARD_RATIO",
-    "LibraryHealth",
-    "LibraryHealthService",
     "STATUS_FS_MISMATCH",
     "STATUS_HEALTHY",
     "STATUS_MOUNT_SUSPECT",
     "STORAGE_DOWNLOAD",
     "STORAGE_EXTERNAL",
+    "LibraryHealth",
+    "LibraryHealthService",
 ]

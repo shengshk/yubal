@@ -41,7 +41,7 @@ export async function createJob(url: string): Promise<CreateJobResult> {
     if (apiError.error === "direct_download_limit_exceeded") {
       return {
         success: false,
-        error: apiError.message ?? "Direct download limit exceeded",
+        error: apiError.message ?? "Instant download limit exceeded",
         code: apiError.error,
         trackCount: Number(apiError.track_count),
         limit: Number(apiError.limit),

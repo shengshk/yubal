@@ -1,4 +1,5 @@
 import { basePath } from "@/lib/base-path";
+import { sharedJsonGet } from "./shared-get";
 
 export type AudioFormat = "opus" | "mp3" | "m4a";
 export type TrackSortKey = "title" | "artist" | "album";
@@ -57,6 +58,15 @@ export type AppSettings = {
   telegram_daily_limit: number;
   telegram_api_url: string;
   telegram_bot_running: boolean;
+  wanted_enabled: boolean;
+  wanted_auto_match_enabled: boolean;
+  wanted_max_items: number;
+  wanted_sync_jitter_seconds: number;
+  wanted_source_musicbrainz: boolean;
+  wanted_source_qq: boolean;
+  wanted_source_discogs: boolean;
+  wanted_source_lastfm: boolean;
+  lastfm_api_key: string;
 };
 
 export type SettingsUpdate = Partial<{
@@ -92,6 +102,15 @@ export type SettingsUpdate = Partial<{
   telegram_admin_ids: string;
   telegram_user_ids: string;
   telegram_daily_limit: number;
+  wanted_enabled: boolean;
+  wanted_auto_match_enabled: boolean;
+  wanted_max_items: number;
+  wanted_sync_jitter_seconds: number;
+  wanted_source_musicbrainz: boolean;
+  wanted_source_qq: boolean;
+  wanted_source_discogs: boolean;
+  wanted_source_lastfm: boolean;
+  lastfm_api_key: string;
 }>;
 
 function errorFromBody(
@@ -115,11 +134,8 @@ function errorFromBody(
 }
 
 export async function getSettings(): Promise<AppSettings | null> {
-  const res = await fetch(`${basePath}/api/settings`, {
-    credentials: "include",
-  });
-  if (!res.ok) return null;
-  return (await res.json()) as AppSettings;
+  const result = await sharedJsonGet<AppSettings>(`${basePath}/api/settings`);
+  return result.ok ? result.data : null;
 }
 
 export async function updateSettings(
@@ -174,7 +190,8 @@ export async function clearScrapeCooldowns(): Promise<
       detail?: string;
     } | null;
     return {
-      error: body?.message ?? body?.detail ?? "Failed to clear scrape cooldowns",
+      error:
+        body?.message ?? body?.detail ?? "Failed to clear scrape cooldowns",
     };
   }
   return (await res.json()) as { cleared: number };
@@ -215,10 +232,10 @@ export async function reclaimPits(
   target: ReclaimPitTarget,
 ): Promise<ReclaimPitsResult | { error: string }> {
   const params = new URLSearchParams({ target });
-  const res = await fetch(
-    `${basePath}/api/settings/reclaim-pits?${params}`,
-    { method: "POST", credentials: "include" },
-  );
+  const res = await fetch(`${basePath}/api/settings/reclaim-pits?${params}`, {
+    method: "POST",
+    credentials: "include",
+  });
   if (!res.ok) {
     const body = (await res.json().catch(() => null)) as {
       message?: string;

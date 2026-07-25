@@ -28,6 +28,7 @@ from yubal.utils.library import resolve_under_data
 
 from yubal_api.db.track_catalog_repository import TrackCatalogRepository
 from yubal_api.schemas.search import SearchSnapshotResponse, SearchTrackResponse
+from yubal_api.services.meta_search import MetaHit, same_recording
 from yubal_api.services.preferences import Preferences, PreferencesStore
 from yubal_api.services.sync_ledger_service import SyncLedgerService
 
@@ -35,6 +36,45 @@ logger = logging.getLogger(__name__)
 
 _URL_RE = re.compile(r"https?://", re.IGNORECASE)
 _PREVIEW_SUFFIXES = {".webm", ".m4a", ".mp3", ".opus", ".ogg", ".aac"}
+
+
+def _supplementary_meta_hits(
+    ytm_rows: list[dict[str, Any]],
+    meta_hits: list[MetaHit],
+    *,
+    limit: int,
+) -> list[MetaHit]:
+    """Keep only third-party recordings not already represented by YTM."""
+    supplements: list[MetaHit] = []
+    for hit in meta_hits:
+        candidates = [
+            (
+                str(row.get("title") or ""),
+                str(row.get("artist") or ""),
+                row.get("duration_seconds"),
+            )
+            for row in ytm_rows
+        ]
+        candidates.extend(
+            (item.title, item.artist, item.duration_seconds)
+            for item in supplements
+        )
+        if any(
+            same_recording(
+                left_title=title,
+                left_artist=artist,
+                left_duration=duration if isinstance(duration, int) else None,
+                right_title=hit.title,
+                right_artist=hit.artist,
+                right_duration=hit.duration_seconds,
+            )
+            for title, artist, duration in candidates
+        ):
+            continue
+        supplements.append(hit)
+        if len(supplements) >= limit:
+            break
+    return supplements
 
 
 class SearchService:
@@ -60,18 +100,41 @@ class SearchService:
         self._sync_ledger = sync_ledger
         self._index = TrackFileIndex(data_path)
         self._client = YTMusicClient(
-            config=APIConfig(search_limit=10),
+            config=APIConfig(search_limit=5),
             cookies_path=cookies_path,
         )
         self._state_lock = threading.Lock()
         self._preview_lock = threading.Lock()
 
     def search(self, query: str) -> SearchSnapshotResponse | None:
-        """Search ten songs and atomically replace the previous non-empty result."""
+        """Search 5 YTM + up to 5 meta (wishlist) songs; replace previous snapshot."""
         normalized = self._validate_query(query)
         logger.info("Online search: %r", normalized)
-        results = self._client.search_songs(normalized)[:10]
-        if not results:
+        results = self._client.search_songs(normalized)[:5]
+        prefs = self._preferences.effective()
+        meta_hits: list[MetaHit] = []
+        if prefs.wanted_enabled and (
+            prefs.wanted_source_musicbrainz
+            or prefs.wanted_source_qq
+            or prefs.wanted_source_discogs
+            or prefs.wanted_source_lastfm
+        ):
+            from yubal_api.services.meta_search import search_meta_sources
+
+            meta_hits = search_meta_sources(
+                normalized,
+                # Fetch deeper than the display limit so duplicates already
+                # represented by YTM can be removed without starving the
+                # useful third-party supplement list.
+                limit=10,
+                enable_musicbrainz=prefs.wanted_source_musicbrainz,
+                enable_qq=prefs.wanted_source_qq,
+                enable_discogs=prefs.wanted_source_discogs,
+                enable_lastfm=prefs.wanted_source_lastfm,
+                lastfm_api_key=prefs.lastfm_api_key,
+            )
+
+        if not results and not meta_hits:
             logger.info(
                 "Online search: %r returned no songs (kept previous)", normalized
             )
@@ -92,6 +155,31 @@ class SearchService:
                         result.thumbnails[-1].url if result.thumbnails else None
                     ),
                     "duration_seconds": result.duration_seconds,
+                    "result_kind": "ytm",
+                    "source": "ytm",
+                    "source_id": result.video_id,
+                    "source_url": (
+                        f"https://music.youtube.com/watch?v={result.video_id}"
+                    ),
+                    "wishable": False,
+                }
+            )
+        meta_hits = _supplementary_meta_hits(tracks, meta_hits, limit=5)
+        for offset, hit in enumerate(meta_hits, start=1):
+            tracks.append(
+                {
+                    "rank": len(results) + offset,
+                    "video_id": "",
+                    "title": hit.title,
+                    "artist": hit.artist,
+                    "album": hit.album,
+                    "thumbnail_url": hit.thumbnail_url,
+                    "duration_seconds": hit.duration_seconds,
+                    "result_kind": "meta",
+                    "source": hit.source,
+                    "source_id": hit.source_id,
+                    "source_url": hit.source_url,
+                    "wishable": True,
                 }
             )
 
@@ -305,7 +393,7 @@ class SearchService:
                 self._sync_ledger.reconcile_direct(direct_folder)
 
             logger.info(
-                "Imported preview to Direct: %s - %s (%s)",
+                "Imported preview to Download Center: %s - %s (%s)",
                 track.artist,
                 track.title,
                 video_id,
@@ -337,7 +425,7 @@ class SearchService:
 
                     length = MediaFile(preview).length
                     if length is not None and float(length) > 0:
-                        duration = max(1, int(round(float(length))))
+                        duration = max(1, round(float(length)))
                 except Exception:
                     logger.debug(
                         "Could not read preview duration for %s",
@@ -440,7 +528,7 @@ class SearchService:
         video_ids = [
             str(item.get("video_id", ""))
             for item in tracks_data
-            if isinstance(item, dict)
+            if isinstance(item, dict) and item.get("video_id")
         ]
         paths = self._track_catalog.resolve_existing_paths(
             video_ids,
@@ -450,10 +538,14 @@ class SearchService:
         for item in tracks_data:
             if not isinstance(item, dict):
                 continue
-            video_id = str(item.get("video_id", ""))
-            if not video_id:
+            video_id = str(item.get("video_id", "") or "")
+            result_kind = str(
+                item.get("result_kind") or ("ytm" if video_id else "meta")
+            )
+            wishable = bool(item.get("wishable")) or result_kind == "meta"
+            if result_kind == "ytm" and not video_id:
                 continue
-            local_path = paths.get(video_id)
+            local_path = paths.get(video_id) if video_id else None
             matched = local_path is not None
             tracks.append(
                 SearchTrackResponse(
@@ -475,8 +567,17 @@ class SearchService:
                     matched=matched,
                     local_path=local_path,
                     preview_cached=(
-                        not matched and self.preview_file(video_id) is not None
+                        bool(video_id)
+                        and not matched
+                        and self.preview_file(video_id) is not None
                     ),
+                    result_kind=result_kind,
+                    source=str(item["source"]) if item.get("source") else None,
+                    source_id=str(item["source_id"]) if item.get("source_id") else None,
+                    source_url=(
+                        str(item["source_url"]) if item.get("source_url") else None
+                    ),
+                    wishable=wishable,
                 )
             )
         return SearchSnapshotResponse(

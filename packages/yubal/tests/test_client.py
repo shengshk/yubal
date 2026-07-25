@@ -1,5 +1,6 @@
 """Tests for YTMusicClient."""
 
+import hashlib
 from unittest.mock import MagicMock
 
 import pytest
@@ -53,7 +54,9 @@ def sample_album_data() -> dict:
 class TestLazySessionInit:
     """Cold-start must not contact YouTube; session is built on first use."""
 
-    def test_constructor_does_not_create_ytmusic(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_constructor_does_not_create_ytmusic(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         created: list[object] = []
 
         def boom(*_a: object, **_k: object) -> None:
@@ -96,6 +99,32 @@ class TestLazySessionInit:
         client.search_songs("a")
         assert attempts["n"] == 2
         assert client._ytm_instance is mock_ytmusic
+
+
+class TestAccountFingerprint:
+    def test_uses_channel_handle_without_exposing_it(
+        self, mock_ytmusic: MagicMock
+    ) -> None:
+        mock_ytmusic.get_account_info.return_value = {
+            "accountName": "Display Name",
+            "channelHandle": "@stable-handle",
+            "accountPhotoUrl": "https://example.com/photo",
+        }
+        client = YTMusicClient(ytmusic=mock_ytmusic)
+
+        result = client.get_account_fingerprint()
+
+        assert result == hashlib.sha256(b"@stable-handle").hexdigest()
+        assert "@stable-handle" not in result
+
+    def test_rejects_unauthenticated_account(
+        self, mock_ytmusic: MagicMock
+    ) -> None:
+        mock_ytmusic.auth_type = AuthType.UNAUTHORIZED
+        client = YTMusicClient(ytmusic=mock_ytmusic)
+
+        with pytest.raises(AuthenticationRequiredError):
+            client.get_account_fingerprint()
 
 
 # ============================================================================

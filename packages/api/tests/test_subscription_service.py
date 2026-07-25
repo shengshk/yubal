@@ -100,7 +100,7 @@ class TestCreate:
         mock_playlist_info.get_playlist_metadata.assert_called_once()
         mock_repo.create.assert_called_once()
         created_arg = mock_repo.create.call_args[0][0]
-        assert created_arg.save_folder == "My Playlist"
+        assert created_arg.save_folder == "sublist/default"
         assert created_arg.sync_jitter_seconds == 600
 
     def test_create_conflict(
@@ -174,6 +174,27 @@ class TestCreate:
 
         assert result.max_items == 5
 
+    def test_liked_music_uses_fixed_identity_and_folder(
+        self,
+        service: SubscriptionService,
+        mock_repo: MagicMock,
+        mock_playlist_info: MagicMock,
+    ) -> None:
+        mock_repo.get_by_url.return_value = None
+        mock_playlist_info.get_playlist_metadata.return_value = PlaylistMetadata(
+            title="A remote title", thumbnail_url=None
+        )
+        mock_playlist_info.get_account_fingerprint.return_value = "a" * 64
+        mock_repo.create.side_effect = lambda sub: sub
+
+        result = service.create(
+            "https://music.youtube.com/playlist?list=LM"
+        )
+
+        assert result.name == "Liked Music"
+        assert result.save_folder == "liked"
+        assert result.source_account_fingerprint == "a" * 64
+
 
 class TestUpdate:
     def test_update_success(
@@ -182,6 +203,7 @@ class TestUpdate:
         mock_repo: MagicMock,
         sample_subscription: Subscription,
     ) -> None:
+        mock_repo.get.return_value = sample_subscription
         mock_repo.update.return_value = sample_subscription
 
         result = service.update(sample_subscription.id, {"name": "New Name"})
@@ -194,7 +216,7 @@ class TestUpdate:
     def test_update_not_found(
         self, service: SubscriptionService, mock_repo: MagicMock
     ) -> None:
-        mock_repo.update.return_value = None
+        mock_repo.get.return_value = None
         sub_id = uuid4()
 
         with pytest.raises(SubscriptionNotFoundError):
@@ -213,6 +235,76 @@ class TestUpdate:
         assert result == sample_subscription
         mock_repo.update.assert_not_called()
         mock_repo.get.assert_called_once()
+
+    def test_liked_music_folder_cannot_be_changed(
+        self,
+        service: SubscriptionService,
+        mock_repo: MagicMock,
+    ) -> None:
+        sub = Subscription(
+            id=uuid4(),
+            type=SubscriptionType.PLAYLIST,
+            url="https://music.youtube.com/playlist?list=LM",
+            name="Liked Music",
+            save_folder="liked",
+            enabled=True,
+            created_at=datetime.now(UTC),
+        )
+        mock_repo.get.return_value = sub
+
+        with pytest.raises(SubscriptionConflictError):
+            service.update(sub.id, {"save_folder": "another-folder"})
+
+        mock_repo.update.assert_not_called()
+
+
+class TestPrepareForSync:
+    def test_binds_unclaimed_liked_music_to_current_account(
+        self,
+        service: SubscriptionService,
+        mock_repo: MagicMock,
+        mock_playlist_info: MagicMock,
+    ) -> None:
+        sub = Subscription(
+            id=uuid4(),
+            type=SubscriptionType.PLAYLIST,
+            url="https://music.youtube.com/playlist?list=LM",
+            name="Liked Music",
+            save_folder="liked",
+            enabled=True,
+            created_at=datetime.now(UTC),
+        )
+        mock_playlist_info.get_account_fingerprint.return_value = "a" * 64
+        mock_repo.update.side_effect = lambda _id, fields: sub.model_copy(
+            update=fields
+        )
+
+        result = service.prepare_for_sync(sub)
+
+        assert result.source_account_fingerprint == "a" * 64
+
+    def test_blocks_liked_music_from_a_different_account(
+        self,
+        service: SubscriptionService,
+        mock_repo: MagicMock,
+        mock_playlist_info: MagicMock,
+    ) -> None:
+        sub = Subscription(
+            id=uuid4(),
+            type=SubscriptionType.PLAYLIST,
+            url="https://music.youtube.com/playlist?list=LM",
+            name="Liked Music",
+            save_folder="liked",
+            source_account_fingerprint="a" * 64,
+            enabled=True,
+            created_at=datetime.now(UTC),
+        )
+        mock_playlist_info.get_account_fingerprint.return_value = "b" * 64
+
+        with pytest.raises(SubscriptionConflictError):
+            service.prepare_for_sync(sub)
+
+        mock_repo.update.assert_not_called()
 
 
 class TestDelete:

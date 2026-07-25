@@ -69,6 +69,32 @@ describe("classifyTrackBucket", () => {
         ctx,
       ),
     ).toBe("unmatched");
+    expect(
+      classifyTrackBucket(
+        track({
+          title: "V",
+          relative_path: "Raw/v",
+          tier: "raw",
+          tags_complete: true,
+          meta_status: "verified",
+        }),
+        ctx,
+      ),
+    ).toBe("meta_verified");
+    expect(
+      classifyTrackBucket(
+        track({
+          title: "Verified after YTM rejection",
+          relative_path: "Raw/verified-rejected",
+          tier: "raw",
+          tags_complete: true,
+          meta_status: "verified",
+          junk_kind: "rw",
+          is_junk: true,
+        }),
+        ctx,
+      ),
+    ).toBe("meta_verified");
   });
 
   test("offline and blocked before active", () => {
@@ -206,11 +232,7 @@ describe("sortTracksUnified + assignDisplayNumbers", () => {
       }),
     ];
     const ordered = sortTracksUnified(tracks, "title", ctx);
-    expect(ordered.map((t) => t.title)).toEqual([
-      "Alpha",
-      "Beta",
-      "AlphaRaw",
-    ]);
+    expect(ordered.map((t) => t.title)).toEqual(["Alpha", "Beta", "AlphaRaw"]);
     const sections = buildOrderedTrackSections(ordered, "title");
     expect(sections.map((s) => s.letter)).toEqual(["A", "B", "A"]);
     expect(sections[0]!.tracks[0]!.title).toBe("Alpha");

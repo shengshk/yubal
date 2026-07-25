@@ -30,7 +30,13 @@ from starlette.types import Scope
 from yubal import cleanup_part_files
 from yubal.services.track_index import repair_track_index
 from yubal.utils.cleanup import cleanup_startup_temps
-from yubal.utils.library import DOWNLOAD_ROOT, EXTERNAL_ROOT, ensure_external_layout
+from yubal.utils.library import (
+    DOWNLOAD_ROOT,
+    EXTERNAL_ROOT,
+    WANTED_ROOT,
+    ensure_external_layout,
+    ensure_wanted_layout,
+)
 
 from yubal_api.api.container import Services
 from yubal_api.api.exceptions import register_exception_handlers
@@ -53,6 +59,9 @@ from yubal_api.api.routes import (
 from yubal_api.api.routes import (
     settings as settings_routes,
 )
+from yubal_api.api.routes import (
+    wanted as wanted_routes,
+)
 from yubal_api.api.routes.auth import AuthMiddleware
 from yubal_api.db import SubscriptionRepository, create_db_engine
 from yubal_api.db.external_library_repository import ExternalLibraryRepository
@@ -63,6 +72,7 @@ from yubal_api.db.subscription_membership_repository import (
 )
 from yubal_api.db.sync_ledger_repository import SyncLedgerRepository
 from yubal_api.db.track_catalog_repository import TrackCatalogRepository
+from yubal_api.db.wanted_repository import WantedRepository
 from yubal_api.schemas.jobs import (
     ClearedEvent,
     CreatedEvent,
@@ -73,6 +83,10 @@ from yubal_api.schemas.jobs import (
 from yubal_api.schemas.logs import LogEntry
 from yubal_api.services.auth import AuthManager
 from yubal_api.services.catalog_folder_presence import CatalogFolderPresence
+from yubal_api.services.database_safety import (
+    create_verified_database_backup,
+    verify_sqlite_database,
+)
 from yubal_api.services.external_library_service import ExternalLibraryService
 from yubal_api.services.job_event_bus import JobEventBus
 from yubal_api.services.job_executor import JobExecutor
@@ -81,6 +95,7 @@ from yubal_api.services.library_dedup_service import LibraryDedupService
 from yubal_api.services.library_enrichment_service import LibraryEnrichmentService
 from yubal_api.services.library_health_service import LibraryHealthService
 from yubal_api.services.library_lookup_service import LibraryLookupService
+from yubal_api.services.library_stats_service import LibraryStatsService
 from yubal_api.services.log_buffer import BufferHandler, LogBuffer
 from yubal_api.services.operation_gate import OperationGate
 from yubal_api.services.playlist_info_service import PlaylistInfoService
@@ -98,9 +113,11 @@ from yubal_api.services.subscription_membership_service import (
 )
 from yubal_api.services.subscription_service import SubscriptionService
 from yubal_api.services.sync_ledger_service import SyncLedgerService
+from yubal_api.services.sync_pipeline_service import SyncPipelineService
 from yubal_api.services.telegram import TelegramBotService
 from yubal_api.services.track_metadata_service import TrackMetadataService
 from yubal_api.services.track_retag_service import TrackRetagService
+from yubal_api.services.wanted_service import WantedService
 from yubal_api.services.wash_service import WashService
 from yubal_api.settings import get_settings
 
@@ -267,20 +284,41 @@ def create_services(repository: SubscriptionRepository) -> Services:
     )
     operation_gate.bind_health(library_health)
 
+    external_repository = ExternalLibraryRepository(repository.engine)
     external_library_service = ExternalLibraryService(
-        ExternalLibraryRepository(repository.engine),
+        external_repository,
         track_catalog,
         preferences_store,
         cookies_path=cookies_path,
     )
     sync_ledger_service.bind_external_library(external_library_service)
     membership_service.bind_external_library(external_library_service)
+
+    wanted_repository = WantedRepository(repository.engine)
+    wanted_service = WantedService(
+        wanted_repository,
+        preferences_store,
+        cookies_path=cookies_path,
+        sync_ledger=sync_ledger_service,
+        external_library=external_library_service,
+    )
+    sync_ledger_service.bind_wanted_service(wanted_service)
+    membership_service.bind_wanted_service(wanted_service)
+    external_library_service.bind_wanted_service(wanted_service)
     library_dedup_service = LibraryDedupService(track_catalog)
     library_lookup_service = LibraryLookupService(
         catalog=track_catalog,
         subscriptions=subscription_service,
         preferences=preferences_store,
         sync_ledger=sync_ledger_service,
+    )
+    library_stats_service = LibraryStatsService(
+        catalog=track_catalog,
+        external=external_repository,
+        wanted=wanted_repository,
+        download_root=settings.data,
+        external_root=EXTERNAL_ROOT,
+        wanted_root=WANTED_ROOT,
     )
 
     folder_presence = CatalogFolderPresence(track_catalog, settings.data)
@@ -304,6 +342,22 @@ def create_services(repository: SubscriptionRepository) -> Services:
     )
     external_library_service.bind_enrichment(library_enrichment_service)
 
+    sync_pipeline_service = SyncPipelineService(
+        library_health=library_health,
+        external_library_service=external_library_service,
+        library_enrichment_service=library_enrichment_service,
+        library_dedup_service=library_dedup_service,
+        preferences_store=preferences_store,
+        sync_ledger_service=sync_ledger_service,
+        wanted_service=wanted_service,
+    )
+    sync_ledger_service.bind_post_job_finalize(
+        lambda folder, kind: sync_pipeline_service.sync_catalog_folder(
+            folder,
+            trigger=f"{kind}:job",
+        )
+    )
+
     job_executor = JobExecutor(
         job_store=job_store,
         base_path=settings.data,
@@ -325,6 +379,7 @@ def create_services(repository: SubscriptionRepository) -> Services:
         operation_gate=operation_gate,
         folder_presence=folder_presence,
     )
+    wanted_service.bind_job_executor(job_executor)
 
     # Create scheduler
     scheduler_service = Scheduler(
@@ -339,6 +394,8 @@ def create_services(repository: SubscriptionRepository) -> Services:
         membership_service=membership_service,
         library_enrichment_service=library_enrichment_service,
         library_dedup_service=library_dedup_service,
+        wanted_service=wanted_service,
+        sync_pipeline_service=sync_pipeline_service,
     )
 
     subscription_service.bind_maintenance(operation_gate, job_executor)
@@ -371,6 +428,7 @@ def create_services(repository: SubscriptionRepository) -> Services:
         scheduler=scheduler_service,
         library_health=library_health,
         db_engine=repository.engine,
+        wanted_service=wanted_service,
     )
 
     return Services(
@@ -380,6 +438,7 @@ def create_services(repository: SubscriptionRepository) -> Services:
         subscription_service=subscription_service,
         membership_service=membership_service,
         sync_ledger_service=sync_ledger_service,
+        sync_pipeline_service=sync_pipeline_service,
         preferences_store=preferences_store,
         scheduler=scheduler_service,
         job_event_bus=job_event_bus,
@@ -395,8 +454,10 @@ def create_services(repository: SubscriptionRepository) -> Services:
         external_library_service=external_library_service,
         library_dedup_service=library_dedup_service,
         library_lookup_service=library_lookup_service,
+        library_stats_service=library_stats_service,
         telegram_bot=telegram_bot,
         playlist_info=playlist_info,
+        wanted_service=wanted_service,
     )
 
 
@@ -416,6 +477,7 @@ def create_api_router() -> APIRouter:
     api_router.include_router(sync_ledger.router)
     api_router.include_router(settings_routes.router)
     api_router.include_router(external.router)
+    api_router.include_router(wanted_routes.router)
     api_router.include_router(scheduler.router)
     return api_router
 
@@ -432,8 +494,24 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     else:
         logger.info("Built-in auth disabled (use external auth if needed)")
 
+    # Automatic migrations are preceded by a verified online SQLite snapshot.
+    # A failed backup blocks startup so schema changes never proceed without a
+    # recoverable database copy.
+    backup = await asyncio.to_thread(
+        create_verified_database_backup,
+        settings.db_path,
+        settings.db_path.parent / "backups",
+    )
+    if backup is not None:
+        logger.info(
+            "Verified pre-migration database backup: %s (%d bytes)",
+            backup.path,
+            backup.size_bytes,
+        )
+
     # Run database migrations (in thread to avoid blocking event loop)
     await asyncio.to_thread(run_migrations)
+    await asyncio.to_thread(verify_sqlite_database, settings.db_path)
     logger.info("Database migrations complete")
 
     # Create database engine
@@ -449,6 +527,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # Ensure External/Raw + External/Organized exist (no-op if unmounted), then
     # probe mount health so jobs/scheduler start with an accurate status.
     await asyncio.to_thread(ensure_external_layout)
+    await asyncio.to_thread(ensure_wanted_layout)
     health = await asyncio.to_thread(services.library_health.check)
     if not health.ok:
         logger.warning(
@@ -472,9 +551,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 naming.errors,
             )
 
-    save_folders = [
-        sub.save_folder or sub.name for sub in repository.list()
-    ]
+    save_folders = [sub.save_folder or sub.name for sub in repository.list()]
     repaired = repair_track_index(settings.data, save_folders=save_folders)
     if repaired:
         logger.info("Repaired %d stale track index entries on startup", repaired)
@@ -484,9 +561,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # previously-synced folder as "never run".
     interrupted = services.sync_ledger_service.reconcile_interrupted_jobs()
     if interrupted:
-        logger.info(
-            "Marked %d interrupted sync ledger row(s) on startup", interrupted
-        )
+        logger.info("Marked %d interrupted sync ledger row(s) on startup", interrupted)
 
     # Leftover .part / abandoned Cache staging from crashed downloads.
     cache_root = DOWNLOAD_CACHE_ROOT if DOWNLOAD_CACHE_ROOT.is_dir() else None

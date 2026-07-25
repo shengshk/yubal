@@ -9,7 +9,7 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
-from yubal.services.track_index import rewrite_track_index_prefix
+from yubal.services.track_index import repair_track_index, rewrite_track_index_prefix
 from yubal.utils.audio_assets import (
     read_embedded_cover,
     read_embedded_lyrics,
@@ -22,6 +22,8 @@ from yubal.utils.filename import _limit_path_component, clean_filename
 from yubal.utils.library import (
     AUDIO_SUFFIXES,
     STORAGE_EXTERNAL,
+    STORAGE_WANTED,
+    WANTED_ROOT,
     assert_folder_depth,
     delete_empty_library_folder,
     is_empty_library_folder,
@@ -34,6 +36,7 @@ from yubal.utils.library import (
 from yubal_api.api.deps import (
     LibraryHealthServiceDep,
     LibraryLookupServiceDep,
+    LibraryStatsServiceDep,
     PreferencesStoreDep,
     SettingsDep,
     SubscriptionServiceDep,
@@ -138,6 +141,8 @@ def _resolve_audio_file(data_path: Path, path: str) -> Path:
             rel = rel[len("External/") :]
         if rel.startswith("organized/") or rel.startswith("raw/"):
             abs_path = resolve_storage_path(STORAGE_EXTERNAL, rel)
+        elif rel.startswith("wanted/"):
+            abs_path = resolve_storage_path(STORAGE_WANTED, rel[len("wanted/") :])
         else:
             abs_path = resolve_under_data(data_path, rel)
     except ValueError as e:
@@ -163,6 +168,10 @@ def _resolve_library_dir(data_path: Path, folder: str) -> Path:
             ):
                 rest = f"organized/{rest}"
             abs_path = resolve_storage_path(STORAGE_EXTERNAL, rest)
+        elif rel == "wanted":
+            abs_path = WANTED_ROOT
+        elif rel.startswith("wanted/"):
+            abs_path = resolve_storage_path(STORAGE_WANTED, rel[len("wanted/") :])
         else:
             abs_path = resolve_under_data(data_path, rel)
     except ValueError as e:
@@ -220,6 +229,27 @@ class LibraryHealthResponse(BaseModel):
     last_check_at: str | None = None
 
 
+class LibraryTrackSummaryResponse(BaseModel):
+    effective_count: int
+    identified_count: int
+    unidentified_count: int
+    verified_count: int
+    unverified_count: int
+    physical_count: int
+    hardlink_duplicate_count: int
+
+
+class LibraryAuditResponse(BaseModel):
+    ok: bool
+    physical_count: int
+    hardlink_duplicate_count: int
+    catalog_location_count: int
+    missing_catalog_locations: int
+    repaired_catalog_locations: int
+    repaired_index_entries: int
+    untracked_physical_count: int
+
+
 @router.get("/health", response_model=LibraryHealthResponse)
 def library_health(library_health: LibraryHealthServiceDep) -> LibraryHealthResponse:
     """Download/External mount health used to gate jobs, scheduler, and matching."""
@@ -235,6 +265,49 @@ def library_health(library_health: LibraryHealthServiceDep) -> LibraryHealthResp
         last_check_at=(
             health.last_check_at.isoformat() if health.last_check_at else None
         ),
+    )
+
+
+@router.post("/audit", response_model=LibraryAuditResponse)
+def audit_library(
+    library_health: LibraryHealthServiceDep,
+    library_stats: LibraryStatsServiceDep,
+    settings: SettingsDep,
+    subscriptions: SubscriptionServiceDep,
+    repair: bool = Query(default=False),
+) -> LibraryAuditResponse:
+    """Audit physical files/catalog rows; optional repair only removes stale refs."""
+    library_health.ensure_healthy()
+    audit = library_stats.audit(repair_missing=repair)
+    repaired_index = 0
+    if repair:
+        save_folders = [
+            subscription.save_folder or subscription.name
+            for subscription in subscriptions.list()
+        ]
+        repaired_index = repair_track_index(
+            settings.data,
+            save_folders=save_folders,
+        )
+    return LibraryAuditResponse(
+        ok=audit.ok,
+        physical_count=audit.physical_count,
+        hardlink_duplicate_count=audit.hardlink_duplicate_count,
+        catalog_location_count=audit.catalog_location_count,
+        missing_catalog_locations=audit.missing_catalog_locations,
+        repaired_catalog_locations=audit.repaired_catalog_locations,
+        repaired_index_entries=repaired_index,
+        untracked_physical_count=audit.untracked_physical_count,
+    )
+
+
+@router.get("/track-summary", response_model=LibraryTrackSummaryResponse)
+def library_track_summary(
+    library_stats: LibraryStatsServiceDep,
+) -> LibraryTrackSummaryResponse:
+    """Count real audio files once per inode across the whole local library."""
+    return LibraryTrackSummaryResponse.model_validate(
+        library_stats.summary(), from_attributes=True
     )
 
 
@@ -291,7 +364,27 @@ def stream_playlist_cover(
     cover_path = find_playlist_folder_cover(abs_dir)
     if cover_path is None:
         return Response(status_code=204)
-    media = _IMAGE_MEDIA_TYPES.get(cover_path.suffix.lower(), "application/octet-stream")
+    media = _IMAGE_MEDIA_TYPES.get(
+        cover_path.suffix.lower(), "application/octet-stream"
+    )
+    return FileResponse(
+        cover_path,
+        media_type=media,
+        filename=cover_path.name,
+        content_disposition_type="inline",
+    )
+
+
+@router.get("/wanted-cover")
+def stream_wanted_cover(
+    matched: bool = Query(default=False),
+) -> Response:
+    """Default wishlist cover: empty (no hardlinks) vs matched (has files)."""
+    name = "cover-matched.jpg" if matched else "cover-empty.jpg"
+    cover_path = WANTED_ROOT / name
+    if not cover_path.is_file():
+        return Response(status_code=204)
+    media = _IMAGE_MEDIA_TYPES.get(cover_path.suffix.lower(), "image/jpeg")
     return FileResponse(
         cover_path,
         media_type=media,
@@ -313,7 +406,9 @@ def stream_album_cover(
     cover_path = find_album_folder_cover(abs_path)
     if cover_path is None:
         return Response(status_code=204)
-    media = _IMAGE_MEDIA_TYPES.get(cover_path.suffix.lower(), "application/octet-stream")
+    media = _IMAGE_MEDIA_TYPES.get(
+        cover_path.suffix.lower(), "application/octet-stream"
+    )
     return FileResponse(
         cover_path,
         media_type=media,

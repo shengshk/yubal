@@ -123,6 +123,15 @@ class SettingsResponse(BaseModel):
     telegram_daily_limit: int = Field(default=5, ge=1, le=1000)
     telegram_api_url: str = ""
     telegram_bot_running: bool = False
+    wanted_enabled: bool = True
+    wanted_auto_match_enabled: bool = True
+    wanted_max_items: int = Field(default=50, ge=1, le=10000)
+    wanted_sync_jitter_seconds: int = Field(default=600, ge=0, le=600)
+    wanted_source_musicbrainz: bool = True
+    wanted_source_qq: bool = True
+    wanted_source_discogs: bool = False
+    wanted_source_lastfm: bool = False
+    lastfm_api_key: str = ""
 
 
 class SettingsUpdate(BaseModel):
@@ -160,3 +169,12 @@ class SettingsUpdate(BaseModel):
     telegram_admin_ids: str | None = None
     telegram_user_ids: str | None = None
     telegram_daily_limit: int | None = Field(default=None, ge=1, le=1000)
+    wanted_enabled: bool | None = None
+    wanted_auto_match_enabled: bool | None = None
+    wanted_max_items: int | None = Field(default=None, ge=1, le=10000)
+    wanted_sync_jitter_seconds: int | None = Field(default=None, ge=0, le=600)
+    wanted_source_musicbrainz: bool | None = None
+    wanted_source_qq: bool | None = None
+    wanted_source_discogs: bool | None = None
+    wanted_source_lastfm: bool | None = None
+    lastfm_api_key: str | None = None

@@ -69,9 +69,13 @@ class SubscriptionMembershipService:
         self._archive_folder = archive_folder.strip().replace("\\", "/").rstrip("/")
         self._index = TrackFileIndex(data_path)
         self._external = None
+        self._wanted = None
 
     def bind_external_library(self, external: object) -> None:
         self._external = external
+
+    def bind_wanted_service(self, wanted: object) -> None:
+        self._wanted = wanted
 
     def rewrite_catalog_folder(self, old_folder: str, new_folder: str) -> int:
         return self._catalog.rewrite_save_folder(old_folder, new_folder)
@@ -104,6 +108,7 @@ class SubscriptionMembershipService:
         snapshot_id: UUID,
         remote_tracks: list[TrackMetadata],
         unavailable_count: int = 0,
+        unavailable_video_ids: list[str] | None = None,
         cancelled: bool = False,
         failed: bool = False,
         error_message: str | None = None,
@@ -139,24 +144,36 @@ class SubscriptionMembershipService:
         # is idempotent: already-known tracks are skipped, and files claimed by
         # another subscription in the same folder are left alone.
         self._backfill_local_members(subscription, remote)
-        delta = self._membership.reconcile(subscription, remote)
+        delta = self._membership.reconcile(
+            subscription,
+            remote,
+            unavailable_video_ids=set(unavailable_video_ids or []),
+        )
         self._apply_file_delta(subscription, delta)
-        if (
-            subscription.sync_mode == SubscriptionSyncMode.INCREMENTAL
-            and subscription.offline_cleanup_enabled
-            and int(subscription.offline_cleanup_delay_hours) == 0
-        ):
-            for row in delta.offline:
-                self._membership.delete_membership(
-                    subscription.id,
-                    row.video_id,
+        if subscription.sync_mode == SubscriptionSyncMode.INCREMENTAL:
+            if (
+                subscription.offline_cleanup_enabled
+                and int(subscription.offline_cleanup_delay_hours) == 0
+            ):
+                for row in delta.offline:
+                    self._cleanup_membership_row(
+                        subscription,
+                        row,
+                        action=self._offline_cleanup_action(subscription),
+                    )
+            if (
+                getattr(subscription, "id_invalid_cleanup_enabled", False)
+                and int(
+                    getattr(subscription, "id_invalid_cleanup_delay_hours", 72) or 72
                 )
-                self._dispose_catalog_file(
-                    catalog_video_id=row.catalog_video_id,
-                    save_folder=subscription.save_folder or subscription.name,
-                    exclude_subscription_id=subscription.id,
-                    action=subscription.offline_cleanup_action,
-                )
+                == 0
+            ):
+                for row in delta.id_invalid:
+                    self._cleanup_membership_row(
+                        subscription,
+                        row,
+                        action=self._id_invalid_cleanup_action(subscription),
+                    )
         return delta
 
     def list_membership(
@@ -185,6 +202,13 @@ class SubscriptionMembershipService:
                 action="missing",
                 kept_reason="membership not found",
             )
+        if str(action) == "to_wanted":
+            if row.membership_status != MembershipStatus.ID_INVALID:
+                raise ValueError(
+                    "to_wanted is only allowed for id_invalid memberships"
+                )
+            return self._migrate_membership_to_wanted(subscription, row)
+
         self._membership.delete_membership(subscription.id, video_id)
         return self._dispose_catalog_file(
             catalog_video_id=row.catalog_video_id,
@@ -193,17 +217,84 @@ class SubscriptionMembershipService:
             action=OfflineCleanupAction(action),
         )
 
+    def _migrate_membership_to_wanted(
+        self,
+        subscription: Subscription,
+        row: SubscriptionTrack,
+    ) -> FileActionResult:
+        """Strip membership, hardlink file into wishlist, drop source list+file."""
+        if self._wanted is None:
+            raise RuntimeError("wanted service not configured")
+        folder = subscription.save_folder or subscription.name
+        location = self._catalog.get_location(row.catalog_video_id, folder)
+        abs_path = None
+        if location is not None:
+            abs_path = resolve_under_data(
+                self._data_path, f"{folder}/{location.relative_path}"
+            )
+        track = self._catalog.get_track(row.catalog_video_id)
+        title = row.title or (
+            location.relative_path if location is not None else row.video_id
+        )
+        artists = row.artist or ""
+        album = (track.album if track else "") or ""
+        add_from_offline = getattr(self._wanted, "add_from_offline", None)
+        if not callable(add_from_offline):
+            raise RuntimeError("wanted service missing add_from_offline")
+        add_from_offline(
+            title=title,
+            artists=artists,
+            album=album,
+            source_path=abs_path if abs_path is not None and abs_path.is_file() else None,
+            thumbnail_url=getattr(track, "thumbnail_url", None) if track else None,
+        )
+        self._membership.delete_membership(subscription.id, row.video_id)
+        if location is not None:
+            refs = self._membership.count_refs_in_folder(
+                row.catalog_video_id,
+                folder,
+                exclude_subscription_id=subscription.id,
+            )
+            if refs == 0:
+                if abs_path is not None and abs_path.is_file():
+                    try:
+                        abs_path.unlink(missing_ok=True)
+                        lrc = abs_path.with_suffix(".lrc")
+                        if lrc.is_file():
+                            lrc.unlink(missing_ok=True)
+                        stop_at = resolve_under_data(self._data_path, folder)
+                        cleanup_after_audio_removed(abs_path.parent, stop_at)
+                    except OSError:
+                        logger.exception(
+                            "Failed removing source after wanted migrate %s",
+                            row.video_id,
+                        )
+                self._catalog.delete_location(folder, location.relative_path)
+        return FileActionResult(
+            video_id=row.video_id,
+            action="to_wanted",
+            path=str(abs_path) if abs_path else None,
+        )
+
     def clear_offline(
         self,
         subscription: Subscription,
         *,
         to_raw_delete: bool = False,
+        to_wanted: bool = False,
+        status: MembershipStatus = MembershipStatus.OFFLINE,
     ) -> dict[str, int]:
-        """Clear offline memberships: hard-delete or salvage into Raw/Delete."""
+        """Clear memberships in one status: hard-delete, Raw/Delete, or Wanted."""
+        if to_wanted and to_raw_delete:
+            raise ValueError("choose either to_wanted or to_raw_delete")
+        if to_wanted and status == MembershipStatus.OFFLINE:
+            raise ValueError(
+                "to_wanted is only allowed for id_invalid, not not-in-playlist"
+            )
         rows = [
             r
             for r in self._membership.list_for_subscription(subscription.id)
-            if r.membership_status == MembershipStatus.OFFLINE
+            if r.membership_status == status
         ]
         folder = subscription.save_folder or subscription.name
         cleared = moved = errors = 0
@@ -214,7 +305,17 @@ class SubscriptionMembershipService:
                 abs_path = resolve_under_data(
                     self._data_path, f"{folder}/{location.relative_path}"
                 )
-            if to_raw_delete:
+            if to_wanted:
+                try:
+                    self._migrate_membership_to_wanted(subscription, row)
+                    cleared += 1
+                    moved += 1
+                except Exception:
+                    errors += 1
+                    logger.exception(
+                        "Failed offline→wanted for %s", row.video_id
+                    )
+            elif to_raw_delete:
                 if self._external is None:
                     raise RuntimeError("external library not configured")
                 try:
@@ -440,35 +541,83 @@ class SubscriptionMembershipService:
         return moved
 
     def run_offline_cleanup(self, *, now: datetime | None = None) -> int:
-        """Process due offline memberships for subscriptions with cleanup enabled."""
+        """Process due offline / ID-invalid memberships with cleanup enabled."""
         now = now or datetime.now(UTC)
         processed = 0
-        # Evaluate each subscription's delay independently.
         for sub in self._subscriptions.list(enabled=None):
             if sub.sync_mode != SubscriptionSyncMode.INCREMENTAL:
                 continue
-            if not sub.offline_cleanup_enabled:
-                continue
-            delay = max(0, int(sub.offline_cleanup_delay_hours))
-            cutoff = now - timedelta(hours=delay)
-            due = [
-                row
-                for row in self._membership.list_for_subscription(
-                    sub.id,
-                    status=MembershipStatus.OFFLINE,
+            if sub.offline_cleanup_enabled:
+                delay = max(0, int(sub.offline_cleanup_delay_hours))
+                cutoff = now - timedelta(hours=delay)
+                action = self._offline_cleanup_action(sub)
+                due = [
+                    row
+                    for row in self._membership.list_for_subscription(
+                        sub.id,
+                        status=MembershipStatus.OFFLINE,
+                    )
+                    if row.missing_since is not None and row.missing_since <= cutoff
+                ]
+                for row in due:
+                    self._cleanup_membership_row(sub, row, action=action)
+                    processed += 1
+            if getattr(sub, "id_invalid_cleanup_enabled", False):
+                delay = max(
+                    0, int(getattr(sub, "id_invalid_cleanup_delay_hours", 72) or 72)
                 )
-                if row.missing_since is not None and row.missing_since <= cutoff
-            ]
-            for row in due:
-                self._membership.delete_membership(sub.id, row.video_id)
-                self._dispose_catalog_file(
-                    catalog_video_id=row.catalog_video_id,
-                    save_folder=sub.save_folder or sub.name,
-                    exclude_subscription_id=sub.id,
-                    action=sub.offline_cleanup_action,
-                )
-                processed += 1
+                cutoff = now - timedelta(hours=delay)
+                action = self._id_invalid_cleanup_action(sub)
+                due = [
+                    row
+                    for row in self._membership.list_for_subscription(
+                        sub.id,
+                        status=MembershipStatus.ID_INVALID,
+                    )
+                    if row.missing_since is not None and row.missing_since <= cutoff
+                ]
+                for row in due:
+                    self._cleanup_membership_row(sub, row, action=action)
+                    processed += 1
         return processed
+
+    @staticmethod
+    def _offline_cleanup_action(subscription: Subscription) -> OfflineCleanupAction:
+        """Not-in-playlist cleanup never migrates to Wanted."""
+        action = subscription.offline_cleanup_action
+        if action == OfflineCleanupAction.TO_WANTED or str(action) == "to_wanted":
+            return OfflineCleanupAction.ARCHIVE
+        return OfflineCleanupAction(action)
+
+    @staticmethod
+    def _id_invalid_cleanup_action(
+        subscription: Subscription,
+    ) -> OfflineCleanupAction:
+        action = getattr(
+            subscription, "id_invalid_cleanup_action", OfflineCleanupAction.ARCHIVE
+        )
+        try:
+            return OfflineCleanupAction(action)
+        except ValueError:
+            return OfflineCleanupAction.ARCHIVE
+
+    def _cleanup_membership_row(
+        self,
+        subscription: Subscription,
+        row: SubscriptionTrack,
+        *,
+        action: OfflineCleanupAction,
+    ) -> FileActionResult:
+        """Apply a configured cleanup action to one membership row."""
+        if action == OfflineCleanupAction.TO_WANTED:
+            return self._migrate_membership_to_wanted(subscription, row)
+        self._membership.delete_membership(subscription.id, row.video_id)
+        return self._dispose_catalog_file(
+            catalog_video_id=row.catalog_video_id,
+            save_folder=subscription.save_folder or subscription.name,
+            exclude_subscription_id=subscription.id,
+            action=action,
+        )
 
     def _backfill_local_members(
         self,

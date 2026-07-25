@@ -127,7 +127,7 @@ class JobExecutor:
         ):
             self._direct_recover = DirectRecoverService(
                 data_path=base_path,
-                track_catalog=sync_ledger_service._track_catalog,  # noqa: SLF001
+                track_catalog=sync_ledger_service._track_catalog,
                 preferences_store=preferences_store,
                 cookies_path=cookies_path,
                 folder_presence=folder_presence,
@@ -138,6 +138,14 @@ class JobExecutor:
 
         # Track background tasks to prevent GC during execution
         self._background_tasks: set[asyncio.Task[Any]] = set()
+        # Scheduler work runs in a worker thread, but asyncio tasks must be
+        # created on the application's event loop.
+        try:
+            self._event_loop: asyncio.AbstractEventLoop | None = (
+                asyncio.get_running_loop()
+            )
+        except RuntimeError:
+            self._event_loop = None
         # Map job_id -> CancelToken for cancellation support
         self._cancel_tokens: dict[str, CancelToken] = {}
 
@@ -264,7 +272,22 @@ class JobExecutor:
         Args:
             job: The job to start executing.
         """
-        task = asyncio.create_task(
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = self._event_loop
+            if loop is None or loop.is_closed():
+                raise RuntimeError("job executor event loop is not available") from None
+            loop.call_soon_threadsafe(self._start_job_on_loop, job)
+            return
+
+        self._event_loop = loop
+        self._start_job_on_loop(job)
+
+    def _start_job_on_loop(self, job: Job) -> None:
+        """Create and track a job task on the bound application event loop."""
+        loop = asyncio.get_running_loop()
+        task = loop.create_task(
             self._run_job(job.id, job.url, job.max_items, job.subscription_id),
             name=f"job-{job.id[:8]}",  # Helpful for debugging
         )
@@ -303,9 +326,7 @@ class JobExecutor:
             token.cancel()
         return len(tokens)
 
-    def _finalize_failed_ledger(
-        self, job_id: str, library_folder: str | None
-    ) -> None:
+    def _finalize_failed_ledger(self, job_id: str, library_folder: str | None) -> None:
         """Mark the ledger row failed after a timeout/exception.
 
         Prevents the row from being stuck at "running" (which the UI cannot
@@ -321,9 +342,7 @@ class JobExecutor:
                     save_folder=library_folder,
                 )
             except Exception:
-                logger.exception(
-                    "Failed to finalize ledger for job %s", job_id[:8]
-                )
+                logger.exception("Failed to finalize ledger for job %s", job_id[:8])
 
     async def _run_job(
         self,
@@ -358,6 +377,10 @@ class JobExecutor:
                 if self._subscription_service and subscription_id:
                     try:
                         subscription = self._subscription_service.get(subscription_id)
+                        subscription = await asyncio.to_thread(
+                            self._subscription_service.prepare_for_sync,
+                            subscription,
+                        )
                         library_folder = sanitize_save_folder(
                             subscription.save_folder or subscription.name,
                             ascii_filenames=self._ascii_filenames,
@@ -441,7 +464,7 @@ class JobExecutor:
                     if self._direct_recover is None:
                         result = SyncResult(
                             success=False,
-                            error="Direct recover service is not configured",
+                            error="Download Center recovery is not configured",
                         )
                     else:
                         recover = self._direct_recover
@@ -491,10 +514,7 @@ class JobExecutor:
 
                 # Handle result (cancelled status already set by cancel_job API)
                 if cancel_token.is_cancelled:
-                    if (
-                        self._membership_service is not None
-                        and snapshot_id is not None
-                    ):
+                    if self._membership_service is not None and snapshot_id is not None:
                         self._membership_service.abort_snapshot(
                             snapshot_id,
                             status=SnapshotStatus.CANCELLED,
@@ -533,6 +553,7 @@ class JobExecutor:
                             snapshot_id=snapshot_id,
                             remote_tracks=result.remote_tracks,
                             unavailable_count=result.unavailable_track_count,
+                            unavailable_video_ids=result.unavailable_video_ids,
                         )
                     finished = self._job_store.get(job_id)
                     if self._sync_ledger_service and finished is not None:
@@ -541,6 +562,15 @@ class JobExecutor:
                             if result.remote_tracks is not None
                             else None
                         )
+                        # Catalog newly materialized files before marking the
+                        # job finished. ``record_job_finished`` invokes the
+                        # canonical post-job finalizer, which must be able to
+                        # see these tracks in the same cycle.
+                        if result.download_results and library_folder:
+                            self._sync_ledger_service.record_download_results(
+                                library_folder,
+                                result.download_results,
+                            )
                         self._sync_ledger_service.record_job_finished(
                             finished,
                             success=True,
@@ -549,18 +579,10 @@ class JobExecutor:
                             download_stats=result.download_stats,
                             cloud_track_count=cloud,
                         )
-                        if result.download_results and library_folder:
-                            self._sync_ledger_service.record_download_results(
-                                library_folder,
-                                result.download_results,
-                            )
                 else:
                     error_msg = result.error or "Unknown error"
                     logger.error("Job %s failed: %s", job_id[:8], error_msg)
-                    if (
-                        self._membership_service is not None
-                        and snapshot_id is not None
-                    ):
+                    if self._membership_service is not None and snapshot_id is not None:
                         self._membership_service.abort_snapshot(
                             snapshot_id,
                             status=SnapshotStatus.FAILED,

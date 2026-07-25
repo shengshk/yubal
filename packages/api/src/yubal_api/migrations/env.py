@@ -20,6 +20,7 @@ from yubal_api.db.subscription_membership import (  # noqa: F401
 )
 from yubal_api.db.sync_ledger import SyncLedgerEntry  # noqa: F401
 from yubal_api.db.track_catalog import TrackLocation, TrackRecord  # noqa: F401
+from yubal_api.db.wanted import WantedTrack  # noqa: F401
 from yubal_api.settings import get_settings
 
 config = context.config

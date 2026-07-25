@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import shutil
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -19,9 +20,9 @@ from yubal.utils.library import (
 )
 
 from yubal_api.api.exceptions import FolderConflictError
-from yubal_api.db.track_catalog import LocationMembershipStatus
 from yubal_api.db.sync_ledger import DIRECT_LEDGER_KEY, LedgerKind, SyncLedgerEntry
 from yubal_api.db.sync_ledger_repository import SyncLedgerRepository
+from yubal_api.db.track_catalog import LocationMembershipStatus
 from yubal_api.db.track_catalog_repository import (
     TrackCatalogRepository,
     format_track_display,
@@ -43,6 +44,15 @@ if TYPE_CHECKING:
     from yubal_api.services.job_executor import JobExecutor
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class FolderTrackSummary:
+    """Compact card data that avoids returning a whole track list."""
+
+    present_video_ids: frozenset[str]
+    missing_active_count: int
+    cover_track_path: str | None
 
 
 def subscription_ledger_key(subscription_id: UUID) -> str:
@@ -162,10 +172,15 @@ class SyncLedgerService:
         self._gate = None
         self._job_executor = None
         self._subscription_folder_lookup = None
+        self._post_job_finalize: Callable[[str, str], object] | None = None
         self._external: ExternalLibraryService | None = None
+        self._wanted = None
 
     def bind_external_library(self, external: ExternalLibraryService) -> None:
         self._external = external
+
+    def bind_wanted_service(self, wanted: object | None) -> None:
+        self._wanted = wanted
 
     def _cover_tier_kwargs(
         self,
@@ -180,13 +195,9 @@ class SyncLedgerService:
         if self._preferences_store is not None:
             prefs = self._preferences_store.effective()
             if excellence is None:
-                excellence = int(
-                    getattr(prefs, "cover_excellence_px", 0) or 0
-                )
+                excellence = int(getattr(prefs, "cover_excellence_px", 0) or 0)
             probe_days = int(getattr(prefs, "cover_probe_fresh_days", 7) or 7)
-            download_days = int(
-                getattr(prefs, "cover_download_fresh_days", 30) or 30
-            )
+            download_days = int(getattr(prefs, "cover_download_fresh_days", 30) or 30)
         if excellence is None:
             excellence = 0
         if not video_id or self._data_path is None:
@@ -210,18 +221,18 @@ class SyncLedgerService:
             "cover_download_fresh_days": download_days,
         }
 
-    def bind_maintenance(
-        self, gate: OperationGate, job_executor: JobExecutor
-    ) -> None:
+    def bind_maintenance(self, gate: OperationGate, job_executor: JobExecutor) -> None:
         """Wire OperationGate + JobExecutor for exclusive Direct folder moves."""
         self._gate = gate
         self._job_executor = job_executor
 
-    def bind_subscription_folders(
-        self, lookup: Callable[[UUID], str | None]
-    ) -> None:
+    def bind_subscription_folders(self, lookup: Callable[[UUID], str | None]) -> None:
         """Resolve current subscription save_folder during reconcile."""
         self._subscription_folder_lookup = lookup
+
+    def bind_post_job_finalize(self, callback: Callable[[str, str], object]) -> None:
+        """Run canonical folder enrichment after a successful job."""
+        self._post_job_finalize = callback
 
     def reconcile_interrupted_jobs(self) -> int:
         """Resolve ledger rows left ``running`` by a crash/restart. Startup-only."""
@@ -349,9 +360,7 @@ class SyncLedgerService:
                             lrc = abs_path.with_suffix(".lrc")
                             if lrc.is_file():
                                 synced = lyrics_are_synced(
-                                    lrc.read_text(
-                                        encoding="utf-8", errors="ignore"
-                                    )
+                                    lrc.read_text(encoding="utf-8", errors="ignore")
                                 )
                         except OSError:
                             pass
@@ -405,9 +414,7 @@ class SyncLedgerService:
                 title=t.title,
                 artist=t.artist,
                 album_artist=None,
-                display_label=(
-                    f"{t.artist} - {t.title}" if t.artist else t.title
-                ),
+                display_label=(f"{t.artist} - {t.title}" if t.artist else t.title),
                 exists=t.exists,
                 storage=t.storage,
                 relative_path=t.relative_path,
@@ -415,6 +422,59 @@ class SyncLedgerService:
             for t in tracks
         ]
         return folder, items
+
+    def folder_track_summary(self, save_folder: str) -> FolderTrackSummary:
+        """Return only the membership/cover facts needed by a collapsed card."""
+        if self._data_path is None:
+            return FolderTrackSummary(frozenset(), 0, None)
+        folder = (save_folder or "").strip().replace("\\", "/")
+        if not folder or folder.startswith("/") or ".." in folder.split("/"):
+            raise ValueError("invalid save_folder")
+        root = resolve_under_data(self._data_path, folder)
+
+        if self._track_catalog is not None:
+            rows = self._track_catalog.list_for_save_folder(folder)
+            if rows:
+                present_ids: set[str] = set()
+                missing_active = 0
+                cover_path: str | None = None
+                for location, _track in rows:
+                    path = root / location.relative_path
+                    exists = path.is_file()
+                    if exists:
+                        present_ids.add(location.video_id)
+                        if cover_path is None:
+                            cover_path = f"{folder}/{location.relative_path}".replace(
+                                "\\", "/"
+                            )
+                    elif location.membership_status not in (
+                        LocationMembershipStatus.OFFLINE,
+                        LocationMembershipStatus.BLOCKED,
+                    ):
+                        missing_active += 1
+                return FolderTrackSummary(
+                    frozenset(present_ids),
+                    missing_active,
+                    cover_path,
+                )
+
+        # Legacy folders without catalog rows are uncommon. Reuse the existing
+        # scanner only for this fallback so normal dashboard loads stay cheap.
+        _folder, items = self.list_tracks(folder)
+        present = [item for item in items if item.exists]
+        present_ids = frozenset(item.video_id for item in present if item.video_id)
+        first = present[0] if present else None
+        cover_path = (
+            f"{folder}/{first.relative_path}".replace("\\", "/")
+            if first is not None
+            else None
+        )
+        missing_active = sum(
+            1
+            for item in items
+            if not item.exists and item.membership_status not in ("offline", "blocked")
+        )
+        return FolderTrackSummary(present_ids, missing_active, cover_path)
 
     def record_download_results(
         self,
@@ -452,8 +512,8 @@ class SyncLedgerService:
                 if skip not in (None, SkipReason.FILE_EXISTS):
                     continue
                 try:
-                    rel_to_data = Path(path).resolve().relative_to(
-                        self._data_path.resolve()
+                    rel_to_data = (
+                        Path(path).resolve().relative_to(self._data_path.resolve())
                     )
                 except ValueError:
                     continue
@@ -503,9 +563,40 @@ class SyncLedgerService:
                     origin=origin,
                 )
             except Exception:
-                logger.exception(
-                    "Failed to record track catalog for %s", video_id
-                )
+                logger.exception("Failed to record track catalog for %s", video_id)
+
+    def record_existing_track(
+        self,
+        *,
+        video_id: str,
+        title: str,
+        artist: str,
+        album: str,
+        cover_url: str | None,
+        save_folder: str,
+        absolute_path: Path,
+        origin: str,
+        immutable: bool = False,
+    ) -> None:
+        """Register a materialized non-download file for final enrichment."""
+        if self._track_catalog is None or self._data_path is None:
+            return
+        self._track_catalog.record_from_download(
+            video_id=video_id,
+            title=title,
+            artist=artist,
+            album_artist=artist,
+            album=album,
+            track_number=None,
+            year=None,
+            cover_url=cover_url,
+            save_folder=save_folder,
+            absolute_path=absolute_path,
+            data_root=self._data_path,
+            origin=origin,
+        )
+        if immutable:
+            self._track_catalog.set_immutable(video_id, True)
 
     def delete_for_subscription(self, subscription_id: UUID) -> None:
         self._repository.delete_by_subscription_id(subscription_id)
@@ -569,7 +660,7 @@ class SyncLedgerService:
     ) -> SyncLedgerEntry:
         if self._data_path is None or self._preferences_store is None:
             raise RuntimeError(
-                "Direct folder update requires data_path and preferences"
+                "Download Center update requires data_path and preferences"
             )
 
         prefs_updates: dict = {}
@@ -591,7 +682,7 @@ class SyncLedgerService:
             )
         if offline_cleanup_action is not None:
             action = str(offline_cleanup_action).lower().strip()
-            if action not in {"delete", "archive"}:
+            if action not in {"delete", "archive", "to_wanted"}:
                 raise ValueError(f"invalid offline_cleanup_action: {action}")
             prefs_updates["direct_offline_cleanup_action"] = action
         if offline_cleanup_delay_hours is not None:
@@ -614,10 +705,8 @@ class SyncLedgerService:
         entry = run_exclusive(
             gate=self._gate,
             job_executor=self._job_executor,
-            reason=f"move Direct folder {old}→{safe}",
-            fn=lambda: self._move_direct_folder(
-                old, safe, confirm=confirm_folder_move
-            ),
+            reason=f"move Download Center folder {old}→{safe}",
+            fn=lambda: self._move_direct_folder(old, safe, confirm=confirm_folder_move),
         )
         if prefs_updates:
             self._preferences_store.update(**prefs_updates)
@@ -685,13 +774,17 @@ class SyncLedgerService:
         - ``wipe_list``: delete audio + catalog locations + ledger row.
         - ``clear_offline_delete``: hard-delete offline list rows + files.
         - ``clear_offline_to_raw_delete``: move offline files to Raw/Delete, drop ids.
+        - ``clear_offline_to_wanted``: move offline files into wishlist, drop ids.
         - ``migrate_to_external``: move active tracks to Organized/Default.
         """
         if mode in (
             "clear_offline_delete",
             "clear_offline_to_raw_delete",
+            "clear_offline_to_wanted",
             "migrate_to_external",
         ):
+            if mode == "clear_offline_to_wanted":
+                return self.clear_direct_offline(to_wanted=True)
             if mode.startswith("clear_offline"):
                 return self.clear_direct_offline(
                     to_raw_delete=mode == "clear_offline_to_raw_delete"
@@ -700,7 +793,7 @@ class SyncLedgerService:
 
         if not confirm:
             raise FolderConflictError(
-                "Confirm deletion of all Direct-download files.",
+                "Confirm deletion of all Download Center files.",
                 save_folder=self._direct_folder(),
             )
         folder = self._direct_folder()
@@ -732,12 +825,15 @@ class SyncLedgerService:
         ``wipe_list``: remove catalog location.
         ``block``: delete file + mark blocked (禁止回补).
         ``migrate_to_external``: move file+list to Organized/Default.
+        ``migrate_to_wanted``: strip id into wishlist; hardlink file; drop list+file.
         """
         if self._data_path is None:
             raise ValueError("data path not configured")
         folder = self._direct_folder()
         if mode == "migrate_to_external":
             self._migrate_direct_track(relative_path)
+        elif mode == "migrate_to_wanted":
+            self._migrate_direct_track_to_wanted(relative_path)
         elif mode == "block":
             delete_track_file(
                 data_path=self._data_path,
@@ -767,6 +863,45 @@ class SyncLedgerService:
             entry = self.ensure_direct_entry()
         return entry
 
+    def _migrate_direct_track_to_wanted(self, relative_path: str) -> None:
+        """Move one Direct row (typically offline) into the wishlist."""
+        if self._wanted is None:
+            raise RuntimeError("wanted service not configured")
+        if self._track_catalog is None or self._data_path is None:
+            raise ValueError("catalog/data path not configured")
+        folder = self._direct_folder()
+        loc = None
+        rec = None
+        for location, record in self._track_catalog.list_for_save_folder(folder):
+            if location.relative_path == relative_path:
+                loc = location
+                rec = record
+                break
+        if loc is None or rec is None:
+            raise FileNotFoundError("track not in Download Center list")
+        abs_path = resolve_under_data(self._data_path, f"{folder}/{relative_path}")
+        stop_at = resolve_under_data(self._data_path, folder)
+        self._wanted.add_from_offline(
+            title=rec.title or "",
+            artists=rec.artist or "",
+            album=rec.album or "",
+            source_path=abs_path if abs_path.is_file() else None,
+            thumbnail_url=getattr(rec, "thumbnail_url", None),
+        )
+        if abs_path.is_file():
+            try:
+                abs_path.unlink(missing_ok=True)
+                lrc = abs_path.with_suffix(".lrc")
+                if lrc.is_file():
+                    lrc.unlink(missing_ok=True)
+                cleanup_after_audio_removed(abs_path.parent, stop_at)
+            except OSError:
+                logger.exception(
+                    "Failed removing Download Center file after wanted migrate %s",
+                    relative_path,
+                )
+        self._track_catalog.delete_location(folder, relative_path)
+
     def unblock_direct_track(self, video_id: str) -> SyncLedgerEntry:
         """Clear Direct block so auto-recover may restore the track."""
         if self._track_catalog is None:
@@ -774,7 +909,7 @@ class SyncLedgerService:
         folder = self._direct_folder()
         loc = self._track_catalog.get_location(video_id, folder)
         if loc is None:
-            raise ValueError("track not in Direct list")
+            raise ValueError("track not in Download Center list")
         self._track_catalog.set_membership_status(
             folder, video_id, LocationMembershipStatus.ACTIVE
         )
@@ -790,7 +925,7 @@ class SyncLedgerService:
         folder = self._direct_folder()
         loc = self._track_catalog.get_location(video_id, folder)
         if loc is None:
-            raise ValueError("track not in Direct list")
+            raise ValueError("track not in Download Center list")
         if self._data_path is not None:
             abs_path = resolve_under_data(
                 self._data_path, f"{folder}/{loc.relative_path}"
@@ -809,10 +944,14 @@ class SyncLedgerService:
             entry = self.ensure_direct_entry()
         return entry
 
-    def clear_direct_offline(self, *, to_raw_delete: bool = False) -> dict:
-        """Remove offline Direct rows; optionally salvage files into Raw/Delete."""
+    def clear_direct_offline(
+        self, *, to_raw_delete: bool = False, to_wanted: bool = False
+    ) -> dict:
+        """Remove offline Direct rows; optionally salvage into Raw/Delete or Wanted."""
         if self._track_catalog is None:
             return {"cleared": 0, "moved": 0, "errors": 0}
+        if to_wanted and to_raw_delete:
+            raise ValueError("choose either to_wanted or to_raw_delete")
         folder = self._direct_folder()
         stop_at = (
             resolve_under_data(self._data_path, folder)
@@ -831,7 +970,37 @@ class SyncLedgerService:
                 abs_path = resolve_under_data(
                     self._data_path, f"{folder}/{loc.relative_path}"
                 )
-            if to_raw_delete:
+            if to_wanted:
+                if self._wanted is None:
+                    raise RuntimeError("wanted service not configured")
+                try:
+                    self._wanted.add_from_offline(
+                        title=rec.title or "",
+                        artists=rec.artist or "",
+                        album=rec.album or "",
+                        source_path=abs_path
+                        if abs_path is not None and abs_path.is_file()
+                        else None,
+                        thumbnail_url=getattr(rec, "thumbnail_url", None),
+                    )
+                    if abs_path is not None and abs_path.is_file():
+                        # Drop Direct hardlink after wanted has its own link/copy
+                        try:
+                            if abs_path.stat().st_nlink > 1:
+                                abs_path.unlink(missing_ok=True)
+                            else:
+                                abs_path.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                        if stop_at is not None:
+                            cleanup_after_audio_removed(abs_path.parent, stop_at)
+                    self._track_catalog.delete_location(folder, loc.relative_path)
+                    cleared += 1
+                    moved += 1
+                except Exception:
+                    errors += 1
+                    logger.exception("Failed offline→wanted for %s", loc.relative_path)
+            elif to_raw_delete:
                 if self._external is None:
                     raise RuntimeError("external library not configured")
                 try:
@@ -879,7 +1048,7 @@ class SyncLedgerService:
             raise RuntimeError("external library not configured")
         folder = self._direct_folder()
         moved = errors = skipped = 0
-        for loc, rec in list(self._track_catalog.list_for_save_folder(folder)):
+        for loc, _rec in list(self._track_catalog.list_for_save_folder(folder)):
             if loc.membership_status != LocationMembershipStatus.ACTIVE:
                 skipped += 1
                 continue
@@ -888,7 +1057,9 @@ class SyncLedgerService:
                 moved += 1
             except Exception:
                 errors += 1
-                logger.exception("Failed Direct→Default for %s", loc.relative_path)
+                logger.exception(
+                    "Failed Download Center→Default for %s", loc.relative_path
+                )
         self.reconcile_direct(folder)
         return {"moved": moved, "errors": errors, "skipped": skipped}
 
@@ -898,17 +1069,13 @@ class SyncLedgerService:
         if self._data_path is None:
             raise ValueError("data path not configured")
         folder = self._direct_folder()
-        loc = self._track_catalog.get_location_by_relative_path(
-            folder, relative_path
-        )
+        loc = self._track_catalog.get_location_by_relative_path(folder, relative_path)
         if loc is None:
             raise ValueError(f"catalog location not found: {relative_path}")
         rec = self._track_catalog.get_track(loc.video_id)
         if rec is None:
             raise ValueError(f"track record not found: {loc.video_id}")
-        abs_path = resolve_under_data(
-            self._data_path, f"{folder}/{loc.relative_path}"
-        )
+        abs_path = resolve_under_data(self._data_path, f"{folder}/{loc.relative_path}")
         self._external.ingest_matched_to_default(
             abs_path,
             relative_path=loc.relative_path,
@@ -968,7 +1135,11 @@ class SyncLedgerService:
         }
 
     def run_id_invalid_cleanup(self, *, now: datetime | None = None) -> int:
-        """Dispose due Direct ID-invalid locations (archive → Raw/Delete)."""
+        """Dispose due Direct ID-invalid locations.
+
+        Actions: ``archive`` → Raw/Delete, ``delete`` → unlink,
+        ``to_wanted`` → wishlist (hardlink file when present).
+        """
         if self._track_catalog is None or self._preferences_store is None:
             return 0
         prefs = self._preferences_store.effective()
@@ -977,7 +1148,7 @@ class SyncLedgerService:
         now = now or datetime.now(UTC)
         delay = max(0, int(prefs.direct_offline_cleanup_delay_hours))
         cutoff = now - timedelta(hours=delay)
-        to_raw = (prefs.direct_offline_cleanup_action or "archive") != "delete"
+        action = (prefs.direct_offline_cleanup_action or "archive").lower().strip()
         folder = self._direct_folder()
         stop_at = (
             resolve_under_data(self._data_path, folder)
@@ -996,7 +1167,9 @@ class SyncLedgerService:
                     self._data_path, f"{folder}/{loc.relative_path}"
                 )
             try:
-                if to_raw:
+                if action == "to_wanted":
+                    self._migrate_direct_track_to_wanted(loc.relative_path)
+                elif action == "archive":
                     if self._external is None:
                         raise RuntimeError("external library not configured")
                     if abs_path is not None and abs_path.is_file():
@@ -1011,6 +1184,7 @@ class SyncLedgerService:
                         )
                         if stop_at is not None:
                             cleanup_after_audio_removed(abs_path.parent, stop_at)
+                    self._track_catalog.delete_location(folder, loc.relative_path)
                 else:
                     if abs_path is not None and abs_path.is_file():
                         abs_path.unlink()
@@ -1019,11 +1193,12 @@ class SyncLedgerService:
                             lrc.unlink(missing_ok=True)
                         if stop_at is not None:
                             cleanup_after_audio_removed(abs_path.parent, stop_at)
-                self._track_catalog.delete_location(folder, loc.relative_path)
+                    self._track_catalog.delete_location(folder, loc.relative_path)
                 cleared += 1
             except Exception:
                 logger.exception(
-                    "Failed Direct ID-invalid cleanup for %s", loc.relative_path
+                    "Failed Download Center ID-invalid cleanup for %s",
+                    loc.relative_path,
                 )
         if cleared:
             self.reconcile_direct(folder)
@@ -1210,8 +1385,14 @@ class SyncLedgerService:
                     entry.total_count = existing.total_count
 
         saved = self._repository.upsert(entry)
-        # Reconcile against disk so external deletes don't leave inflated counts
-        return self._reconcile_entry(saved)
+        # Reconcile against disk so external deletes don't leave inflated counts.
+        reconciled = self._reconcile_entry(saved)
+        if success and self._post_job_finalize is not None and folder:
+            try:
+                self._post_job_finalize(folder, kind.value)
+            except Exception:
+                logger.exception("Post-job finalization failed for %s", folder)
+        return reconciled
 
     def record_cloud_track_count(
         self,

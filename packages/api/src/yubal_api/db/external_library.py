@@ -11,6 +11,11 @@ MATCH_PENDING = "pending"
 MATCH_MATCHED = "matched"
 MATCH_REJECTED = "rejected"
 
+# Meta-lane (Wanted sources) verification lifecycle.
+META_PENDING = "pending"
+META_VERIFIED = "verified"
+META_REJECTED = "rejected"
+
 
 class ExternalPlaylist(SQLModel, table=True):
     """One top-level directory under External/Raw (a user's existing playlist)."""
@@ -89,6 +94,22 @@ class ExternalRawTrack(SQLModel, table=True):
     scrape_fail_count: int = Field(default=0)
     match_next_eligible_at: datetime | None = Field(default=None)
     scrape_next_eligible_at: datetime | None = Field(default=None)
+
+    # Meta-lane verification (Wanted-enabled sources: MusicBrainz/QQ/…).
+    # pending = never / stale; verified = hit; rejected = no hit after tries.
+    meta_status: str = Field(default="pending", max_length=16, index=True)
+    meta_source: str | None = Field(default=None, max_length=32)
+    meta_source_id: str | None = Field(default=None, max_length=128)
+    meta_source_url: str | None = Field(default=None, max_length=2048)
+    meta_title: str | None = Field(default=None, max_length=500)
+    meta_artists: str | None = Field(default=None, max_length=500)
+    meta_album: str | None = Field(default=None, max_length=500)
+    meta_thumbnail_url: str | None = Field(default=None, max_length=2048)
+    # Fingerprint of local title|artists|album at verify time; tag edits invalidate.
+    meta_fingerprint: str | None = Field(default=None, max_length=600)
+    meta_verified_at: datetime | None = Field(default=None)
+    meta_fail_count: int = Field(default=0)
+    meta_next_eligible_at: datetime | None = Field(default=None)
 
     # Identity guard for scan/dedupe (device+inode signature, best-effort).
     file_key: str | None = Field(default=None, max_length=64)

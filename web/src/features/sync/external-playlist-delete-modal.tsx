@@ -1,4 +1,5 @@
 import type { ExternalDeleteMode } from "@/api/external";
+import { externalPlaylistDisplayName } from "@/lib/playlist-labels";
 import {
   Button,
   Modal,
@@ -52,6 +53,7 @@ export function ExternalPlaylistDeleteModal({
   onConfirm,
 }: Props) {
   const { t } = useTranslation();
+  const displayName = externalPlaylistDisplayName(dirName, t);
   const [busy, setBusy] = useState(false);
   const [step, setStep] = useState<"choose" | "confirm">("choose");
   const [mode, setMode] = useState<ExternalDeleteMode>("forget_matched");
@@ -74,6 +76,7 @@ export function ExternalPlaylistDeleteModal({
       delete_matched: "sync.deleteExternalMatched",
       move_matched_to_direct: "sync.deleteExternalMoveMatched",
       add_matched_to_direct: "sync.deleteExternalMoveMatched",
+      add_meta_verified_to_wanted: "sync.addMetaVerifiedToWanted",
       delete_unmatched: "sync.deleteExternalUnmatched",
       delete_all: "sync.deleteExternalAll",
       clear_offline_delete: "sync.clearIdInvalidDelete",
@@ -86,6 +89,7 @@ export function ExternalPlaylistDeleteModal({
       delete_matched: "sync.deleteExternalMatchedHint",
       move_matched_to_direct: "sync.deleteExternalMoveMatchedHint",
       add_matched_to_direct: "sync.deleteExternalMoveMatchedHint",
+      add_meta_verified_to_wanted: "sync.addMetaVerifiedToWantedHint",
       delete_unmatched: "sync.deleteExternalUnmatchedHint",
       delete_all: "sync.deleteExternalAllHint",
       clear_offline_delete: "sync.clearIdInvalidDeleteHint",
@@ -98,6 +102,7 @@ export function ExternalPlaylistDeleteModal({
       delete_matched: "sync.deleteExternalConfirmMatched",
       move_matched_to_direct: "sync.deleteExternalConfirmMove",
       add_matched_to_direct: "sync.deleteExternalConfirmMove",
+      add_meta_verified_to_wanted: "sync.addMetaVerifiedToWantedHint",
       delete_unmatched: "sync.deleteExternalConfirmUnmatched",
       delete_all: "sync.deleteExternalConfirmAll",
       clear_offline_delete: "sync.clearIdInvalidConfirmDelete",
@@ -106,16 +111,16 @@ export function ExternalPlaylistDeleteModal({
 
   const isLedger = LEDGER_MODES.includes(mode);
   const isSoftConfirm =
-    isLedger || mode === "clear_offline_to_raw_delete" || mode === "move_matched_to_direct";
+    isLedger ||
+    mode === "clear_offline_to_raw_delete" ||
+    mode === "move_matched_to_direct";
 
   const renderModeButton = (m: ExternalDeleteMode, enabled: boolean) => (
     <Button
       key={m}
       variant={mode === m ? "solid" : "flat"}
-      color={
-        mode === m ? (DANGER.has(m) ? "danger" : "primary") : "default"
-      }
-      className="justify-start h-auto py-3 whitespace-normal"
+      color={mode === m ? (DANGER.has(m) ? "danger" : "primary") : "default"}
+      className="h-auto justify-start py-3 whitespace-normal"
       isDisabled={!enabled}
       onPress={() => {
         if (enabled) setMode(m);
@@ -135,33 +140,33 @@ export function ExternalPlaylistDeleteModal({
         <ModalBody className="gap-3 text-sm">
           {step === "choose" ? (
             <>
-              <p>{t("sync.deleteExternalBody", { name: dirName })}</p>
+              <p>{t("sync.deleteExternalBody", { name: displayName })}</p>
               <p className="text-foreground-400 text-xs">
                 {t("sync.deleteExternalHint")}
               </p>
 
               <div className="flex flex-col gap-2">
-                <p className="text-xs font-medium text-foreground-500">
+                <p className="text-foreground-500 text-xs font-medium">
                   {t("sync.deleteExternalSectionLedger")}
                 </p>
-                <p className="text-foreground-400 text-xs -mt-1">
+                <p className="text-foreground-400 -mt-1 text-xs">
                   {t("sync.deleteExternalSectionLedgerHint")}
                 </p>
                 {LEDGER_MODES.map((m) => renderModeButton(m, true))}
               </div>
 
-              <div className="flex flex-col gap-2 mt-2">
-                <p className="text-xs font-medium text-foreground-500">
+              <div className="mt-2 flex flex-col gap-2">
+                <p className="text-foreground-500 text-xs font-medium">
                   {t("sync.deleteSectionIdInvalid")}
                 </p>
-                <p className="text-foreground-400 text-xs -mt-1">
+                <p className="text-foreground-400 -mt-1 text-xs">
                   {t("sync.deleteSectionIdInvalidHint")}
                 </p>
                 {ID_INVALID_MODES.map((m) => renderModeButton(m, true))}
               </div>
 
-              <div className="flex flex-col gap-2 mt-2">
-                <p className="text-xs font-medium text-foreground-500">
+              <div className="mt-2 flex flex-col gap-2">
+                <p className="text-foreground-500 text-xs font-medium">
                   {t("sync.deleteExternalSectionFiles")}
                 </p>
                 {!allowMutate ? (
@@ -169,7 +174,7 @@ export function ExternalPlaylistDeleteModal({
                     {t("sync.deleteExternalReadonlyBlock")}
                   </p>
                 ) : (
-                  <p className="text-foreground-400 text-xs -mt-1">
+                  <p className="text-foreground-400 -mt-1 text-xs">
                     {t("sync.deleteExternalSectionFilesHint")}
                   </p>
                 )}
@@ -178,7 +183,7 @@ export function ExternalPlaylistDeleteModal({
             </>
           ) : (
             <>
-              <p>{t(confirmKey(mode), { name: dirName })}</p>
+              <p>{t(confirmKey(mode), { name: displayName })}</p>
               <p
                 className={
                   isSoftConfirm

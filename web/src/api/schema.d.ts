@@ -918,6 +918,26 @@ export interface components {
              */
             offline_cleanup_delay_hours?: number;
             /**
+             * Id Invalid Marking Enabled
+             * @default true
+             */
+            id_invalid_marking_enabled?: boolean;
+            /**
+             * Id Invalid Cleanup Enabled
+             * @default false
+             */
+            id_invalid_cleanup_enabled?: boolean;
+            /**
+             * Id Invalid Cleanup Action
+             * @default archive
+             */
+            id_invalid_cleanup_action?: "delete" | "archive" | "to_wanted";
+            /**
+             * Id Invalid Cleanup Delay Hours
+             * @default 72
+             */
+            id_invalid_cleanup_delay_hours?: number;
+            /**
              * Thumbnail Url
              * Format: uri
              */
@@ -959,6 +979,16 @@ export interface components {
             offline_cleanup_action?: ("delete" | "archive") | null;
             /** Offline Cleanup Delay Hours */
             offline_cleanup_delay_hours?: number | null;
+            /** Id Invalid Marking Enabled */
+            id_invalid_marking_enabled?: boolean | null;
+            /** Id Invalid Cleanup Enabled */
+            id_invalid_cleanup_enabled?: boolean | null;
+            /** Id Invalid Cleanup Action */
+            id_invalid_cleanup_action?:
+              | ("delete" | "archive" | "to_wanted")
+              | null;
+            /** Id Invalid Cleanup Delay Hours */
+            id_invalid_cleanup_delay_hours?: number | null;
             /** Confirm Folder Move */
             confirm_folder_move?: boolean;
         };

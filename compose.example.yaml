@@ -27,7 +27,6 @@ services:
       - ./data:/data
       - ./config:/config
       # - /mnt/ssd/yubal-cache:/data/cache
-
   # Optional; recommended for Telegram large uploads.
   # 可选；Telegram 大文件上传建议启用。
   # Same Docker network as yubal; mount the same ./data read-only.

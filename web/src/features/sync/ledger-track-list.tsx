@@ -20,12 +20,19 @@ import {
 } from "@/api/subscriptions";
 import {
   acceptExternalMatch,
+  acceptExternalMeta,
   deleteExternalTrack,
   listExternalPlaylistTracks,
   matchExternalTrack,
   type ExternalMatchCandidate,
+  type ExternalMetaCandidate,
   type ExternalTrack,
 } from "@/api/external";
+import {
+  addWantedTrack,
+  listWantedTracks,
+  type WantedTrack,
+} from "@/api/wanted";
 import { useLibraryAudio } from "@/features/sync/library-audio";
 import { SectionIndexRail } from "@/features/sync/section-index-rail";
 import {
@@ -36,7 +43,10 @@ import {
   TRACK_ROW_GRID,
   TrackTextCells,
 } from "@/features/sync/track-columns";
-import { TrackDeleteModal, type TrackDeleteMode } from "@/features/sync/track-delete-modal";
+import {
+  TrackDeleteModal,
+  type TrackDeleteMode,
+} from "@/features/sync/track-delete-modal";
 import { TrackEditModal } from "@/features/sync/track-edit-modal";
 import {
   DEFAULT_INDEX_THRESHOLD,
@@ -44,17 +54,28 @@ import {
 } from "@/features/sync/track-index";
 import {
   assignDisplayNumbers,
+  BUCKET_PREFIX_HINT_KEY,
   buildOrderedTrackSections,
+  displayIndexPrefix,
   lettersInSections,
   orderedSectionDomId,
   resolveJunkKind,
   sortTracksUnified,
   trackIdentity,
+  WANTED_PREFIX_HINT_KEY,
   type JunkKind,
 } from "@/features/sync/track-list-order";
 import { formatArtistTitle } from "@/features/sync/track-label";
 import { showErrorToast, showSuccessToast } from "@/lib/toast";
-import { Button, Modal, ModalBody, ModalContent, ModalFooter, ModalHeader, Spinner } from "@heroui/react";
+import {
+  Button,
+  Modal,
+  ModalBody,
+  ModalContent,
+  ModalFooter,
+  ModalHeader,
+  Spinner,
+} from "@heroui/react";
 import {
   ArchiveIcon,
   AudioLinesIcon,
@@ -62,6 +83,8 @@ import {
   CloudOffIcon,
   DownloadIcon,
   ExternalLinkIcon,
+  HeartIcon,
+  ImageIcon,
   PencilIcon,
   PlusIcon,
   SparklesIcon,
@@ -79,6 +102,37 @@ import { useTranslation } from "react-i18next";
 
 const ADDED_TO_DIRECT_KEY = "yubal:added-to-direct";
 const ADDED_TTL_MS = 24 * 60 * 60 * 1000;
+
+function candidateSourceLabel(source: string): string {
+  if (source.toLowerCase() === "musicbrainz") return "MusicBrainz";
+  if (source.toLowerCase() === "qq") return "QQ";
+  if (source.toLowerCase() === "ytm") return "YTM";
+  return source;
+}
+
+function CandidateThumbnail({ url }: { url?: string | null }) {
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    setFailed(false);
+  }, [url]);
+
+  if (url && !failed) {
+    return (
+      <img
+        src={url}
+        alt=""
+        className="h-10 w-10 shrink-0 rounded object-cover"
+        onError={() => setFailed(true)}
+      />
+    );
+  }
+  return (
+    <span className="bg-default-100 text-foreground-300 flex h-10 w-10 shrink-0 items-center justify-center rounded">
+      <ImageIcon className="h-4 w-4" />
+    </span>
+  );
+}
 
 function readAddedToDirect(): Record<string, number> {
   try {
@@ -113,9 +167,15 @@ type Props = {
   /**
    * "external" reads from the External-library scan instead of the sync
    * ledger: unmatched files surface as tier "raw" with a match action.
+   * "wanted" reads the wishlist; rows with a hardlinked file are playable.
    */
-  mode?: "sync" | "external";
+  mode?: "sync" | "external" | "wanted";
   externalDirName?: string;
+  /** Wanted mode: parent owns the delete / per-track YTM match dialogs. */
+  onWantedDelete?: (track: SyncTrackItem) => void;
+  onWantedMatch?: (track: SyncTrackItem) => void;
+  /** Wanted mode: id of the row currently running a match. */
+  wantedBusyId?: string | null;
   /** Playlist-level allow_mutate — gates tag edit / raw delete / tag scrape. */
   allowMutate?: boolean;
   /** Playlist-level show_raw — hides unmatched rows when false. */
@@ -142,6 +202,45 @@ function audioPath(
   return trackKey(saveFolder, relativePath);
 }
 
+/** Maps a wishlist row onto the shared SyncTrackItem shape. */
+function wantedTrackToItem(track: WantedTrack, index: number): SyncTrackItem {
+  const hasFile = track.has_file && Boolean(track.relative_path);
+  return {
+    index,
+    title: track.title,
+    artist: track.artists,
+    album_artist: null,
+    album: track.album ?? null,
+    exists: hasFile,
+    storage: hasFile ? "hardlink" : "missing",
+    // Wanted files live on their own root; the stream API keys them by prefix.
+    relative_path: hasFile ? `wanted/${track.relative_path}` : "",
+    video_id: track.video_id ?? null,
+    tier: hasFile ? "complete" : "raw",
+    cover_url: track.thumbnail_url,
+    tags_complete: true,
+    wanted_id: track.id,
+    source_url: track.source_url,
+  };
+}
+
+function wantedSoftKey(
+  title: string,
+  artists: string,
+  album?: string | null,
+): string {
+  return `${title.trim().toLowerCase()}|${artists.trim().toLowerCase()}|${(album ?? "").trim().toLowerCase()}`;
+}
+
+function trackWantedKeys(track: SyncTrackItem): string[] {
+  const keys = [
+    wantedSoftKey(track.title || "", track.artist || "", track.album),
+  ];
+  const sid = (track.meta_source_id || "").trim();
+  if (sid) keys.push(`sid:${sid}`);
+  return keys;
+}
+
 /** External quality tier for row-action matrix. */
 export type ExternalQualityTier =
   | "junk_rw"
@@ -166,7 +265,10 @@ function externalQualityTier(
 }
 
 /** Maps an External-library scan row onto the shared SyncTrackItem shape. */
-function externalTrackToItem(track: ExternalTrack, index: number): SyncTrackItem {
+function externalTrackToItem(
+  track: ExternalTrack,
+  index: number,
+): SyncTrackItem {
   const matched =
     track.match_status === "matched" &&
     Boolean(track.video_id) &&
@@ -184,10 +286,11 @@ function externalTrackToItem(track: ExternalTrack, index: number): SyncTrackItem
     exists: track.exists ?? true,
     storage: "real",
     relative_path: track.rel_path,
-    video_id: matched ? track.video_id ?? null : null,
-    tier: matched ? track.tier ?? "complete" : "raw",
+    video_id: matched ? (track.video_id ?? null) : null,
+    tier: matched ? (track.tier ?? "complete") : "raw",
     cover_source: track.cover_source ?? null,
     cover_url: track.cover_url ?? null,
+    has_embedded_cover: Boolean(track.has_embedded_cover),
     year: track.year ?? null,
     track_number: track.track_number ?? null,
     tags_complete:
@@ -195,6 +298,10 @@ function externalTrackToItem(track: ExternalTrack, index: number): SyncTrackItem
       Boolean(
         track.title?.trim() && track.artist?.trim() && track.album?.trim(),
       ),
+    meta_status: track.meta_status ?? null,
+    meta_source: track.meta_source ?? null,
+    meta_source_id: track.meta_source_id ?? null,
+    meta_source_url: track.meta_source_url ?? null,
     is_junk: Boolean(track.is_junk) || junkKind != null,
     junk_kind: junkKind,
     in_direct: Boolean(track.in_direct),
@@ -214,7 +321,10 @@ function TrackRow({
   playable = true,
   mutable = true,
   external = false,
+  wanted = false,
+  wantedEnabled = false,
   qualityTier = null,
+  onWantedMatch,
   onDeleteRequest,
   onEditRequest,
   onEnrichRequest,
@@ -224,6 +334,8 @@ function TrackRow({
   onDownloadRequest,
   onAddToDirect,
   addedToDirect = false,
+  onAddToWanted,
+  inWanted = false,
 }: {
   track: SyncTrackItem;
   saveFolder: string;
@@ -238,23 +350,39 @@ function TrackRow({
   playable?: boolean;
   mutable?: boolean;
   external?: boolean;
+  wanted?: boolean;
+  wantedEnabled?: boolean;
   /** External playlist quality tier; null = non-external / use legacy tier. */
   qualityTier?: ExternalQualityTier | null;
+  onWantedMatch?: (track: SyncTrackItem) => void;
   onDeleteRequest: (track: SyncTrackItem) => void;
   onEditRequest: (track: SyncTrackItem) => void;
   onEnrichRequest: (track: SyncTrackItem) => void;
-  onDispose?: (track: SyncTrackItem, action: "archive" | "delete") => void;
+  onDispose?: (
+    track: SyncTrackItem,
+    action: "archive" | "delete" | "to_wanted",
+  ) => void;
   onMatchRequest?: (track: SyncTrackItem) => void;
   onUnblockRequest?: (track: SyncTrackItem) => void;
   onDownloadRequest?: (track: SyncTrackItem) => void;
   onAddToDirect?: (track: SyncTrackItem) => void;
   addedToDirect?: boolean;
+  onAddToWanted?: (track: SyncTrackItem) => void;
+  inWanted?: boolean;
 }) {
   const { t } = useTranslation();
   const audio = useLibraryAudio();
   const isRaw = track.tier === "raw";
-  const missing = !isRaw && (!track.exists || track.storage === "missing");
-  const filePath = audioPath(saveFolder, track.relative_path, external);
+  // External Raw = unmatched but file present (still playable). Wanted "W" rows
+  // reuse tier raw for numbering, yet have no file — treat as missing/dimmed.
+  const missing = wanted
+    ? !track.exists || track.storage === "missing" || !track.relative_path
+    : !isRaw && (!track.exists || track.storage === "missing");
+  const filePath = audioPath(
+    saveFolder,
+    track.relative_path,
+    external || wanted,
+  );
   const key = filePath;
   const isCurrent = playable && audio.key === key;
   const isPlaying = isCurrent && audio.playing;
@@ -266,23 +394,24 @@ function TrackRow({
   const tier = qualityTier;
 
   const junkKind: JunkKind | null =
-    tier === "junk_rw"
-      ? "rw"
-      : tier === "junk_ro"
-        ? "ro"
-        : null;
+    tier === "junk_rw" ? "rw" : tier === "junk_ro" ? "ro" : null;
   const isJunk = junkKind != null;
   const isReadonlyJunk = junkKind === "ro";
   const isWritableJunk = junkKind === "rw";
   const isPremium = tier === "premium" || track.tier === "premium";
-  const isUnmatched = Boolean(
-    isJunk || tier === "raw" || (!tier && isRaw),
-  );
+  const isUnmatched = Boolean(isJunk || tier === "raw" || (!tier && isRaw));
 
-  const showMatchOrEnrich = !blocked && !missing;
+  const showMatchOrEnrich = !wanted && !blocked && !missing;
   const showUnmatchedMatch = showMatchOrEnrich && isUnmatched;
   const showMatchedEnrich =
     showMatchOrEnrich && !isUnmatched && Boolean(track.video_id);
+  const showMetaWantedHeart =
+    external &&
+    wantedEnabled &&
+    Boolean(onAddToWanted) &&
+    track.meta_status === "verified" &&
+    isUnmatched &&
+    !isJunk;
 
   const enrichButtonClass = isPremium
     ? "!text-success-400/80 data-[disabled=true]:opacity-100"
@@ -301,6 +430,7 @@ function TrackRow({
   // Readonly External opens assets-only (cover/lyrics); mutable + unmatched
   // still needs a YTM id before tag edits.
   const showEdit =
+    !wanted &&
     !missing &&
     !blocked &&
     (isJunk || Boolean(track.video_id) || (external && isUnmatched));
@@ -349,7 +479,7 @@ function TrackRow({
         {!rowInert ? (
           <button
             type="button"
-            className="absolute inset-y-0 left-0 right-[10.5rem] z-0 cursor-pointer border-0 bg-transparent p-0"
+            className="absolute inset-y-0 right-[10.5rem] left-0 z-0 cursor-pointer border-0 bg-transparent p-0"
             aria-label={
               isCurrent
                 ? t("sync.seekTrack")
@@ -360,7 +490,17 @@ function TrackRow({
           />
         ) : null}
 
-        <span className={`${TRACK_INDEX} pointer-events-none relative z-10`}>
+        <span
+          className={`${TRACK_INDEX} relative z-10`}
+          title={(() => {
+            const prefix = displayIndexPrefix(displayIndex);
+            const keyMap = wanted
+              ? WANTED_PREFIX_HINT_KEY
+              : BUCKET_PREFIX_HINT_KEY;
+            const key = keyMap[prefix];
+            return key ? t(`sync.${key}`) : undefined;
+          })()}
+        >
           <span className={TRACK_INDEX_ICON} aria-hidden>
             {isPlaying ? (
               <AudioLinesIcon className="text-primary h-3 w-3" />
@@ -400,8 +540,8 @@ function TrackRow({
               isDisabled={busy || addedToDirect}
               className={`${ACTION_BTN} ${
                 addedToDirect
-                  ? "!text-success-400"
-                  : "hover:text-primary"
+                  ? "!text-success-600 opacity-100"
+                  : "text-success hover:text-success"
               }`}
               aria-label={
                 addedToDirect
@@ -421,6 +561,71 @@ function TrackRow({
               <PlusIcon className="h-3.5 w-3.5" />
             </Button>
           ) : null}
+          {showMetaWantedHeart ? (
+            <Button
+              variant="light"
+              size="sm"
+              isIconOnly
+              isDisabled={busy || inWanted}
+              className={
+                inWanted
+                  ? `${ACTION_BTN} text-danger opacity-100`
+                  : `${ACTION_BTN} hover:text-danger`
+              }
+              aria-label={
+                inWanted ? t("search.addedToWanted") : t("search.addToWanted")
+              }
+              title={
+                inWanted ? t("search.addedToWanted") : t("search.addToWanted")
+              }
+              onPress={() => {
+                if (!inWanted && onAddToWanted) onAddToWanted(track);
+              }}
+            >
+              <HeartIcon
+                className="h-3.5 w-3.5"
+                fill={inWanted ? "currentColor" : "none"}
+              />
+            </Button>
+          ) : null}
+          {wanted && track.source_url ? (
+            <Button
+              as="a"
+              href={track.source_url}
+              target="_blank"
+              rel="noopener noreferrer"
+              variant="light"
+              size="sm"
+              isIconOnly
+              className={`${ACTION_BTN} hover:text-primary`}
+              aria-label={t("sync.wantedOpenSource")}
+              title={t("sync.wantedOpenSource")}
+            >
+              <ExternalLinkIcon className="h-3.5 w-3.5" />
+            </Button>
+          ) : null}
+
+          {wanted && onWantedMatch ? (
+            <Button
+              variant="light"
+              size="sm"
+              isIconOnly
+              isLoading={busy}
+              className={
+                track.video_id
+                  ? `${ACTION_BTN} hover:text-primary`
+                  : `${ACTION_BTN} !text-danger hover:!text-danger-600`
+              }
+              aria-label={t("sync.wantedMatchYtm")}
+              title={t("sync.wantedMatchYtm")}
+              onPress={() => {
+                if (!busy) onWantedMatch(track);
+              }}
+            >
+              {!busy ? <SparklesIcon className="h-3.5 w-3.5" /> : null}
+            </Button>
+          ) : null}
+
           {track.video_id ? (
             <Button
               as="a"
@@ -532,13 +737,28 @@ function TrackRow({
               >
                 <CloudOffIcon className="h-3.5 w-3.5" />
               </span>
+              {wantedEnabled && offlineKind === "id_invalid" ? (
+                <Button
+                  variant="light"
+                  size="sm"
+                  isIconOnly
+                  isDisabled={busy}
+                  className={`${ACTION_BTN} hover:text-primary`}
+                  aria-label={t("sync.migrateToWanted")}
+                  title={t("sync.migrateToWantedHint")}
+                  onPress={() => onDispose(track, "to_wanted")}
+                >
+                  <HeartIcon className="h-3.5 w-3.5" />
+                </Button>
+              ) : null}
               <Button
                 variant="light"
                 size="sm"
                 isIconOnly
                 isDisabled={busy}
                 className={`${ACTION_BTN} hover:text-primary`}
-                aria-label={t("sync.offlineActionArchive")}
+                aria-label={t("sync.idInvalidActionToRawDelete")}
+                title={t("sync.cleanupActionArchiveHint")}
                 onPress={() => onDispose(track, "archive")}
               >
                 <ArchiveIcon className="h-3.5 w-3.5" />
@@ -549,7 +769,8 @@ function TrackRow({
                 isIconOnly
                 isDisabled={busy}
                 className={`${ACTION_BTN} hover:text-danger`}
-                aria-label={t("sync.offlineActionDelete")}
+                aria-label={t("sync.idInvalidActionDelete")}
+                title={t("sync.cleanupActionDeleteHint")}
                 onPress={() => onDispose(track, "delete")}
               >
                 <Trash2Icon className="h-3.5 w-3.5" />
@@ -607,12 +828,19 @@ export function LedgerTrackList({
   showRaw = true,
   showJunk = true,
   onMatched,
+  onWantedDelete,
+  onWantedMatch,
+  wantedBusyId,
 }: Props) {
   const { t } = useTranslation();
   const audio = useLibraryAudio();
   const isExternal = mode === "external";
+  const isWanted = mode === "wanted";
+  // External and Wanted files are streamed by their own root-prefixed path.
+  const rawPath = isExternal || isWanted;
   const [tracks, setTracks] = useState<SyncTrackItem[] | null>(null);
   const [offlineIds, setOfflineIds] = useState<Set<string>>(new Set());
+  const [idInvalidIds, setIdInvalidIds] = useState<Set<string>>(new Set());
   const [blockedIds, setBlockedIds] = useState<Set<string>>(new Set());
   const [offlineMembershipIds, setOfflineMembershipIds] = useState<
     Map<string, string>
@@ -623,13 +851,18 @@ export function LedgerTrackList({
   const [matchPick, setMatchPick] = useState<{
     track: SyncTrackItem;
     candidates: ExternalMatchCandidate[];
+    metaCandidates: ExternalMetaCandidate[];
   } | null>(null);
   const [selectedCandidateId, setSelectedCandidateId] = useState<string | null>(
     null,
   );
+  const [selectedMetaKey, setSelectedMetaKey] = useState<string | null>(null);
   const [acceptingMatch, setAcceptingMatch] = useState(false);
+  const [wantedKeys, setWantedKeys] = useState<Set<string>>(new Set());
+  const [addingWantedPath, setAddingWantedPath] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [externalEnabled, setExternalEnabled] = useState(false);
+  const [wantedEnabled, setWantedEnabled] = useState(false);
   const [addedMap, setAddedMap] = useState<Record<string, number>>(() =>
     readAddedToDirect(),
   );
@@ -649,6 +882,21 @@ export function LedgerTrackList({
   const reload = useCallback(() => {
     if (!open) return;
 
+    if (isWanted) {
+      const token = ++reloadToken.current;
+      setLoading(true);
+      void listWantedTracks().then((items) => {
+        if (token !== reloadToken.current) return;
+        setTracks(items.map((item, i) => wantedTrackToItem(item, i)));
+        setOfflineIds(new Set());
+        setBlockedIds(new Set());
+        setOfflineMembershipIds(new Map());
+        setOfflineExtra([]);
+        setLoading(false);
+      });
+      return;
+    }
+
     if (isExternal) {
       if (!externalDirName) return;
       const token = ++reloadToken.current;
@@ -661,6 +909,7 @@ export function LedgerTrackList({
           .filter((item) => showJunk || !item.is_junk);
         setTracks(mapped);
         setOfflineIds(new Set());
+        setIdInvalidIds(new Set());
         setBlockedIds(new Set());
         setOfflineMembershipIds(new Map());
         setOfflineExtra([]);
@@ -683,14 +932,24 @@ export function LedgerTrackList({
           const offline = members.filter(
             (member) => member.membership_status === "offline",
           );
+          const idInvalid = members.filter(
+            (member) => member.membership_status === "id_invalid",
+          );
           const blocked = members.filter(
             (member) => member.membership_status === "blocked",
           );
           const active = members.filter(
             (member) => member.membership_status === "active",
           );
+          // ID-invalid rows are treated like offline (dimmed + dispose); a
+          // separate set drives the badge label.
           const offlineById = new Set(
-            offline.map((m) => m.catalog_video_id || m.video_id),
+            [...offline, ...idInvalid].map(
+              (m) => m.catalog_video_id || m.video_id,
+            ),
+          );
+          const idInvalidById = new Set(
+            idInvalid.map((m) => m.catalog_video_id || m.video_id),
           );
           const blockedById = new Set(
             blocked.map((m) => m.catalog_video_id || m.video_id),
@@ -708,7 +967,12 @@ export function LedgerTrackList({
           // Every membership without a folder row must appear: active (缺),
           // offline, blocked. Previously only offline/blocked were synthesized,
           // so cloud=N missing=N with an empty list after catalog wipe.
-          const logicalExtras = [...active, ...offline, ...blocked]
+          const logicalExtras = [
+            ...active,
+            ...offline,
+            ...idInvalid,
+            ...blocked,
+          ]
             .filter((m) => {
               const id = m.catalog_video_id || m.video_id;
               return id && !presentIds.has(id);
@@ -727,6 +991,7 @@ export function LedgerTrackList({
             }));
           setTracks(items);
           setOfflineIds(offlineById);
+          setIdInvalidIds(idInvalidById);
           setBlockedIds(blockedById);
           setOfflineMembershipIds(membershipIds);
           setOfflineExtra(logicalExtras);
@@ -736,6 +1001,7 @@ export function LedgerTrackList({
               .filter((it) => it.membership_status === "offline" && it.video_id)
               .map((it) => it.video_id as string),
           );
+          setIdInvalidIds(new Set());
           const blockedById = new Set(
             items
               .filter((it) => it.membership_status === "blocked" && it.video_id)
@@ -750,7 +1016,16 @@ export function LedgerTrackList({
         setLoading(false);
       },
     );
-  }, [open, saveFolder, subscriptionId, isExternal, externalDirName, showRaw, showJunk]);
+  }, [
+    open,
+    saveFolder,
+    subscriptionId,
+    isExternal,
+    isWanted,
+    externalDirName,
+    showRaw,
+    showJunk,
+  ]);
 
   useEffect(() => {
     if (!open) {
@@ -782,6 +1057,7 @@ export function LedgerTrackList({
         setIndexThreshold(settings.index_threshold ?? DEFAULT_INDEX_THRESHOLD);
         setTrackSortKey(settings.track_sort_key ?? "title");
         setExternalEnabled(Boolean(settings.external_library_enabled));
+        setWantedEnabled(Boolean(settings.wanted_enabled));
       });
     };
     loadSettings();
@@ -790,6 +1066,34 @@ export function LedgerTrackList({
       window.removeEventListener("yubal:settings-changed", loadSettings);
     };
   }, []);
+
+  useEffect(() => {
+    if (!isExternal || !wantedEnabled) {
+      setWantedKeys(new Set());
+      return;
+    }
+    let cancelled = false;
+    const loadWanted = async () => {
+      const rows = await listWantedTracks();
+      if (cancelled) return;
+      const next = new Set<string>();
+      for (const row of rows) {
+        next.add(wantedSoftKey(row.title, row.artists, row.album));
+        const sid = (row.source_id || row.video_id || "").trim();
+        if (sid) next.add(`sid:${sid}`);
+      }
+      setWantedKeys(next);
+    };
+    void loadWanted();
+    const onChanged = () => {
+      void loadWanted();
+    };
+    window.addEventListener("yubal:ledger-changed", onChanged);
+    return () => {
+      cancelled = true;
+      window.removeEventListener("yubal:ledger-changed", onChanged);
+    };
+  }, [isExternal, wantedEnabled]);
 
   const combinedTracks = useMemo(() => {
     if (!tracks) return null;
@@ -808,8 +1112,14 @@ export function LedgerTrackList({
 
   const orderedTracks = useMemo(() => {
     if (!combinedTracks) return null;
-    return sortTracksUnified(combinedTracks, trackSortKey, orderCtx);
-  }, [combinedTracks, trackSortKey, orderCtx]);
+    const sorted = sortTracksUnified(combinedTracks, trackSortKey, orderCtx);
+    if (!isWanted) return sorted;
+    // Wishlist: hardlinked rows first, tags-only wishes after.
+    return [
+      ...sorted.filter((track) => track.relative_path),
+      ...sorted.filter((track) => !track.relative_path),
+    ];
+  }, [combinedTracks, trackSortKey, orderCtx, isWanted]);
 
   const indexedMode = Boolean(
     combinedTracks && combinedTracks.length >= indexThreshold,
@@ -828,13 +1138,13 @@ export function LedgerTrackList({
     return (
       combinedTracks.find(
         (track) =>
-          audioPath(saveFolder, track.relative_path, isExternal) === audio.key,
+          audioPath(saveFolder, track.relative_path, rawPath) === audio.key,
       ) ?? null
     );
-  }, [combinedTracks, audio.activeFolder, audio.key, saveFolder, isExternal]);
+  }, [combinedTracks, audio.activeFolder, audio.key, saveFolder, rawPath]);
 
   const pinnedKey = pinnedTrack
-    ? audioPath(saveFolder, pinnedTrack.relative_path, isExternal)
+    ? audioPath(saveFolder, pinnedTrack.relative_path, rawPath)
     : null;
 
   /** Flat display order: playing pinned, then unified bucket sort. */
@@ -843,9 +1153,9 @@ export function LedgerTrackList({
     if (!pinnedKey) return orderedTracks;
     return orderedTracks.filter(
       (track) =>
-        audioPath(saveFolder, track.relative_path, isExternal) !== pinnedKey,
+        audioPath(saveFolder, track.relative_path, rawPath) !== pinnedKey,
     );
-  }, [orderedTracks, pinnedKey, saveFolder, isExternal]);
+  }, [orderedTracks, pinnedKey, saveFolder, rawPath]);
 
   const listSections = useMemo(() => {
     if (!sections) return null;
@@ -855,12 +1165,11 @@ export function LedgerTrackList({
         ...section,
         tracks: section.tracks.filter(
           (track) =>
-            audioPath(saveFolder, track.relative_path, isExternal) !==
-            pinnedKey,
+            audioPath(saveFolder, track.relative_path, rawPath) !== pinnedKey,
         ),
       }))
       .filter((section) => section.tracks.length > 0);
-  }, [sections, pinnedKey, saveFolder, isExternal]);
+  }, [sections, pinnedKey, saveFolder, rawPath]);
 
   const sectionLetters = useMemo(
     () => (listSections ? lettersInSections(listSections) : []),
@@ -872,8 +1181,7 @@ export function LedgerTrackList({
     const rest = pinnedKey
       ? orderedTracks.filter(
           (track) =>
-            audioPath(saveFolder, track.relative_path, isExternal) !==
-            pinnedKey,
+            audioPath(saveFolder, track.relative_path, rawPath) !== pinnedKey,
         )
       : orderedTracks;
     const ordered = pinnedTrack ? [pinnedTrack, ...rest] : rest;
@@ -882,7 +1190,7 @@ export function LedgerTrackList({
       ordered
         .filter((t) => t.exists && t.storage !== "missing")
         .map((t) => {
-          const path = audioPath(saveFolder, t.relative_path, isExternal);
+          const path = audioPath(saveFolder, t.relative_path, rawPath);
           return {
             key: path,
             path,
@@ -890,14 +1198,7 @@ export function LedgerTrackList({
           };
         }),
     );
-  }, [
-    audio,
-    saveFolder,
-    orderedTracks,
-    pinnedTrack,
-    pinnedKey,
-    isExternal,
-  ]);
+  }, [audio, saveFolder, orderedTracks, pinnedTrack, pinnedKey, rawPath]);
 
   const jumpToLetter = useCallback(
     (letter: IndexLetter) => {
@@ -977,9 +1278,28 @@ export function LedgerTrackList({
     return assignDisplayNumbers(combinedTracks, trackSortKey, orderCtx);
   }, [combinedTracks, trackSortKey, orderCtx]);
 
+  /** Wanted numbering: plain # for hardlinked, W# for tags-only. */
+  const wantedNumbers = useMemo(() => {
+    const map = new Map<string, string>();
+    if (!isWanted || !orderedTracks) return map;
+    let matched = 0;
+    let unmatched = 0;
+    for (const track of orderedTracks) {
+      if (!track.wanted_id) continue;
+      if (track.relative_path) {
+        matched += 1;
+        map.set(track.wanted_id, String(matched));
+      } else {
+        unmatched += 1;
+        map.set(track.wanted_id, `W${unmatched}`);
+      }
+    }
+    return map;
+  }, [isWanted, orderedTracks]);
+
   const disposeOffline = async (
     track: SyncTrackItem,
-    action: "archive" | "delete",
+    action: "archive" | "delete" | "to_wanted",
   ) => {
     if (!subscriptionId || !track.video_id || busyVideoId) return;
     setBusyVideoId(track.video_id);
@@ -994,7 +1314,6 @@ export function LedgerTrackList({
     if (ok) {
       reload();
       onMembershipChanged?.();
-      // Archived tracks move into the Direct library; refresh all ledgers.
       window.dispatchEvent(new Event("yubal:ledger-changed"));
     }
   };
@@ -1045,40 +1364,107 @@ export function LedgerTrackList({
       return;
     }
     const candidates = result.candidates ?? [];
-    if (candidates.length > 0) {
+    const metaCandidates = result.meta_candidates ?? [];
+    if (candidates.length > 0 || metaCandidates.length > 0) {
       setSelectedCandidateId(candidates[0]?.video_id ?? null);
-      setMatchPick({ track, candidates });
+      setSelectedMetaKey(
+        candidates.length > 0
+          ? null
+          : metaCandidates[0]
+            ? `${metaCandidates[0].source}:${metaCandidates[0].source_id}`
+            : null,
+      );
+      setMatchPick({ track, candidates, metaCandidates });
       return;
     }
-    showSuccessToast(
-      t("sync.matchDoneTitle"),
-      t("sync.matchTrackNoCandidate"),
-    );
+    showSuccessToast(t("sync.matchDoneTitle"), t("sync.matchTrackNoCandidate"));
     reload();
     onMatched?.();
   };
 
   const handleAcceptCandidate = async () => {
-    if (!matchPick || !selectedCandidateId || acceptingMatch) return;
-    const selected = matchPick.candidates.find(
-      (c) => c.video_id === selectedCandidateId,
-    );
-    setAcceptingMatch(true);
-    const result = await acceptExternalMatch(
-      matchPick.track.relative_path,
-      selectedCandidateId,
-      selected?.score,
-    );
-    setAcceptingMatch(false);
-    if ("error" in result) {
-      showErrorToast(t("sync.matchFailedTitle"), result.error);
+    if (!matchPick || acceptingMatch) return;
+    if (selectedCandidateId) {
+      const selected = matchPick.candidates.find(
+        (c) => c.video_id === selectedCandidateId,
+      );
+      setAcceptingMatch(true);
+      const result = await acceptExternalMatch(
+        matchPick.track.relative_path,
+        selectedCandidateId,
+        selected?.score,
+      );
+      setAcceptingMatch(false);
+      if ("error" in result) {
+        showErrorToast(t("sync.matchFailedTitle"), result.error);
+        return;
+      }
+      setMatchPick(null);
+      setSelectedCandidateId(null);
+      setSelectedMetaKey(null);
+      showSuccessToast(t("sync.matchDoneTitle"), t("sync.matchTrackMatched"));
+      reload();
+      onMatched?.();
       return;
     }
-    setMatchPick(null);
-    setSelectedCandidateId(null);
-    showSuccessToast(t("sync.matchDoneTitle"), t("sync.matchTrackMatched"));
-    reload();
-    onMatched?.();
+    if (selectedMetaKey) {
+      const selected = matchPick.metaCandidates.find(
+        (c) => `${c.source}:${c.source_id}` === selectedMetaKey,
+      );
+      if (!selected) return;
+      setAcceptingMatch(true);
+      const result = await acceptExternalMeta({
+        rel_path: matchPick.track.relative_path,
+        source: selected.source,
+        source_id: selected.source_id,
+        title: selected.title,
+        artists: selected.artists,
+        album: selected.album,
+        source_url: selected.source_url,
+        thumbnail_url: selected.thumbnail_url,
+      });
+      setAcceptingMatch(false);
+      if ("error" in result) {
+        showErrorToast(t("sync.matchFailedTitle"), result.error);
+        return;
+      }
+      setMatchPick(null);
+      setSelectedCandidateId(null);
+      setSelectedMetaKey(null);
+      showSuccessToast(t("sync.metaVerifyDoneTitle"), t("sync.metaVerifyDone"));
+      reload();
+      onMatched?.();
+    }
+  };
+
+  const handleAddMetaToWanted = async (track: SyncTrackItem) => {
+    if (addingWantedPath) return;
+    if (trackWantedKeys(track).some((k) => wantedKeys.has(k))) return;
+    setAddingWantedPath(track.relative_path);
+    const result = await addWantedTrack({
+      title: track.title,
+      artists: track.artist || "",
+      album: track.album || "",
+      source: track.meta_source || "manual",
+      source_id: track.meta_source_id || "",
+      source_url: track.meta_source_url || undefined,
+    });
+    setAddingWantedPath(null);
+    if ("error" in result) {
+      showErrorToast(t("search.addToWanted"), result.error);
+      return;
+    }
+    setWantedKeys((current) => {
+      const next = new Set(current);
+      for (const key of trackWantedKeys(track)) next.add(key);
+      const row = result.data;
+      next.add(wantedSoftKey(row.title, row.artists, row.album));
+      const sid = (row.source_id || "").trim();
+      if (sid) next.add(`sid:${sid}`);
+      return next;
+    });
+    showSuccessToast(t("search.addToWanted"), t("search.addedToWanted"));
+    window.dispatchEvent(new Event("yubal:ledger-changed"));
   };
 
   const handleTagsSaved = (result: {
@@ -1088,11 +1474,12 @@ export function LedgerTrackList({
       new_relative_path: string;
     }>;
   }) => {
-    const moved = result.locations.find((loc) => loc.save_folder === saveFolder);
+    const moved = result.locations.find(
+      (loc) => loc.save_folder === saveFolder,
+    );
     if (
       moved &&
-      audio.key ===
-        audioPath(saveFolder, moved.old_relative_path, isExternal)
+      audio.key === audioPath(saveFolder, moved.old_relative_path, rawPath)
     ) {
       if (moved.old_relative_path !== moved.new_relative_path) {
         audio.pause();
@@ -1129,16 +1516,11 @@ export function LedgerTrackList({
         showErrorToast(t("sync.deleteTrack"), result.error);
       } else if (result.ok) {
         if (deleteMode === "add_to_direct") {
-          const id =
-            pendingDelete.video_id || pendingDelete.relative_path;
+          const id = pendingDelete.video_id || pendingDelete.relative_path;
           markAddedToDirect(id);
           setAddedMap(readAddedToDirect());
         }
-        const key = audioPath(
-          saveFolder,
-          pendingDelete.relative_path,
-          true,
-        );
+        const key = audioPath(saveFolder, pendingDelete.relative_path, true);
         if (audio.key === key) audio.pause();
         setPendingDelete(null);
         reload();
@@ -1150,11 +1532,19 @@ export function LedgerTrackList({
       const membershipVideoId =
         offlineMembershipIds.get(pendingDelete.video_id) ??
         pendingDelete.video_id;
-      ok = await deleteSubscriptionTrackFile(
-        subscriptionId,
-        membershipVideoId,
-        mode === "block",
-      );
+      if (mode === "migrate_to_wanted") {
+        ok = await disposeSubscriptionTrack(
+          subscriptionId,
+          membershipVideoId,
+          "to_wanted",
+        );
+      } else {
+        ok = await deleteSubscriptionTrackFile(
+          subscriptionId,
+          membershipVideoId,
+          mode === "block",
+        );
+      }
       if (ok) {
         setPendingDelete(null);
         reload();
@@ -1212,10 +1602,13 @@ export function LedgerTrackList({
     );
     setBusyVideoId(null);
     if (!result.success) {
-      showErrorToast(result.error || t("sync.trackDownloadFailed"));
+      showErrorToast(
+        t("sync.trackDownload"),
+        result.error || t("sync.trackDownloadFailed"),
+      );
       return;
     }
-    showSuccessToast(t("sync.trackDownloadQueued"));
+    showSuccessToast(t("sync.trackDownload"), t("sync.trackDownloadQueued"));
     window.dispatchEvent(new Event("yubal:ledger-changed"));
   };
 
@@ -1255,10 +1648,7 @@ export function LedgerTrackList({
       reload();
       onMatched?.();
       window.dispatchEvent(new Event("yubal:ledger-changed"));
-      showSuccessToast(
-        t("sync.addToDirect"),
-        t("sync.addToDirectDone"),
-      );
+      showSuccessToast(t("sync.addToDirect"), t("sync.addToDirectDone"));
     }
   };
 
@@ -1272,9 +1662,7 @@ export function LedgerTrackList({
   if (!open) return null;
 
   const renderRow = (track: SyncTrackItem) => {
-    const quality = isExternal
-      ? externalQualityTier(track, allowMutate)
-      : null;
+    const quality = isExternal ? externalQualityTier(track, allowMutate) : null;
     const rowCanDelete = isExternal
       ? quality === "junk_rw" || quality === "junk_ro"
         ? false
@@ -1284,32 +1672,55 @@ export function LedgerTrackList({
       : Boolean(canDelete);
     return (
       <TrackRow
-        key={`${track.index}-${trackIdentity(track)}`}
+        key={`${track.index}-${track.wanted_id ?? trackIdentity(track)}`}
         track={track}
         saveFolder={saveFolder}
-        canDelete={rowCanDelete}
-        allowDeleteWhenMissing={Boolean(subscriptionId) || !isExternal}
+        canDelete={isWanted ? true : rowCanDelete}
+        allowDeleteWhenMissing={
+          isWanted || Boolean(subscriptionId) || !isExternal
+        }
         offline={Boolean(
           (track.video_id && offlineIds.has(track.video_id)) ||
-            track.membership_status === "offline",
+          track.membership_status === "offline" ||
+          track.membership_status === "id_invalid",
         )}
         offlineKind={
-          subscriptionId ? "not_in_playlist" : "id_invalid"
+          (track.video_id && idInvalidIds.has(track.video_id)) ||
+          track.membership_status === "id_invalid"
+            ? "id_invalid"
+            : subscriptionId
+              ? "not_in_playlist"
+              : "id_invalid"
         }
         blocked={Boolean(
           (track.video_id && blockedIds.has(track.video_id)) ||
-            track.membership_status === "blocked",
+          track.membership_status === "blocked",
         )}
-        displayIndex={displayNumbers.get(trackIdentity(track)) ?? ""}
+        displayIndex={
+          isWanted
+            ? (wantedNumbers.get(track.wanted_id ?? "") ?? "")
+            : (displayNumbers.get(trackIdentity(track)) ?? "")
+        }
         busy={
+          (isWanted &&
+            wantedBusyId != null &&
+            wantedBusyId === track.wanted_id) ||
           (busyVideoId != null && busyVideoId === track.video_id) ||
-          matchingRelPath === track.relative_path
+          (!isWanted && matchingRelPath === track.relative_path) ||
+          (!isWanted && addingWantedPath === track.relative_path)
         }
         playable
         mutable={!isExternal || allowMutate}
         external={isExternal}
+        wanted={isWanted}
+        wantedEnabled={wantedEnabled}
         qualityTier={quality}
-        onDeleteRequest={setPendingDelete}
+        onWantedMatch={
+          isWanted && onWantedMatch ? (item) => onWantedMatch(item) : undefined
+        }
+        onDeleteRequest={
+          isWanted && onWantedDelete ? onWantedDelete : setPendingDelete
+        }
         onEditRequest={setPendingEdit}
         onEnrichRequest={(item) => {
           void handleEnrichTrack(item);
@@ -1340,9 +1751,16 @@ export function LedgerTrackList({
             : undefined
         }
         addedToDirect={Boolean(
-          track.in_direct ||
-            addedMap[track.video_id || track.relative_path],
+          track.in_direct || addedMap[track.video_id || track.relative_path],
         )}
+        onAddToWanted={
+          isExternal && wantedEnabled
+            ? (item) => {
+                void handleAddMetaToWanted(item);
+              }
+            : undefined
+        }
+        inWanted={trackWantedKeys(track).some((k) => wantedKeys.has(k))}
       />
     );
   };
@@ -1386,7 +1804,7 @@ export function LedgerTrackList({
                         <li key={section.domId} className="list-none">
                           <div
                             id={section.domId}
-                            className="bg-content2/95 text-foreground-500 sticky top-0 z-20 border-default-100 border-b px-3 py-1 text-[10px] font-medium tracking-wide backdrop-blur-sm"
+                            className="bg-content2/95 text-foreground-500 border-default-100 sticky top-0 z-20 border-b px-3 py-1 text-[10px] font-medium tracking-wide backdrop-blur-sm"
                           >
                             {section.letter}
                             <span className="text-foreground-400 ml-2 font-normal tabular-nums">
@@ -1425,7 +1843,7 @@ export function LedgerTrackList({
         readOnlyTags={isExternal && !allowMutate}
         streamPath={
           pendingEdit
-            ? audioPath(saveFolder, pendingEdit.relative_path, isExternal)
+            ? audioPath(saveFolder, pendingEdit.relative_path, rawPath)
             : undefined
         }
         onClose={() => setPendingEdit(null)}
@@ -1437,6 +1855,25 @@ export function LedgerTrackList({
         isOpen={pendingDelete !== null}
         busy={deleting}
         externalEnabled={externalEnabled}
+        wantedEnabled={wantedEnabled}
+        offline={Boolean(
+          pendingDelete &&
+          ((pendingDelete.video_id && offlineIds.has(pendingDelete.video_id)) ||
+            pendingDelete.membership_status === "offline" ||
+            pendingDelete.membership_status === "id_invalid"),
+        )}
+        allowMigrateToWanted={Boolean(
+          pendingDelete &&
+          (subscriptionId
+            ? (pendingDelete.video_id &&
+                idInvalidIds.has(pendingDelete.video_id)) ||
+              pendingDelete.membership_status === "id_invalid"
+            : // Direct offline == ID invalid
+              (pendingDelete.video_id &&
+                offlineIds.has(pendingDelete.video_id)) ||
+              pendingDelete.membership_status === "offline" ||
+              pendingDelete.membership_status === "id_invalid"),
+        )}
         variant={
           subscriptionId
             ? "subscription"
@@ -1460,6 +1897,7 @@ export function LedgerTrackList({
           if (!acceptingMatch) {
             setMatchPick(null);
             setSelectedCandidateId(null);
+            setSelectedMetaKey(null);
           }
         }}
         placement="center"
@@ -1469,52 +1907,107 @@ export function LedgerTrackList({
           <ModalHeader>{t("sync.matchPickTitle")}</ModalHeader>
           <ModalBody className="gap-3 text-sm">
             <p className="text-foreground-500">{t("sync.matchPickBody")}</p>
-            {matchPick && matchPick.candidates.length > 0 ? (
-              <ul className="border-default-200 max-h-72 overflow-y-auto rounded-md border">
-                {matchPick.candidates.map((c) => {
-                  const active = selectedCandidateId === c.video_id;
-                  const score =
-                    c.score != null ? Math.round(c.score) : null;
-                  return (
-                    <li key={c.video_id}>
-                      <button
-                        type="button"
-                        className={`hover:bg-default-100 flex w-full items-center gap-3 px-3 py-2 text-left ${
-                          active ? "bg-primary/10" : ""
-                        }`}
-                        onClick={() => setSelectedCandidateId(c.video_id)}
-                      >
-                        {c.thumbnail_url ? (
-                          <img
-                            src={c.thumbnail_url}
-                            alt=""
-                            className="h-10 w-10 shrink-0 rounded object-cover"
-                          />
-                        ) : (
-                          <span className="bg-default-100 h-10 w-10 shrink-0 rounded" />
-                        )}
-                        <span className="min-w-0 flex-1">
-                          <span className="block truncate font-medium">
-                            {c.title}
+            <div className="flex flex-col gap-1">
+              <p className="text-foreground-600 text-xs font-medium">
+                {t("sync.matchPickYtmSection")}
+              </p>
+              {matchPick && matchPick.candidates.length > 0 ? (
+                <ul className="border-default-200 max-h-48 overflow-y-auto rounded-md border">
+                  {matchPick.candidates.map((c) => {
+                    const active = selectedCandidateId === c.video_id;
+                    const score = c.score != null ? Math.round(c.score) : null;
+                    return (
+                      <li key={c.video_id}>
+                        <button
+                          type="button"
+                          className={`hover:bg-default-100 flex w-full items-center gap-3 px-3 py-2 text-left ${
+                            active ? "bg-primary/10" : ""
+                          }`}
+                          onClick={() => {
+                            setSelectedCandidateId(c.video_id);
+                            setSelectedMetaKey(null);
+                          }}
+                        >
+                          <CandidateThumbnail url={c.thumbnail_url} />
+                          <span className="min-w-0 flex-1">
+                            <span className="block truncate font-medium">
+                              {c.title}
+                            </span>
+                            <span className="text-foreground-400 block truncate text-xs">
+                              {c.artists}
+                              {c.album ? ` · ${c.album}` : ""}
+                            </span>
                           </span>
-                          <span className="text-foreground-400 block truncate text-xs">
-                            {c.artists}
-                            {c.album ? ` · ${c.album}` : ""}
-                          </span>
-                        </span>
-                        {score != null ? (
                           <span className="text-foreground-400 shrink-0 text-xs tabular-nums">
-                            {t("sync.matchPickScore", { score })}
+                            {score != null
+                              ? t("sync.matchPickSourceScore", {
+                                  source: "YTM",
+                                  score,
+                                })
+                              : "YTM"}
                           </span>
-                        ) : null}
-                      </button>
-                    </li>
-                  );
-                })}
-              </ul>
-            ) : (
-              <p className="text-foreground-400">{t("sync.matchPickEmpty")}</p>
-            )}
+                        </button>
+                      </li>
+                    );
+                  })}
+                </ul>
+              ) : (
+                <p className="text-foreground-400 text-xs">
+                  {t("sync.matchPickYtmEmpty")}
+                </p>
+              )}
+            </div>
+            <div className="flex flex-col gap-1">
+              <p className="text-foreground-600 text-xs font-medium">
+                {t("sync.matchPickMetaSection")}
+              </p>
+              {matchPick && matchPick.metaCandidates.length > 0 ? (
+                <ul className="border-default-200 max-h-48 overflow-y-auto rounded-md border">
+                  {matchPick.metaCandidates.map((c) => {
+                    const key = `${c.source}:${c.source_id}`;
+                    const active = selectedMetaKey === key;
+                    const score = c.score != null ? Math.round(c.score) : null;
+                    return (
+                      <li key={key}>
+                        <button
+                          type="button"
+                          className={`hover:bg-default-100 flex w-full items-center gap-3 px-3 py-2 text-left ${
+                            active ? "bg-primary/10" : ""
+                          }`}
+                          onClick={() => {
+                            setSelectedMetaKey(key);
+                            setSelectedCandidateId(null);
+                          }}
+                        >
+                          <CandidateThumbnail url={c.thumbnail_url} />
+                          <span className="min-w-0 flex-1">
+                            <span className="block truncate font-medium">
+                              {c.title}
+                            </span>
+                            <span className="text-foreground-400 block truncate text-xs">
+                              {c.artists}
+                              {c.album ? ` · ${c.album}` : ""}
+                            </span>
+                          </span>
+                          <span className="text-foreground-400 shrink-0 text-xs tabular-nums">
+                            {score != null
+                              ? t("sync.matchPickSourceScore", {
+                                  source: candidateSourceLabel(c.source),
+                                  score,
+                                })
+                              : candidateSourceLabel(c.source)}
+                          </span>
+                        </button>
+                      </li>
+                    );
+                  })}
+                </ul>
+              ) : (
+                <p className="text-foreground-400 text-xs">
+                  {t("sync.matchPickMetaEmpty")}
+                </p>
+              )}
+            </div>
           </ModalBody>
           <ModalFooter>
             <Button
@@ -1523,6 +2016,7 @@ export function LedgerTrackList({
               onPress={() => {
                 setMatchPick(null);
                 setSelectedCandidateId(null);
+                setSelectedMetaKey(null);
                 reload();
                 onMatched?.();
               }}
@@ -1531,13 +2025,17 @@ export function LedgerTrackList({
             </Button>
             <Button
               color="primary"
-              isDisabled={!selectedCandidateId || acceptingMatch}
+              isDisabled={
+                (!selectedCandidateId && !selectedMetaKey) || acceptingMatch
+              }
               isLoading={acceptingMatch}
               onPress={() => {
                 void handleAcceptCandidate();
               }}
             >
-              {t("sync.matchPickConfirm")}
+              {selectedMetaKey && !selectedCandidateId
+                ? t("sync.matchPickConfirmMeta")
+                : t("sync.matchPickConfirm")}
             </Button>
           </ModalFooter>
         </ModalContent>
@@ -1559,7 +2057,7 @@ export function LedgerTrackList({
                 <Button
                   variant="flat"
                   color="danger"
-                  className="justify-start h-auto py-3 whitespace-normal"
+                  className="h-auto justify-start py-3 whitespace-normal"
                   isDisabled={deleting}
                   onPress={() => {
                     void confirmRemoveBlocked();
@@ -1578,7 +2076,7 @@ export function LedgerTrackList({
               <Button
                 variant="flat"
                 color="primary"
-                className="justify-start h-auto py-3 whitespace-normal"
+                className="h-auto justify-start py-3 whitespace-normal"
                 isLoading={deleting}
                 onPress={() => {
                   void confirmUnblock();

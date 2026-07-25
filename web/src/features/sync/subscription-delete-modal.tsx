@@ -15,12 +15,16 @@ export type DeleteFileAction =
   | "move_to_direct"
   | "delete"
   | "clear_offline_delete"
-  | "clear_offline_to_raw_delete";
+  | "clear_offline_to_raw_delete"
+  | "clear_id_invalid_delete"
+  | "clear_id_invalid_to_raw_delete"
+  | "clear_id_invalid_to_wanted";
 
 type Props = {
   subscription: Subscription | null;
   isOpen: boolean;
   externalEnabled?: boolean;
+  wantedEnabled?: boolean;
   onClose: () => void;
   onConfirm: (action: DeleteFileAction) => Promise<boolean>;
 };
@@ -30,17 +34,24 @@ const NOT_IN_PLAYLIST: DeleteFileAction[] = [
   "clear_offline_delete",
   "clear_offline_to_raw_delete",
 ];
+const ID_INVALID: DeleteFileAction[] = [
+  "clear_id_invalid_delete",
+  "clear_id_invalid_to_raw_delete",
+  "clear_id_invalid_to_wanted",
+];
 const HEAVY: DeleteFileAction[] = ["move_to_direct", "delete"];
 
 const DANGER: ReadonlySet<DeleteFileAction> = new Set([
   "delete",
   "clear_offline_delete",
+  "clear_id_invalid_delete",
 ]);
 
 export function SubscriptionDeleteModal({
   subscription,
   isOpen,
   externalEnabled = false,
+  wantedEnabled = false,
   onClose,
   onConfirm,
 }: Props) {
@@ -70,6 +81,9 @@ export function SubscriptionDeleteModal({
       delete: "sync.deleteSubWipeList",
       clear_offline_delete: "sync.clearNotInPlaylistDelete",
       clear_offline_to_raw_delete: "sync.clearNotInPlaylistToRawDelete",
+      clear_id_invalid_delete: "sync.clearIdInvalidDelete",
+      clear_id_invalid_to_raw_delete: "sync.clearIdInvalidToRawDelete",
+      clear_id_invalid_to_wanted: "sync.clearIdInvalidToWanted",
     })[m];
 
   const hintKey = (m: DeleteFileAction): string =>
@@ -79,6 +93,9 @@ export function SubscriptionDeleteModal({
       delete: "sync.deleteSubWipeListHint",
       clear_offline_delete: "sync.clearNotInPlaylistDeleteHint",
       clear_offline_to_raw_delete: "sync.clearNotInPlaylistToRawDeleteHint",
+      clear_id_invalid_delete: "sync.clearIdInvalidDeleteHint",
+      clear_id_invalid_to_raw_delete: "sync.clearIdInvalidToRawDeleteHint",
+      clear_id_invalid_to_wanted: "sync.clearIdInvalidToWantedHint",
     })[m];
 
   const confirmText = (() => {
@@ -91,6 +108,12 @@ export function SubscriptionDeleteModal({
         return t("sync.clearNotInPlaylistConfirmDelete");
       case "clear_offline_to_raw_delete":
         return t("sync.clearNotInPlaylistConfirmRawDelete");
+      case "clear_id_invalid_delete":
+        return t("sync.clearIdInvalidConfirmDelete");
+      case "clear_id_invalid_to_raw_delete":
+        return t("sync.clearIdInvalidConfirmRawDelete");
+      case "clear_id_invalid_to_wanted":
+        return t("sync.clearIdInvalidConfirmWanted");
       default:
         return t("sync.deleteSubConfirmWipe", { name });
     }
@@ -104,6 +127,9 @@ export function SubscriptionDeleteModal({
         return t("sync.deleteSubConfirmMoveWarn");
       case "clear_offline_delete":
       case "clear_offline_to_raw_delete":
+      case "clear_id_invalid_delete":
+      case "clear_id_invalid_to_raw_delete":
+      case "clear_id_invalid_to_wanted":
         return t("sync.clearStaleWarn");
       default:
         return t("sync.deleteSubConfirmWipeWarn");
@@ -111,7 +137,13 @@ export function SubscriptionDeleteModal({
   })();
 
   const renderModeButton = (m: DeleteFileAction) => {
-    if (m === "clear_offline_to_raw_delete" && !externalEnabled) return null;
+    if (
+      (m === "clear_offline_to_raw_delete" ||
+        m === "clear_id_invalid_to_raw_delete") &&
+      !externalEnabled
+    )
+      return null;
+    if (m === "clear_id_invalid_to_wanted" && !wantedEnabled) return null;
     return (
       <Button
         key={m}
@@ -133,7 +165,9 @@ export function SubscriptionDeleteModal({
   const soft =
     mode === "keep_list" ||
     mode === "move_to_direct" ||
-    mode === "clear_offline_to_raw_delete";
+    mode === "clear_offline_to_raw_delete" ||
+    mode === "clear_id_invalid_to_raw_delete" ||
+    mode === "clear_id_invalid_to_wanted";
 
   return (
     <Modal isOpen={isOpen} onClose={handleClose} placement="center" size="lg">
@@ -165,6 +199,16 @@ export function SubscriptionDeleteModal({
                   {t("sync.deleteSectionNotInPlaylistHint")}
                 </p>
                 {NOT_IN_PLAYLIST.map(renderModeButton)}
+              </div>
+
+              <div className="flex flex-col gap-2 mt-2">
+                <p className="text-xs font-medium text-foreground-500">
+                  {t("sync.deleteSectionIdInvalid")}
+                </p>
+                <p className="text-foreground-400 text-xs -mt-1">
+                  {t("sync.deleteSectionIdInvalidHint")}
+                </p>
+                {ID_INVALID.map(renderModeButton)}
               </div>
 
               <div className="flex flex-col gap-2 mt-2">
@@ -222,7 +266,7 @@ export function SubscriptionDeleteModal({
                 ? t("sync.deleteFilesKeepList")
                 : mode === "move_to_direct"
                   ? t("sync.deleteSubConfirmMoveAction")
-                  : mode === "clear_offline_to_raw_delete"
+                  : soft
                     ? t("sync.continue")
                     : t("sync.deleteFilesForever")}
             </Button>

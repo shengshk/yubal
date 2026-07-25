@@ -1,13 +1,33 @@
 import { basePath } from "@/lib/base-path";
 import { api } from "./client";
 import { errorMessage } from "./errors";
+import { sharedJsonGet } from "./shared-get";
 import type { components } from "./schema";
 
 export type Subscription = components["schemas"]["SubscriptionResponse"];
 export type SchedulerStatus = components["schemas"]["SchedulerStatus"];
+export type SyncStepResult = {
+  key:
+    | "health"
+    | "subscriptions"
+    | "direct"
+    | "enrichment"
+    | "external"
+    | "wanted"
+    | "hardlinks";
+  status: "complete" | "queued" | "started" | "skipped" | "failed";
+  count: number | null;
+};
 export type SyncMode = "incremental" | "mirror";
-export type OfflineCleanupAction = "delete" | "archive";
-export type MembershipStatus = "active" | "offline" | "blocked";
+/** Not-in-cloud-playlist cleanup — never migrates to Wanted. */
+export type NotInPlaylistCleanupAction = "delete" | "archive";
+/** Dead cloud-ID cleanup — may migrate to Wanted. */
+export type IdInvalidCleanupAction = "delete" | "archive" | "to_wanted";
+/** @deprecated Prefer NotInPlaylistCleanupAction | IdInvalidCleanupAction */
+export type OfflineCleanupAction = IdInvalidCleanupAction;
+
+export type OfflineDisposeAction = IdInvalidCleanupAction;
+export type MembershipStatus = "active" | "offline" | "id_invalid" | "blocked";
 export type SubscriptionDeleteAction =
   | "keep"
   | "keep_list"
@@ -38,8 +58,12 @@ export type SubscriptionUpdates = {
   sync_mode?: SyncMode;
   offline_marking_enabled?: boolean;
   offline_cleanup_enabled?: boolean;
-  offline_cleanup_action?: OfflineCleanupAction;
+  offline_cleanup_action?: NotInPlaylistCleanupAction;
   offline_cleanup_delay_hours?: number;
+  id_invalid_marking_enabled?: boolean;
+  id_invalid_cleanup_enabled?: boolean;
+  id_invalid_cleanup_action?: IdInvalidCleanupAction;
+  id_invalid_cleanup_delay_hours?: number;
   confirm_folder_move?: boolean;
 };
 
@@ -48,7 +72,7 @@ type AddSubscriptionResult =
   | { success: false; error: string };
 
 type SyncResult =
-  | { success: true; jobIds: string[] }
+  | { success: true; jobIds: string[]; steps?: SyncStepResult[] }
   | { success: false; error: string };
 
 export type UpdateSubscriptionResult =
@@ -121,10 +145,11 @@ export async function deleteSubscription(
 
 export async function clearSubscriptionOffline(
   id: string,
-  mode: "delete" | "to_raw_delete" = "delete",
+  mode: "delete" | "to_raw_delete" | "to_wanted" = "delete",
+  status: "offline" | "id_invalid" = "offline",
 ): Promise<{ cleared: number; moved: number; errors: number } | null> {
   const res = await fetch(
-    `${basePath}/api/subscriptions/${id}/clear-offline?mode=${mode}`,
+    `${basePath}/api/subscriptions/${id}/clear-offline?mode=${mode}&status=${status}`,
     { method: "POST", credentials: "include" },
   );
   if (!res.ok) return null;
@@ -139,22 +164,17 @@ export async function listSubscriptionTracks(
   id: string,
   status?: MembershipStatus,
 ): Promise<SubscriptionTrack[]> {
-  const query = status
-    ? `?status=${encodeURIComponent(status)}`
-    : "";
-  const res = await fetch(
+  const query = status ? `?status=${encodeURIComponent(status)}` : "";
+  const result = await sharedJsonGet<{ items: SubscriptionTrack[] }>(
     `${basePath}/api/subscriptions/${id}/tracks${query}`,
-    { credentials: "include" },
   );
-  if (!res.ok) return [];
-  const data = (await res.json()) as { items: SubscriptionTrack[] };
-  return data.items ?? [];
+  return result.ok ? (result.data?.items ?? []) : [];
 }
 
 export async function disposeSubscriptionTrack(
   id: string,
   videoId: string,
-  action: OfflineCleanupAction,
+  action: OfflineDisposeAction,
 ): Promise<boolean> {
   const res = await fetch(
     `${basePath}/api/subscriptions/${id}/tracks/${encodeURIComponent(videoId)}/dispose`,
@@ -216,7 +236,10 @@ export async function downloadSubscriptionTrack(
     { method: "POST", credentials: "include" },
   );
   if (res.status === 409) {
-    return { success: false, error: "Job queue is full or track is blacklisted" };
+    return {
+      success: false,
+      error: "Job queue is full or track is blacklisted",
+    };
   }
   if (res.status === 404) {
     return { success: false, error: "Track not in subscription" };
@@ -264,7 +287,12 @@ export async function syncAll(): Promise<SyncResult> {
     };
   }
 
-  return { success: true, jobIds: data.job_ids };
+  const response = data as typeof data & { steps?: SyncStepResult[] };
+  return {
+    success: true,
+    jobIds: data.job_ids,
+    steps: response.steps ?? [],
+  };
 }
 
 // --- Status ---

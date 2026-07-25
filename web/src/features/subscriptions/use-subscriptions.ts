@@ -8,6 +8,7 @@ import {
   updateSubscription as updateSubscriptionApi,
   type SchedulerStatus,
   type Subscription,
+  type SyncStepResult,
 } from "@/api/subscriptions";
 import { showErrorToast, showSuccessToast } from "@/lib/toast";
 import { useCallback, useEffect, useState } from "react";
@@ -32,6 +33,10 @@ export interface UseSubscriptionsResult {
       offline_cleanup_enabled?: boolean;
       offline_cleanup_action?: "delete" | "archive";
       offline_cleanup_delay_hours?: number;
+      id_invalid_marking_enabled?: boolean;
+      id_invalid_cleanup_enabled?: boolean;
+      id_invalid_cleanup_action?: "delete" | "archive" | "to_wanted";
+      id_invalid_cleanup_delay_hours?: number;
       confirm_folder_move?: boolean;
     },
   ) => Promise<"ok" | "folder_conflict" | "error">;
@@ -40,7 +45,7 @@ export interface UseSubscriptionsResult {
     fileAction?: "keep" | "keep_list" | "delete" | "move_to_direct",
   ) => Promise<boolean>;
   syncSubscription: (id: string) => Promise<void>;
-  syncAll: () => Promise<void>;
+  syncAll: () => Promise<SyncStepResult[] | null>;
 }
 
 export function useSubscriptions(): UseSubscriptionsResult {
@@ -95,6 +100,10 @@ export function useSubscriptions(): UseSubscriptionsResult {
         offline_cleanup_enabled?: boolean;
         offline_cleanup_action?: "delete" | "archive";
         offline_cleanup_delay_hours?: number;
+        id_invalid_marking_enabled?: boolean;
+        id_invalid_cleanup_enabled?: boolean;
+        id_invalid_cleanup_action?: "delete" | "archive" | "to_wanted";
+        id_invalid_cleanup_delay_hours?: number;
         confirm_folder_move?: boolean;
       },
     ): Promise<"ok" | "folder_conflict" | "error"> => {
@@ -154,13 +163,14 @@ export function useSubscriptions(): UseSubscriptionsResult {
     const result = await syncAllApi();
     if (!result.success) {
       showErrorToast(t("subscriptions.syncFailedTitle"), result.error);
-      return;
+      return null;
     }
     await fetchSubscriptions();
     showSuccessToast(
       t("subscriptions.syncQueuedTitle"),
       t("subscriptions.syncQueuedAll"),
     );
+    return result.steps ?? [];
   }, [fetchSubscriptions, t]);
 
   useEffect(() => {

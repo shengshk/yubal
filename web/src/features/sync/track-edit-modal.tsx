@@ -1,8 +1,10 @@
 import type { SyncTrackItem } from "@/api/sync-ledger";
+import { HoverHint } from "@/components/common/hover-hint";
 import {
   fetchTrackLyrics,
   resolveTrackMetadata,
   searchTrackMetadata,
+  trackCoverUrl,
   updateTrackTags,
   type MetadataCandidate,
   type MetadataSuggestion,
@@ -94,20 +96,6 @@ function coverSource(url: string | null): string {
   }
 }
 
-/** Provenance of the *embedded* cover, from the catalog (not the URL guess). */
-function coverSourceLabel(source: string | null | undefined): string | null {
-  switch (source) {
-    case "apple":
-      return "Apple";
-    case "ytm":
-      return "YouTube Music";
-    case "embedded":
-      return "Embedded";
-    default:
-      return null;
-  }
-}
-
 function plainLyrics(content: string): string {
   return parseLyrics(content)
     .lines.map((line) =>
@@ -188,9 +176,12 @@ export function TrackEditModal({
       album: track.album ?? "",
       year: track.year ?? "",
       trackNumber: track.track_number != null ? String(track.track_number) : "",
-      coverUrl: track.cover_url ?? null,
+      coverUrl:
+        track.has_embedded_cover && trackKey
+          ? trackCoverUrl(trackKey)
+          : (track.cover_url ?? null),
     };
-  }, [track]);
+  }, [track, trackKey]);
 
   const labelWithChange = (label: string, changed: boolean) => (
     <span>
@@ -213,6 +204,26 @@ export function TrackEditModal({
       qq: t("sync.trackSourceQQ"),
     };
     return known[source.toLowerCase()] ?? source;
+  };
+
+  /** Where the bytes came from before they were embedded in the audio file. */
+  const coverSourceLabel = (
+    source: string | null | undefined,
+  ): string | null => {
+    switch (source?.toLowerCase()) {
+      case "apple":
+        return t("sync.trackCoverSourceApple");
+      case "ytm":
+        return t("sync.trackCoverSourceYtm");
+      case "manual":
+        return t("sync.trackCoverSourceManual");
+      case "embedded":
+        return t("sync.trackCoverSourceOriginal");
+      default:
+        return track?.has_embedded_cover
+          ? t("sync.trackCoverSourceUnknown")
+          : null;
+    }
   };
 
   // Reset the form when opening. No auto-search: the user searches manually.
@@ -424,7 +435,8 @@ export function TrackEditModal({
         return;
       }
       if (trimmedTitle !== (track.title ?? "")) payload.title = trimmedTitle;
-      if (trimmedArtist !== (track.artist ?? "")) payload.artist = trimmedArtist;
+      if (trimmedArtist !== (track.artist ?? ""))
+        payload.artist = trimmedArtist;
       if (trimmedAlbumArtist !== (track.album_artist ?? track.artist ?? "")) {
         payload.album_artist = trimmedAlbumArtist;
       }
@@ -494,96 +506,106 @@ export function TrackEditModal({
     >
       <ModalContent>
         <ModalHeader>
-          {readOnlyTags ? t("sync.editTrackAssets") : t("sync.editTrackTags")}
+          {readOnlyTags ? (
+            <HoverHint
+              content={t("sync.editTrackAssetsHint")}
+              className="inline-flex"
+              placement="bottom-start"
+            >
+              {t("sync.editTrackAssets")}
+            </HoverHint>
+          ) : (
+            t("sync.editTrackTags")
+          )}
         </ModalHeader>
         <ModalBody className="gap-4">
           {!readOnlyTags ? (
-          <div className="flex flex-col gap-2">
-            <p className="text-foreground-500 text-xs font-medium">
-              {t("sync.trackScrapeSection")}
-            </p>
-            <div className="flex gap-2">
-              <Input
-                aria-label={t("sync.trackScrapeQuery")}
-                placeholder={t("sync.trackScrapeQuery")}
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") {
-                    e.preventDefault();
+            <div className="flex flex-col gap-2">
+              <p className="text-foreground-500 text-xs font-medium">
+                {t("sync.trackScrapeSection")}
+              </p>
+              <div className="flex gap-2">
+                <Input
+                  aria-label={t("sync.trackScrapeQuery")}
+                  placeholder={t("sync.trackScrapeQuery")}
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      void handleSearch();
+                    }
+                  }}
+                />
+                <Button
+                  color="primary"
+                  variant="flat"
+                  isIconOnly
+                  isLoading={searching}
+                  aria-label={t("sync.trackScrapeSearch")}
+                  onPress={() => {
                     void handleSearch();
-                  }
-                }}
-              />
-              <Button
-                color="primary"
-                variant="flat"
-                isIconOnly
-                isLoading={searching}
-                aria-label={t("sync.trackScrapeSearch")}
-                onPress={() => {
-                  void handleSearch();
-                }}
-              >
-                <SearchIcon className="h-4 w-4" />
-              </Button>
-            </div>
+                  }}
+                >
+                  <SearchIcon className="h-4 w-4" />
+                </Button>
+              </div>
 
-            {candidates.length > 0 ? (
-              <ul className="border-default-200 max-h-40 overflow-y-auto rounded-md border">
-                {candidates.map((c) => {
-                  const active = selectedId === c.candidate_video_id;
-                  const score =
-                    c.title_score != null && c.artist_score != null
-                      ? Math.round((c.title_score + c.artist_score) / 2)
-                      : null;
-                  return (
-                    <li key={c.candidate_video_id}>
-                      <button
-                        type="button"
-                        className={`hover:bg-default-100 flex w-full items-center gap-2 px-2 py-1.5 text-left text-xs ${
-                          active ? "bg-primary/10" : ""
-                        }`}
-                        onClick={() => {
-                          void handleSelectCandidate(c);
-                        }}
-                      >
-                        {c.thumbnail_url ? (
-                          <img
-                            src={c.thumbnail_url}
-                            alt=""
-                            className="h-8 w-8 shrink-0 rounded object-cover"
-                          />
-                        ) : (
-                          <div className="bg-default-100 h-8 w-8 shrink-0 rounded" />
-                        )}
-                        <span className="min-w-0 flex-1 truncate">
-                          {c.artist} - {c.title}
-                          {c.album ? (
-                            <span className="text-foreground-400">
-                              {" · "}
-                              {c.album}
+              {candidates.length > 0 ? (
+                <ul className="border-default-200 max-h-40 overflow-y-auto rounded-md border">
+                  {candidates.map((c) => {
+                    const active = selectedId === c.candidate_video_id;
+                    const score =
+                      c.title_score != null && c.artist_score != null
+                        ? Math.round((c.title_score + c.artist_score) / 2)
+                        : null;
+                    return (
+                      <li key={c.candidate_video_id}>
+                        <button
+                          type="button"
+                          className={`hover:bg-default-100 flex w-full items-center gap-2 px-2 py-1.5 text-left text-xs ${
+                            active ? "bg-primary/10" : ""
+                          }`}
+                          onClick={() => {
+                            void handleSelectCandidate(c);
+                          }}
+                        >
+                          {c.thumbnail_url ? (
+                            <img
+                              src={c.thumbnail_url}
+                              alt=""
+                              className="h-8 w-8 shrink-0 rounded object-cover"
+                            />
+                          ) : (
+                            <div className="bg-default-100 h-8 w-8 shrink-0 rounded" />
+                          )}
+                          <span className="min-w-0 flex-1 truncate">
+                            {c.artist} - {c.title}
+                            {c.album ? (
+                              <span className="text-foreground-400">
+                                {" · "}
+                                {c.album}
+                              </span>
+                            ) : null}
+                          </span>
+                          {score != null ? (
+                            <span className="text-foreground-400 shrink-0 tabular-nums">
+                              {score}%
                             </span>
                           ) : null}
-                        </span>
-                        {score != null ? (
-                          <span className="text-foreground-400 shrink-0 tabular-nums">
-                            {score}%
-                          </span>
-                        ) : null}
-                      </button>
-                    </li>
-                  );
-                })}
-              </ul>
-            ) : null}
-            {resolving ? (
-              <div className="text-foreground-400 flex items-center gap-2 text-xs">
-                <Spinner size="sm" />
-                {t("sync.trackScrapeResolving")}
-              </div>
-            ) : null}
-          </div>
+                        </button>
+                      </li>
+                    );
+                  })}
+                </ul>
+              ) : null}
+              {resolving ? (
+                <div className="text-foreground-400 flex items-center gap-2 text-xs">
+                  <Spinner size="sm" />
+                  {t("sync.trackScrapeResolving")}
+                </div>
+              ) : null}
+            </div>
           ) : null}
 
           {!readOnlyTags && suggestion ? (
@@ -637,66 +659,62 @@ export function TrackEditModal({
           ) : null}
 
           {!readOnlyTags ? (
-          <div className="grid gap-3">
-            <Input
-              label={labelWithChange(
-                t("sync.trackFieldTitle"),
-                title !== baseline.title,
-              )}
-              value={title}
-              onChange={(e) => setTitle(e.target.value)}
-            />
-            <Input
-              label={labelWithChange(
-                t("sync.trackFieldArtist"),
-                artist !== baseline.artist,
-              )}
-              value={artist}
-              onChange={(e) => setArtist(e.target.value)}
-            />
-            <Input
-              label={labelWithChange(
-                t("sync.trackFieldAlbumArtist"),
-                albumArtist !== baseline.albumArtist,
-              )}
-              value={albumArtist}
-              onChange={(e) => setAlbumArtist(e.target.value)}
-            />
-            <Input
-              label={labelWithChange(
-                t("sync.trackFieldAlbum"),
-                album !== baseline.album,
-              )}
-              value={album}
-              onChange={(e) => setAlbum(e.target.value)}
-            />
-            <div className="grid grid-cols-2 gap-3">
+            <div className="grid gap-3">
               <Input
                 label={labelWithChange(
-                  t("sync.trackFieldYear"),
-                  year !== baseline.year,
+                  t("sync.trackFieldTitle"),
+                  title !== baseline.title,
                 )}
-                value={year}
-                onChange={(e) => setYear(e.target.value)}
+                value={title}
+                onChange={(e) => setTitle(e.target.value)}
               />
               <Input
-                type="number"
                 label={labelWithChange(
-                  t("sync.trackFieldTrackNumber"),
-                  trackNumber !== baseline.trackNumber,
+                  t("sync.trackFieldArtist"),
+                  artist !== baseline.artist,
                 )}
-                value={trackNumber}
-                min={1}
-                max={999}
-                onChange={(e) => setTrackNumber(e.target.value)}
+                value={artist}
+                onChange={(e) => setArtist(e.target.value)}
               />
+              <Input
+                label={labelWithChange(
+                  t("sync.trackFieldAlbumArtist"),
+                  albumArtist !== baseline.albumArtist,
+                )}
+                value={albumArtist}
+                onChange={(e) => setAlbumArtist(e.target.value)}
+              />
+              <Input
+                label={labelWithChange(
+                  t("sync.trackFieldAlbum"),
+                  album !== baseline.album,
+                )}
+                value={album}
+                onChange={(e) => setAlbum(e.target.value)}
+              />
+              <div className="grid grid-cols-2 gap-3">
+                <Input
+                  label={labelWithChange(
+                    t("sync.trackFieldYear"),
+                    year !== baseline.year,
+                  )}
+                  value={year}
+                  onChange={(e) => setYear(e.target.value)}
+                />
+                <Input
+                  type="number"
+                  label={labelWithChange(
+                    t("sync.trackFieldTrackNumber"),
+                    trackNumber !== baseline.trackNumber,
+                  )}
+                  value={trackNumber}
+                  min={1}
+                  max={999}
+                  onChange={(e) => setTrackNumber(e.target.value)}
+                />
+              </div>
             </div>
-          </div>
-          ) : (
-            <p className="text-foreground-400 text-xs">
-              {t("sync.editTrackAssetsHint")}
-            </p>
-          )}
+          ) : null}
 
           {/* Equal-height asset rows: preview left, source + action right. */}
           <div className="border-default-200 flex h-24 items-center justify-between gap-4 rounded-md border px-3">
@@ -706,6 +724,17 @@ export function TrackEditModal({
                   src={coverUrl}
                   alt=""
                   className="h-16 w-16 shrink-0 rounded object-cover"
+                  onError={() => {
+                    if (
+                      !coverChanged &&
+                      track?.cover_url &&
+                      coverUrl !== track.cover_url
+                    ) {
+                      setCoverUrl(track.cover_url);
+                    } else if (!coverChanged) {
+                      setCoverUrl(null);
+                    }
+                  }}
                 />
               ) : (
                 <span className="text-foreground-400 text-xs">

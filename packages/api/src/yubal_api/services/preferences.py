@@ -108,6 +108,16 @@ class Preferences:
     telegram_admin_ids: str = ""
     telegram_user_ids: str = ""
     telegram_daily_limit: int = 5
+    # Wishlist / wanted playlist
+    wanted_enabled: bool = True
+    wanted_auto_match_enabled: bool = True
+    wanted_max_items: int = 50
+    wanted_sync_jitter_seconds: int = 600
+    wanted_source_musicbrainz: bool = True
+    wanted_source_qq: bool = True
+    wanted_source_discogs: bool = False
+    wanted_source_lastfm: bool = False
+    lastfm_api_key: str = ""
 
 
 def preferences_from_settings(settings: Any) -> Preferences:
@@ -169,6 +179,15 @@ def preferences_from_settings(settings: Any) -> Preferences:
         telegram_admin_ids="",
         telegram_user_ids="",
         telegram_daily_limit=5,
+        wanted_enabled=True,
+        wanted_auto_match_enabled=True,
+        wanted_max_items=50,
+        wanted_sync_jitter_seconds=600,
+        wanted_source_musicbrainz=True,
+        wanted_source_qq=True,
+        wanted_source_discogs=False,
+        wanted_source_lastfm=False,
+        lastfm_api_key="",
     )
 
 
@@ -274,7 +293,7 @@ def _parse_overrides(raw: dict[str, Any], defaults: Preferences) -> dict[str, An
 
     if "direct_offline_cleanup_action" in raw:
         action = str(raw["direct_offline_cleanup_action"]).lower().strip()
-        if action in {"delete", "archive"}:
+        if action in {"delete", "archive", "to_wanted"}:
             overrides["direct_offline_cleanup_action"] = action
         else:
             logger.warning(
@@ -370,9 +389,39 @@ def _parse_overrides(raw: dict[str, Any], defaults: Preferences) -> dict[str, An
         "preselect_enabled",
         "wash_enabled",
         "download_cache_enabled",
+        "wanted_enabled",
+        "wanted_auto_match_enabled",
+        "wanted_source_musicbrainz",
+        "wanted_source_qq",
+        "wanted_source_discogs",
+        "wanted_source_lastfm",
     ):
         if key in raw:
             overrides[key] = _coerce_bool(raw[key], getattr(defaults, key))
+
+    if "wanted_max_items" in raw:
+        try:
+            value = int(raw["wanted_max_items"])
+            if 1 <= value <= 10000:
+                overrides["wanted_max_items"] = value
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid wanted_max_items in preferences: %r", raw["wanted_max_items"]
+            )
+
+    if "wanted_sync_jitter_seconds" in raw:
+        try:
+            value = int(raw["wanted_sync_jitter_seconds"])
+            if 0 <= value <= 600:
+                overrides["wanted_sync_jitter_seconds"] = value
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid wanted_sync_jitter_seconds in preferences: %r",
+                raw["wanted_sync_jitter_seconds"],
+            )
+
+    if "lastfm_api_key" in raw:
+        overrides["lastfm_api_key"] = str(raw["lastfm_api_key"] or "").strip()[:128]
 
     if "preselect_root" in raw:
         root = str(raw["preselect_root"] or "").strip()

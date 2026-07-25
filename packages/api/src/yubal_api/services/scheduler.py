@@ -40,6 +40,7 @@ from yubal_api.services.subscription_membership_service import (
 from yubal_api.services.subscription_service import SubscriptionService
 from yubal_api.services.sync_ledger_service import SyncLedgerService
 from yubal_api.services.sync_pipeline_service import SyncPipelineService
+from yubal_api.services.wanted_service import WantedService
 from yubal_api.settings import Settings
 
 logger = logging.getLogger(__name__)
@@ -61,6 +62,8 @@ class Scheduler:
         membership_service: SubscriptionMembershipService | None = None,
         library_enrichment_service: LibraryEnrichmentService | None = None,
         library_dedup_service: LibraryDedupService | None = None,
+        wanted_service: WantedService | None = None,
+        sync_pipeline_service: SyncPipelineService | None = None,
     ) -> None:
         """Initialize scheduler."""
         self._subscription_service = subscription_service
@@ -74,13 +77,15 @@ class Scheduler:
         self._membership_service = membership_service
         self._library_enrichment_service = library_enrichment_service
         self._library_dedup_service = library_dedup_service
-        self._pipeline = SyncPipelineService(
+        self._wanted_service = wanted_service
+        self._pipeline = sync_pipeline_service or SyncPipelineService(
             library_health=library_health,
             external_library_service=external_library_service,
             library_enrichment_service=library_enrichment_service,
             library_dedup_service=library_dedup_service,
             preferences_store=preferences_store,
             sync_ledger_service=sync_ledger_service,
+            wanted_service=wanted_service,
         )
         self._task: asyncio.Task[None] | None = None
         self._stop_event = asyncio.Event()
@@ -92,6 +97,7 @@ class Scheduler:
         self._next_run_subscription_name: str | None = None
         self._tracked_cron: str | None = None
         self._last_offline_cleanup_at: datetime | None = None
+        self._last_manual_sync_steps: list[dict[str, str | int | None]] = []
 
     @property
     def is_running(self) -> bool:
@@ -128,6 +134,11 @@ class Scheduler:
     def next_run_subscription_name(self) -> str | None:
         """Subscription name for the soonest planned fire."""
         return self._next_run_subscription_name
+
+    @property
+    def last_manual_sync_steps(self) -> list[dict[str, str | int | None]]:
+        """Snapshot of the most recently triggered manual Sync All pipeline."""
+        return [dict(step) for step in self._last_manual_sync_steps]
 
     def invalidate_plan(self, subscription_id: UUID | None = None) -> None:
         """Drop a cycle plan so the next loop re-rolls jitter.
@@ -221,7 +232,10 @@ class Scheduler:
             return 0
         configured = max(
             0,
-            min(600, int(self._preferences_store.effective().direct_sync_jitter_seconds)),
+            min(
+                600,
+                int(self._preferences_store.effective().direct_sync_jitter_seconds),
+            ),
         )
         interval = self._cron_interval_seconds()
         if interval <= 0:
@@ -396,14 +410,16 @@ class Scheduler:
                 None,
             )
             if job is None:
-                logger.warning("Could not create Direct recover job (queue full)")
+                logger.warning(
+                    "Could not create Download Center recovery job (queue full)"
+                )
                 return None
-            logger.info("Created Direct recover job %s", job.id[:8])
+            logger.info("Created Download Center recovery job %s", job.id[:8])
             return job.id
         except InsufficientDiskSpaceError:
             raise
         except Exception:
-            logger.exception("Failed to create Direct recover job")
+            logger.exception("Failed to create Download Center recovery job")
             return None
 
     def _create_jobs_for_subscriptions(
@@ -453,9 +469,7 @@ class Scheduler:
         """Scan External/Raw for new files and attempt YTM matches for a batch."""
         await asyncio.to_thread(self._pipeline.run_external_scan_and_match)
 
-    async def _sync_subscriptions(
-        self, subscriptions: list[Subscription]
-    ) -> list[str]:
+    async def _sync_subscriptions(self, subscriptions: list[Subscription]) -> list[str]:
         """Sync the given subscriptions (async wrapper)."""
         try:
             return self._create_jobs_for_subscriptions(subscriptions)
@@ -473,29 +487,13 @@ class Scheduler:
             return None
 
         job_ids = self._create_jobs_for_subscriptions([subscription])
-        folder = (subscription.save_folder or subscription.name or "").strip()
-        if folder and self._library_enrichment_service is not None:
-            self._pipeline.spawn_enrichment(
-                budget=50,
-                reason="subscription_sync",
-                save_folder=folder,
-            )
         return job_ids[0] if job_ids else None
 
     def sync_direct(self) -> str | None:
         """Manually trigger Direct recover (bypasses jitter). Returns job_id."""
         if self._operation_gate is not None:
             self._operation_gate.ensure_allowed()
-        job_id = self._create_direct_recover_job(JobSource.MANUAL)
-        from yubal.utils.library import DIRECT_FOLDER
-
-        if self._library_enrichment_service is not None:
-            self._pipeline.spawn_enrichment(
-                budget=50,
-                reason="direct_sync",
-                save_folder=DIRECT_FOLDER,
-            )
-        return job_id
+        return self._create_direct_recover_job(JobSource.MANUAL)
 
     def run_unified_sync(
         self,
@@ -510,24 +508,32 @@ class Scheduler:
           1) health check
           2) sync subscriptions (all enabled vs due — caller chooses list)
           3) Direct recover (when enabled / due)
-          4) enrich_library (budget based on ``source``)
-          5) external scan_raw + match_batch (no junk, no ignore_backoff)
-          6) collapse_divergent_copies
+          4) external scan → verify → match → materialize → enrich
+          5) Wanted local link → asset completion → YTM fulfill
+          6) final whole-library enrichment / on-disk verification
+          7) collapse_divergent_copies
 
-        ``source`` is ``\"sync_all\"`` or ``\"scheduler\"`` (enrich budget + job
-        source). When ``subscriptions`` is None and source is sync_all, all
+        ``source`` is ``\"sync_all\"`` or ``\"scheduler\"``. Both use the same
+        library rules; only subscription scope and trigger time differ. When
+        ``subscriptions`` is None and source is sync_all, all
         enabled subscriptions are used. Scheduled passes the due list (may be
         empty when only Direct is due).
         """
         is_manual = source == "sync_all"
         job_source = JobSource.MANUAL if is_manual else JobSource.SCHEDULER
-        enrich_budget = 500 if is_manual else 25
-        enrich_reason = "sync_all" if is_manual else "scheduler"
 
         if is_manual and self._operation_gate is not None:
             self._operation_gate.ensure_allowed()
 
-        self._pipeline.check_health()
+        steps: list[dict[str, str | int | None]] = []
+        health_ok = self._pipeline.check_health()
+        steps.append(
+            {
+                "key": "health",
+                "status": "complete" if health_ok else "failed",
+                "count": None,
+            }
+        )
 
         if subscriptions is None:
             if is_manual:
@@ -541,6 +547,13 @@ class Scheduler:
                 job_ids.extend(self._create_jobs_for_subscriptions(subscriptions))
             except InsufficientDiskSpaceError as e:
                 logger.warning("Skipping subscription sync (%s): %s", source, e)
+        steps.append(
+            {
+                "key": "subscriptions",
+                "status": "queued" if job_ids else "skipped",
+                "count": len(job_ids),
+            }
+        )
 
         do_direct = (
             self._direct_auto_recover_enabled()
@@ -551,13 +564,118 @@ class Scheduler:
             direct_id = self._create_direct_recover_job(job_source)
             if direct_id:
                 job_ids.append(direct_id)
+            direct_status = "queued" if direct_id else "skipped"
         else:
             self._pipeline.reconcile_direct()
+            direct_status = "complete"
+        steps.append(
+            {
+                "key": "direct",
+                "status": direct_status,
+                "count": 1 if direct_status == "queued" else None,
+            }
+        )
 
-        self._pipeline.spawn_enrichment(budget=enrich_budget, reason=enrich_reason)
-        self._pipeline.run_external_scan_and_match()
-        self._pipeline.collapse_divergent_copies()
+        prefs = (
+            self._preferences_store.effective()
+            if self._preferences_store is not None
+            else None
+        )
+        cycle = self._pipeline.run_library_cycle(
+            trigger=source,
+            enrichment_budget=500,
+        )
+        external_count = (
+            cycle.external.matched
+            + cycle.external.meta_verified
+            + cycle.external.recovered
+            + cycle.external.enriched
+        )
+        steps.append(
+            {
+                "key": "external",
+                "status": (
+                    (
+                        "failed"
+                        if cycle.external.errors or cycle.external.asset_errors
+                        else "complete"
+                    )
+                    if self._external_library_service is not None
+                    and (prefs is None or prefs.external_library_enabled)
+                    else "skipped"
+                ),
+                "count": external_count,
+            }
+        )
+        wanted_count = sum(
+            int(cycle.wanted.get(key, 0))
+            for key in (
+                "linked",
+                "matched",
+                "covers_written",
+                "lyrics_written",
+            )
+        )
+        steps.append(
+            {
+                "key": "wanted",
+                "status": (
+                    (
+                        "failed"
+                        if cycle.wanted.get("asset_failed", 0)
+                        or cycle.wanted.get("failed", 0)
+                        else "complete"
+                    )
+                    if self._wanted_service is not None
+                    and (prefs is None or prefs.wanted_enabled)
+                    else "skipped"
+                ),
+                "count": wanted_count,
+            }
+        )
+        steps.append(
+            {
+                "key": "enrichment",
+                "status": (
+                    "failed"
+                    if cycle.enrichment.failed
+                    else "complete"
+                    if self._library_enrichment_service is not None
+                    else "skipped"
+                ),
+                "count": cycle.enrichment.enriched,
+            }
+        )
+        steps.append(
+            {
+                "key": "hardlinks",
+                "status": (
+                    "complete" if self._library_dedup_service is not None else "skipped"
+                ),
+                "count": None,
+            }
+        )
+        if is_manual:
+            self._last_manual_sync_steps = steps
         return job_ids
+
+    def _run_wanted_pass(self) -> None:
+        """Local hardlink match + YTM fulfill for wishlist (best-effort)."""
+        if self._wanted_service is None:
+            return
+        prefs = (
+            self._preferences_store.effective()
+            if self._preferences_store is not None
+            else None
+        )
+        if prefs is not None and not prefs.wanted_enabled:
+            return
+        try:
+            result = self._wanted_service.run_sync_pass(force_ytm=False)
+            if result.get("linked") or result.get("matched"):
+                logger.info("Wanted sync pass %s", result)
+        except Exception as exc:
+            logger.warning("Wanted sync pass failed: %s", exc)
 
     def sync_all(self) -> list[str]:
         """Create sync jobs for all enabled subscriptions. Returns job_ids.

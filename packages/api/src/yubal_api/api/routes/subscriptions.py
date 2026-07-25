@@ -14,7 +14,11 @@ from yubal_api.api.deps import (
     SyncLedgerServiceDep,
 )
 from yubal_api.api.exceptions import QueueFullError
-from yubal_api.db.subscription import Subscription, SubscriptionType
+from yubal_api.db.subscription import (
+    OfflineCleanupAction,
+    Subscription,
+    SubscriptionType,
+)
 from yubal_api.db.subscription_membership import MembershipStatus
 from yubal_api.schemas.subscriptions import (
     SubscriptionCreate,
@@ -34,6 +38,9 @@ router = APIRouter(prefix="/subscriptions", tags=["subscriptions"])
 
 def _to_response(subscription: Subscription) -> SubscriptionResponse:
     """Build response with effective save_folder (falls back to name)."""
+    offline_action = subscription.offline_cleanup_action
+    if offline_action == OfflineCleanupAction.TO_WANTED:
+        offline_action = OfflineCleanupAction.ARCHIVE
     return SubscriptionResponse(
         id=subscription.id,
         type=subscription.type,
@@ -46,8 +53,22 @@ def _to_response(subscription: Subscription) -> SubscriptionResponse:
         sync_mode=subscription.sync_mode,
         offline_marking_enabled=subscription.offline_marking_enabled,
         offline_cleanup_enabled=subscription.offline_cleanup_enabled,
-        offline_cleanup_action=subscription.offline_cleanup_action,
+        offline_cleanup_action=offline_action,  # type: ignore[arg-type]
         offline_cleanup_delay_hours=subscription.offline_cleanup_delay_hours,
+        id_invalid_marking_enabled=getattr(
+            subscription, "id_invalid_marking_enabled", True
+        ),
+        id_invalid_cleanup_enabled=getattr(
+            subscription, "id_invalid_cleanup_enabled", False
+        ),
+        id_invalid_cleanup_action=getattr(
+            subscription,
+            "id_invalid_cleanup_action",
+            OfflineCleanupAction.ARCHIVE,
+        ),
+        id_invalid_cleanup_delay_hours=int(
+            getattr(subscription, "id_invalid_cleanup_delay_hours", 72) or 72
+        ),
         thumbnail_url=subscription.thumbnail_url,
         created_at=subscription.created_at,
         last_synced_at=subscription.last_synced_at,
@@ -66,7 +87,10 @@ async def sync_all_subscriptions(
 ) -> SyncResponse:
     """Sync all enabled subscriptions."""
     job_ids = scheduler.sync_all()
-    return SyncResponse(job_ids=job_ids)
+    return SyncResponse(
+        job_ids=job_ids,
+        steps=scheduler.last_manual_sync_steps,
+    )
 
 
 # =============================================================================
@@ -204,16 +228,28 @@ def clear_subscription_offline(
     subscription_id: UUID,
     service: SubscriptionServiceDep,
     membership: MembershipServiceDep,
-    mode: Literal["delete", "to_raw_delete"] = Query(default="delete"),
+    mode: Literal["delete", "to_raw_delete", "to_wanted"] = Query(default="delete"),
+    status: Literal["offline", "id_invalid"] = Query(default="offline"),
 ) -> dict[str, int]:
-    """Clear offline memberships: hard-delete or salvage into Raw/Delete."""
+    """Clear offline / ID-invalid memberships: hard-delete, Raw/Delete, or Wanted."""
     subscription = service.get(subscription_id)
+    target = (
+        MembershipStatus.ID_INVALID
+        if status == "id_invalid"
+        else MembershipStatus.OFFLINE
+    )
     try:
+        if mode == "to_wanted" and target == MembershipStatus.OFFLINE:
+            raise ValueError(
+                "to_wanted is only allowed for id_invalid, not not-in-playlist"
+            )
         return membership.clear_offline(
             subscription,
             to_raw_delete=mode == "to_raw_delete",
+            to_wanted=mode == "to_wanted",
+            status=target,
         )
-    except RuntimeError as e:
+    except (RuntimeError, ValueError) as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
 
 
@@ -230,11 +266,14 @@ def dispose_subscription_track(
 ) -> SubscriptionTrackDisposeResponse:
     """Manually delete or archive one offline/active membership track."""
     subscription = service.get(subscription_id)
-    result = membership.dispose_membership(
-        subscription,
-        video_id,
-        action=data.action,
-    )
+    try:
+        result = membership.dispose_membership(
+            subscription,
+            video_id,
+            action=data.action,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     return SubscriptionTrackDisposeResponse(
         video_id=result.video_id,
         action=result.action,

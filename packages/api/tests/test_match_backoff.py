@@ -7,11 +7,11 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
-
 from yubal_api.db.external_library import (
     MATCH_PENDING,
     MATCH_REJECTED,
     MATCH_UNMATCHED,
+    META_VERIFIED,
     ExternalRawTrack,
 )
 from yubal_api.services.external_library_service import (
@@ -47,9 +47,7 @@ def test_backoff_step_is_24h() -> None:
         (8, 8 * 86400),
     ],
 )
-def test_backoff_seconds_is_linear_24h(
-    fail_count: int, expected_seconds: int
-) -> None:
+def test_backoff_seconds_is_linear_24h(fail_count: int, expected_seconds: int) -> None:
     assert _svc()._backoff_seconds(fail_count) == expected_seconds
 
 
@@ -81,10 +79,14 @@ def test_record_failure_sets_linear_next_eligible() -> None:
     svc = ExternalLibraryService(
         repo,
         MagicMock(),
-        MagicMock(effective=MagicMock(return_value=SimpleNamespace(
-            match_backoff_cap_days=7,
-            match_strictness="strict",
-        ))),
+        MagicMock(
+            effective=MagicMock(
+                return_value=SimpleNamespace(
+                    match_backoff_cap_days=7,
+                    match_strictness="strict",
+                )
+            )
+        ),
     )
     row = ExternalRawTrack(
         rel_path="plist/a.flac",
@@ -130,6 +132,15 @@ def test_is_junk_rejected_or_readonly_incomplete() -> None:
         artists="A",
         album="Al",
     )
+    verified_after_rejection = ExternalRawTrack(
+        rel_path="verified.flac",
+        dir_name="d",
+        match_status=MATCH_REJECTED,
+        meta_status=META_VERIFIED,
+        title="T",
+        artists="A",
+        album="Al",
+    )
     assert ExternalLibraryService.is_junk_row(rejected, readonly=False) is True
     assert ExternalLibraryService.is_junk_row(incomplete, readonly=True) is True
     assert ExternalLibraryService.is_junk_row(incomplete, readonly=False) is False
@@ -139,6 +150,18 @@ def test_is_junk_rejected_or_readonly_incomplete() -> None:
     assert ExternalLibraryService.junk_kind_for_row(incomplete, readonly=True) == "ro"
     assert ExternalLibraryService.junk_kind_for_row(incomplete, readonly=False) is None
     assert ExternalLibraryService.junk_kind_for_row(ok, readonly=True) is None
+    assert (
+        ExternalLibraryService.junk_kind_for_row(
+            verified_after_rejection, readonly=False
+        )
+        is None
+    )
+    assert (
+        ExternalLibraryService.junk_kind_for_row(
+            verified_after_rejection, readonly=True
+        )
+        is None
+    )
 
 
 def test_match_one_rejects_on_eighth_failure() -> None:

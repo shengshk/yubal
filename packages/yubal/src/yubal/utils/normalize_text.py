@@ -13,6 +13,12 @@ _PUNCT_RE = re.compile(r"[\s\-–—_/·•・,，、&＆+＋]+")
 _STRIP_RE = re.compile(r'["\'`´\[\]\(\)\{\}【】「」『』《》<>]')
 _CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
 
+
+def has_cjk(text: str | None) -> bool:
+    """True when ``text`` contains CJK ideographs."""
+    return bool(text and _CJK_RE.search(text))
+
+
 # Optional: OpenCC-style 简繁 via zhconv (pure Python)
 _zh_convert = None
 try:

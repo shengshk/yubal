@@ -5,6 +5,7 @@ import {
   type SearchSnapshot,
   type SearchTrack,
 } from "@/api/search";
+import { addWantedTrack, listWantedTracks } from "@/api/wanted";
 import { trackCoverUrl } from "@/api/library";
 import {
   enrichTrack,
@@ -14,6 +15,7 @@ import {
 import { AudioSpectrum } from "@/features/sync/audio-spectrum";
 import { useLibraryAudio } from "@/features/sync/library-audio";
 import type { PlayMode } from "@/features/sync/play-mode";
+import { PlaylistTitleTooltip } from "@/features/sync/playlist-title-tooltip";
 import {
   SYNC_ACTION_BTN,
   SYNC_CARD_ACTIONS,
@@ -34,6 +36,7 @@ import {
   CaptionsIcon,
   DownloadIcon,
   ExternalLinkIcon,
+  HeartIcon,
   ListMusicIcon,
   ListOrderedIcon,
   PauseIcon,
@@ -67,13 +70,39 @@ type Props = {
   onExpired: () => void;
 };
 
+function isMetaTrack(track: SearchTrack): boolean {
+  return Boolean(track.wishable) || track.result_kind === "meta";
+}
+
 function labelFor(track: SearchTrack): string {
   return formatArtistTitle(track.artist, track.title);
 }
 
 function trackKey(track: SearchTrack): string {
   if (track.matched && track.local_path) return track.local_path;
-  return `search-preview:${track.video_id}`;
+  if (track.video_id) return `search-preview:${track.video_id}`;
+  return `search-meta:${track.source ?? "meta"}:${track.source_id ?? track.rank}`;
+}
+
+function trackIdentity(track: SearchTrack): string {
+  if (track.video_id) return track.video_id;
+  return `${track.source ?? "meta"}:${track.source_id ?? ""}:${track.rank}`;
+}
+
+/** Soft match key aligned with WantedService.add() title/artist/album dedupe. */
+function wantedSoftKey(
+  title: string,
+  artists: string,
+  album?: string | null,
+): string {
+  return `${title.trim().toLowerCase()}|${artists.trim().toLowerCase()}|${(album ?? "").trim().toLowerCase()}`;
+}
+
+function searchWantedKeys(track: SearchTrack): string[] {
+  const keys = [wantedSoftKey(track.title, track.artist, track.album)];
+  const sourceId = (track.source_id || track.video_id || "").trim();
+  if (sourceId) keys.push(`sid:${sourceId}`);
+  return keys;
 }
 
 function splitLocalPath(localPath: string): {
@@ -131,12 +160,38 @@ export function SearchResultsCard({
   } | null>(null);
   const [previewUrls, setPreviewUrls] = useState<Record<string, string>>({});
   const [coverIdx, setCoverIdx] = useState(0);
+  const [addingWanted, setAddingWanted] = useState<string | null>(null);
+  const [wantedKeys, setWantedKeys] = useState<Set<string>>(new Set());
   const rootRef = useRef<HTMLDivElement>(null);
   const latestAudio = useRef(audio);
 
   useEffect(() => {
     latestAudio.current = audio;
   }, [audio]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const loadWanted = async () => {
+      const rows = await listWantedTracks();
+      if (cancelled) return;
+      const next = new Set<string>();
+      for (const row of rows) {
+        next.add(wantedSoftKey(row.title, row.artists, row.album));
+        const sid = (row.source_id || row.video_id || "").trim();
+        if (sid) next.add(`sid:${sid}`);
+      }
+      setWantedKeys(next);
+    };
+    void loadWanted();
+    const onChanged = () => {
+      void loadWanted();
+    };
+    window.addEventListener("yubal:ledger-changed", onChanged);
+    return () => {
+      cancelled = true;
+      window.removeEventListener("yubal:ledger-changed", onChanged);
+    };
+  }, []);
 
   useEffect(() => {
     if (!tracksOpen) return;
@@ -231,10 +286,11 @@ export function SearchResultsCard({
     let localN = 0;
     let onlineN = 0;
     for (const track of [...snapshot.tracks].sort((a, b) => a.rank - b.rank)) {
+      const id = trackIdentity(track);
       if (track.matched) {
-        localIds.set(track.video_id, `L${++localN}`);
-      } else {
-        onlineIds.set(track.video_id, String(++onlineN));
+        localIds.set(id, `L${++localN}`);
+      } else if (!isMetaTrack(track)) {
+        onlineIds.set(id, String(++onlineN));
       }
     }
     return { localIds, onlineIds };
@@ -249,6 +305,7 @@ export function SearchResultsCard({
       const rankOf = (track: SearchTrack, playing: boolean) => {
         if (playing) return 0;
         if (track.matched) return 1;
+        if (isMetaTrack(track)) return 4;
         if (track.preview_cached || previewUrls[track.video_id]) return 2;
         return 3;
       };
@@ -260,6 +317,7 @@ export function SearchResultsCard({
     latestAudio.current.registerPlaylist(
       SEARCH_FOLDER,
       displayTracks.flatMap((track) => {
+        if (isMetaTrack(track)) return [];
         const label = labelFor(track);
         if (track.matched && track.local_path) {
           return [
@@ -273,7 +331,7 @@ export function SearchResultsCard({
         const url =
           previewUrls[track.video_id] ??
           (track.preview_cached ? searchPreviewUrl(track.video_id) : null);
-        if (!url) return [];
+        if (!url || !track.video_id) return [];
         return [
           {
             key: `search-preview:${track.video_id}`,
@@ -337,6 +395,7 @@ export function SearchResultsCard({
       snapshot.tracks.filter(
         (track) =>
           !track.matched &&
+          !isMetaTrack(track) &&
           (track.preview_cached || Boolean(previewUrls[track.video_id])),
       ).length,
     [snapshot.tracks, previewUrls],
@@ -361,6 +420,7 @@ export function SearchResultsCard({
   );
 
   const playTrack = async (track: SearchTrack) => {
+    if (isMetaTrack(track) || !track.video_id) return;
     const label = labelFor(track);
     if (track.matched && track.local_path) {
       audio.play(track.local_path, track.local_path, SEARCH_FOLDER);
@@ -397,6 +457,7 @@ export function SearchResultsCard({
       cached_count: snapshot.tracks.filter(
         (item) =>
           !item.matched &&
+          !isMetaTrack(item) &&
           (item.video_id === track.video_id ||
             item.preview_cached ||
             Boolean(previewUrls[item.video_id])),
@@ -414,6 +475,7 @@ export function SearchResultsCard({
     event: React.MouseEvent<HTMLElement>,
     track: SearchTrack,
   ) => {
+    if (isMetaTrack(track) || !track.video_id) return;
     const key = trackKey(track);
     const isCurrent = audio.activeFolder === SEARCH_FOLDER && audio.key === key;
     if (!isCurrent) {
@@ -518,9 +580,46 @@ export function SearchResultsCard({
     window.dispatchEvent(new Event("yubal:ledger-changed"));
   };
 
+  const handleAddWanted = async (track: SearchTrack) => {
+    const id = trackIdentity(track);
+    if (addingWanted) return;
+    if (searchWantedKeys(track).some((key) => wantedKeys.has(key))) return;
+    setAddingWanted(id);
+    const result = await addWantedTrack({
+      title: track.title,
+      artists: track.artist,
+      album: track.album ?? "",
+      source: track.source || track.result_kind || "meta",
+      source_id: track.source_id || track.video_id || "",
+      source_url: track.source_url ?? null,
+      thumbnail_url: track.thumbnail_url,
+      duration_seconds: track.duration_seconds,
+    });
+    setAddingWanted(null);
+    if ("error" in result) {
+      showErrorToast(t("search.addToWanted"), result.error);
+      return;
+    }
+    setWantedKeys((current) => {
+      const next = new Set(current);
+      for (const key of searchWantedKeys(track)) next.add(key);
+      const row = result.data;
+      next.add(wantedSoftKey(row.title, row.artists, row.album));
+      const sid = (row.source_id || row.video_id || "").trim();
+      if (sid) next.add(`sid:${sid}`);
+      return next;
+    });
+    showSuccessToast(t("search.addToWanted"), t("search.addedToWanted"));
+    window.dispatchEvent(new Event("yubal:ledger-changed"));
+  };
+
   return (
     <section className={`flex flex-col ${layout.sectionInner}`}>
-      <h2 className={layout.sectionTitle}>{t("search.sectionTitle")}</h2>
+      <h2 className={layout.sectionTitle}>
+        <PlaylistTitleTooltip kind="search">
+          {t("search.sectionTitle")}
+        </PlaylistTitleTooltip>
+      </h2>
       <div ref={rootRef}>
         <Card shadow="sm" className="bg-content1 overflow-hidden">
           <CardBody className="relative flex flex-row items-center gap-3 overflow-hidden p-0">
@@ -567,7 +666,9 @@ export function SearchResultsCard({
                   audio.togglePlaylistFolder(SEARCH_FOLDER);
                   return;
                 }
-                const first = displayTracks[0];
+                const first = displayTracks.find(
+                  (track) => !isMetaTrack(track),
+                );
                 if (first) void playTrack(first);
               }}
             >
@@ -609,9 +710,12 @@ export function SearchResultsCard({
               aria-expanded={tracksOpen}
             >
               <div className="min-w-0 flex-1">
-                <p className="text-foreground min-w-0 truncate text-sm font-medium">
+                <PlaylistTitleTooltip
+                  kind="search"
+                  className="text-foreground block min-w-0 truncate text-sm font-medium"
+                >
                   {headline}
-                </p>
+                </PlaylistTitleTooltip>
                 <p className={LINE}>{subline}</p>
                 <p className={LINE}>
                   {t("search.lastSearched", {
@@ -703,25 +807,37 @@ export function SearchResultsCard({
             <div className="border-default-200 bg-content2/40 max-h-[50rem] overflow-y-auto overscroll-contain border-t">
               <ul className="divide-default-100 divide-y">
                 {displayTracks.map((track) => {
+                  const id = trackIdentity(track);
+                  const meta = isMetaTrack(track);
                   const current =
+                    !meta &&
                     audio.activeFolder === SEARCH_FOLDER &&
                     audio.key === trackKey(track);
                   const playing = current && audio.playing;
                   const busyPreview = previewing === track.video_id;
                   const busyDownload = downloading === track.video_id;
+                  const busyWanted = addingWanted === id;
+                  const inWanted = searchWantedKeys(track).some((key) =>
+                    wantedKeys.has(key),
+                  );
                   const cached =
+                    !meta &&
                     !track.matched &&
                     (track.preview_cached ||
                       Boolean(previewUrls[track.video_id]));
                   const displayIndex = track.matched
-                    ? (numbered.localIds.get(track.video_id) ?? "L?")
-                    : (numbered.onlineIds.get(track.video_id) ?? "?");
+                    ? (numbered.localIds.get(id) ?? "L?")
+                    : meta
+                      ? ""
+                      : (numbered.onlineIds.get(id) ?? "?");
                   const downloadClass = track.matched
                     ? `${ACTION_BTN} text-success opacity-100`
                     : cached
                       ? `${ACTION_BTN} text-warning hover:text-warning`
                       : `${ACTION_BTN} hover:text-primary`;
-                  const local = localMatches[track.video_id]?.track;
+                  const local = track.video_id
+                    ? localMatches[track.video_id]?.track
+                    : undefined;
                   const enrichLabel =
                     local?.tier === "premium"
                       ? t("sync.tierOptimal")
@@ -738,138 +854,208 @@ export function SearchResultsCard({
                         : "hover:text-primary";
                   const rowLabel = labelFor(track);
                   return (
-                    <li
-                      key={track.video_id}
-                      className="relative h-8 overflow-hidden"
-                    >
+                    <li key={id} className="relative h-8 overflow-hidden">
                       <div
-                        className={`${TRACK_ROW_GRID} text-foreground cursor-pointer`}
-                        role="button"
-                        tabIndex={0}
-                        onClick={(event) => {
-                          onRowClick(event, track);
-                        }}
-                        onKeyDown={(event) => {
-                          if (event.key === "Enter" || event.key === " ") {
-                            event.preventDefault();
-                            onRowClick(event as never, track);
-                          }
-                        }}
+                        className={`${TRACK_ROW_GRID} ${
+                          meta
+                            ? "text-foreground-400"
+                            : "text-foreground cursor-pointer"
+                        }`}
+                        role={meta ? undefined : "button"}
+                        tabIndex={meta ? undefined : 0}
+                        onClick={
+                          meta
+                            ? undefined
+                            : (event) => {
+                                onRowClick(event, track);
+                              }
+                        }
+                        onKeyDown={
+                          meta
+                            ? undefined
+                            : (event) => {
+                                if (
+                                  event.key === "Enter" ||
+                                  event.key === " "
+                                ) {
+                                  event.preventDefault();
+                                  onRowClick(event as never, track);
+                                }
+                              }
+                        }
                         aria-label={
-                          current
-                            ? t("sync.seekTrack")
-                            : `${t("sync.playTrack")}: ${rowLabel}`
+                          meta
+                            ? rowLabel
+                            : current
+                              ? t("sync.seekTrack")
+                              : `${t("sync.playTrack")}: ${rowLabel}`
                         }
                         title={rowLabel}
                       >
-                          <span className={TRACK_INDEX}>
-                            <span className={TRACK_INDEX_ICON} aria-hidden>
-                              {playing ? (
-                                <AudioLinesIcon className="text-primary h-3 w-3" />
-                              ) : busyPreview ? (
-                                <Spinner size="sm" className="scale-75" />
-                              ) : null}
-                            </span>
-                            <span className="min-w-[1.25rem] text-right">
-                              {displayIndex}
-                            </span>
+                        <span className={TRACK_INDEX}>
+                          <span className={TRACK_INDEX_ICON} aria-hidden>
+                            {playing ? (
+                              <AudioLinesIcon className="text-primary h-3 w-3" />
+                            ) : busyPreview ? (
+                              <Spinner size="sm" className="scale-75" />
+                            ) : null}
                           </span>
-                          <TrackTextCells
-                            title={track.title}
-                            artist={track.artist}
-                            album={local?.album ?? track.album}
-                            albumArtist={local?.album_artist}
-                          />
+                          <span className="min-w-[1.25rem] text-right">
+                            {displayIndex}
+                          </span>
+                        </span>
+                        <TrackTextCells
+                          title={track.title}
+                          artist={track.artist}
+                          album={local?.album ?? track.album}
+                          albumArtist={local?.album_artist}
+                        />
                         <div
                           className={TRACK_ACTIONS}
                           onClick={(event) => event.stopPropagation()}
                           onKeyDown={(event) => event.stopPropagation()}
                         >
-                          {track.matched && track.local_path ? (
-                            <Button
-                              variant="light"
-                              size="sm"
-                              isIconOnly
-                              isLoading={loadingEdit === track.video_id}
-                              isDisabled={
-                                Boolean(loadingEdit) &&
-                                loadingEdit !== track.video_id
-                              }
-                              className={`${ACTION_BTN} hover:text-primary`}
-                              aria-label={t("sync.editTrackTags")}
-                              title={t("sync.editTrackTags")}
-                              onPress={() => {
-                                void openMatchedEditor(track);
-                              }}
-                            >
-                              <PencilIcon className="h-3.5 w-3.5" />
-                            </Button>
-                          ) : null}
-                          {local ? (
-                            <Button
-                              variant="light"
-                              size="sm"
-                              isIconOnly
-                              isLoading={enriching === track.video_id}
-                              isDisabled={
-                                local.tier === "premium" ||
-                                (Boolean(enriching) &&
-                                  enriching !== track.video_id)
-                              }
-                              className={`${ACTION_BTN} ${enrichClass}`}
-                              aria-label={enrichLabel}
-                              title={enrichLabel}
-                              onPress={() => {
-                                void handleEnrichTrack(track.video_id);
-                              }}
-                            >
-                              <SparklesIcon className="h-3.5 w-3.5" />
-                            </Button>
-                          ) : null}
-                          <Button
-                            as="a"
-                            href={`https://music.youtube.com/watch?v=${encodeURIComponent(track.video_id)}`}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            variant="light"
-                            size="sm"
-                            isIconOnly
-                            className={`${ACTION_BTN} hover:text-primary`}
-                            aria-label={t("sync.openInYtm")}
-                            title={t("sync.openInYtm")}
-                          >
-                            <ExternalLinkIcon className="h-3.5 w-3.5" />
-                          </Button>
-                          <Button
-                            variant="light"
-                            size="sm"
-                            isIconOnly
-                            isLoading={busyDownload}
-                            isDisabled={
-                              track.matched ||
-                              (Boolean(downloading) && !busyDownload)
-                            }
-                            className={downloadClass}
-                            aria-label={
-                              track.matched
-                                ? t("search.downloaded")
-                                : cached
-                                  ? t("search.importCached")
-                                  : t("search.download")
-                            }
-                            title={
-                              track.matched
-                                ? t("search.downloaded")
-                                : cached
-                                  ? t("search.importCached")
-                                  : t("search.download")
-                            }
-                            onPress={() => {
-                              void handleDownload(track);
-                            }}
-                          >
-                            <DownloadIcon className="h-3.5 w-3.5" />
-                          </Button>
+                          {meta ? (
+                            <>
+                              {track.source_url ? (
+                                <Button
+                                  as="a"
+                                  href={track.source_url}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  variant="light"
+                                  size="sm"
+                                  isIconOnly
+                                  className={`${ACTION_BTN} hover:text-primary`}
+                                  aria-label={t("search.openSource")}
+                                  title={t("search.openSource")}
+                                >
+                                  <ExternalLinkIcon className="h-3.5 w-3.5" />
+                                </Button>
+                              ) : null}
+                              <Button
+                                variant="light"
+                                size="sm"
+                                isIconOnly
+                                isLoading={busyWanted}
+                                isDisabled={
+                                  inWanted ||
+                                  (Boolean(addingWanted) && !busyWanted)
+                                }
+                                className={
+                                  inWanted
+                                    ? `${ACTION_BTN} text-danger opacity-100`
+                                    : `${ACTION_BTN} hover:text-danger`
+                                }
+                                aria-label={
+                                  inWanted
+                                    ? t("search.addedToWanted")
+                                    : t("search.addToWanted")
+                                }
+                                title={
+                                  inWanted
+                                    ? t("search.addedToWanted")
+                                    : t("search.addToWanted")
+                                }
+                                onPress={() => {
+                                  void handleAddWanted(track);
+                                }}
+                              >
+                                <HeartIcon
+                                  className="h-3.5 w-3.5"
+                                  fill={inWanted ? "currentColor" : "none"}
+                                />
+                              </Button>
+                            </>
+                          ) : (
+                            <>
+                              {track.matched && track.local_path ? (
+                                <Button
+                                  variant="light"
+                                  size="sm"
+                                  isIconOnly
+                                  isLoading={loadingEdit === track.video_id}
+                                  isDisabled={
+                                    Boolean(loadingEdit) &&
+                                    loadingEdit !== track.video_id
+                                  }
+                                  className={`${ACTION_BTN} hover:text-primary`}
+                                  aria-label={t("sync.editTrackTags")}
+                                  title={t("sync.editTrackTags")}
+                                  onPress={() => {
+                                    void openMatchedEditor(track);
+                                  }}
+                                >
+                                  <PencilIcon className="h-3.5 w-3.5" />
+                                </Button>
+                              ) : null}
+                              {local ? (
+                                <Button
+                                  variant="light"
+                                  size="sm"
+                                  isIconOnly
+                                  isLoading={enriching === track.video_id}
+                                  isDisabled={
+                                    local.tier === "premium" ||
+                                    (Boolean(enriching) &&
+                                      enriching !== track.video_id)
+                                  }
+                                  className={`${ACTION_BTN} ${enrichClass}`}
+                                  aria-label={enrichLabel}
+                                  title={enrichLabel}
+                                  onPress={() => {
+                                    void handleEnrichTrack(track.video_id);
+                                  }}
+                                >
+                                  <SparklesIcon className="h-3.5 w-3.5" />
+                                </Button>
+                              ) : null}
+                              <Button
+                                as="a"
+                                href={`https://music.youtube.com/watch?v=${encodeURIComponent(track.video_id)}`}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                variant="light"
+                                size="sm"
+                                isIconOnly
+                                className={`${ACTION_BTN} hover:text-primary`}
+                                aria-label={t("sync.openInYtm")}
+                                title={t("sync.openInYtm")}
+                              >
+                                <ExternalLinkIcon className="h-3.5 w-3.5" />
+                              </Button>
+                              <Button
+                                variant="light"
+                                size="sm"
+                                isIconOnly
+                                isLoading={busyDownload}
+                                isDisabled={
+                                  track.matched ||
+                                  (Boolean(downloading) && !busyDownload)
+                                }
+                                className={downloadClass}
+                                aria-label={
+                                  track.matched
+                                    ? t("search.downloaded")
+                                    : cached
+                                      ? t("search.importCached")
+                                      : t("search.download")
+                                }
+                                title={
+                                  track.matched
+                                    ? t("search.downloaded")
+                                    : cached
+                                      ? t("search.importCached")
+                                      : t("search.download")
+                                }
+                                onPress={() => {
+                                  void handleDownload(track);
+                                }}
+                              >
+                                <DownloadIcon className="h-3.5 w-3.5" />
+                              </Button>
+                            </>
+                          )}
                         </div>
                       </div>
                     </li>

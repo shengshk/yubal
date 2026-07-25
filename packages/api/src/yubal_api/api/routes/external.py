@@ -12,6 +12,7 @@ from yubal_api.api.deps import (
     ExternalLibraryServiceDep,
     LibraryHealthServiceDep,
     PreferencesStoreDep,
+    SyncPipelineServiceDep,
 )
 from yubal_api.services.external_library_service import (
     DeletePlaylistResult,
@@ -43,12 +44,14 @@ class ExternalPlaylistResponse(BaseModel):
     show_junk: bool
     unmatched_count: int
     matched_count: int
+    meta_verified_count: int = 0
     cloud: int
     local: int
     offline: int
     exclusive: int
     shared: int
     hardlink: int
+    cover_track_path: str | None = None
     enabled: bool
     max_items: int
     sync_jitter_seconds: int
@@ -102,6 +105,7 @@ class SyncPlaylistRequest(BaseModel):
 
     enrich: bool = True
     raw_match: bool = True
+    verify_meta: bool = True
     junk_match: bool = False
 
 
@@ -112,6 +116,11 @@ class SyncPlaylistResponse(BaseModel):
     errors: int
     deferred: int
     rejected: int
+    meta_checked: int = 0
+    meta_verified: int = 0
+    enriched: int = 0
+    upgraded: int = 0
+    asset_errors: int = 0
 
 
 class DeletePlaylistResponse(BaseModel):
@@ -139,6 +148,18 @@ class MatchCandidateResponse(BaseModel):
     score: float = 0
 
 
+class MetaCandidateResponse(BaseModel):
+    source: str
+    source_id: str
+    title: str
+    artists: str
+    album: str = ""
+    source_url: str | None = None
+    thumbnail_url: str | None = None
+    duration_seconds: int | None = None
+    score: float = 0
+
+
 class MatchOneResponse(BaseModel):
     rel_path: str
     matched: bool
@@ -146,12 +167,30 @@ class MatchOneResponse(BaseModel):
     ingested: bool = False
     mode_used: Literal["strict", "relaxed"] = "strict"
     candidates: list[MatchCandidateResponse] = Field(default_factory=list)
+    meta_candidates: list[MetaCandidateResponse] = Field(default_factory=list)
 
 
 class MatchAcceptRequest(BaseModel):
     rel_path: str
     video_id: str
     score: float | None = None
+
+
+class MetaAcceptRequest(BaseModel):
+    rel_path: str
+    source: str
+    source_id: str
+    title: str
+    artists: str
+    album: str = ""
+    source_url: str | None = None
+    thumbnail_url: str | None = None
+
+
+class MetaAcceptResponse(BaseModel):
+    rel_path: str
+    verified: bool
+    meta_status: str = "verified"
 
 
 class ExternalTrackResponse(BaseModel):
@@ -168,10 +207,15 @@ class ExternalTrackResponse(BaseModel):
     junk_kind: str | None = None
     cover_url: str | None = None
     cover_source: str | None = None
+    has_embedded_cover: bool = False
     album_artist: str | None = None
     year: str | None = None
     track_number: int | None = None
     in_direct: bool = False
+    meta_status: str = "pending"
+    meta_source: str | None = None
+    meta_source_id: str | None = None
+    meta_source_url: str | None = None
 
 
 def _to_playlist_response(v: ExternalPlaylistView) -> ExternalPlaylistResponse:
@@ -182,12 +226,14 @@ def _to_playlist_response(v: ExternalPlaylistView) -> ExternalPlaylistResponse:
         show_junk=v.show_junk,
         unmatched_count=v.unmatched_count,
         matched_count=v.matched_count,
+        meta_verified_count=v.meta_verified_count,
         cloud=v.cloud,
         local=v.local,
         offline=v.offline,
         exclusive=v.exclusive,
         shared=v.shared,
         hardlink=v.hardlink,
+        cover_track_path=v.cover_track_path,
         enabled=v.enabled,
         max_items=v.max_items,
         sync_jitter_seconds=v.sync_jitter_seconds,
@@ -217,6 +263,11 @@ def _to_match_batch_response(r: MatchBatchResult) -> MatchBatchResponse:
         matched=r.matched,
         deferred=r.deferred,
         rejected=r.rejected,
+        meta_checked=r.meta_checked,
+        meta_verified=r.meta_verified,
+        enriched=r.enriched,
+        upgraded=r.upgraded,
+        asset_errors=r.asset_errors,
         errors=r.errors,
     )
 
@@ -258,10 +309,15 @@ def _to_track_response(v: PlaylistTrackView) -> ExternalTrackResponse:
         junk_kind=v.junk_kind,
         cover_url=v.cover_url,
         cover_source=v.cover_source,
+        has_embedded_cover=v.has_embedded_cover,
         album_artist=v.album_artist,
         year=v.year,
         track_number=v.track_number,
         in_direct=v.in_direct,
+        meta_status=v.meta_status,
+        meta_source=v.meta_source,
+        meta_source_id=v.meta_source_id,
+        meta_source_url=v.meta_source_url,
     )
 
 
@@ -307,9 +363,7 @@ def update_playlist_settings(
     return _to_playlist_response(view)
 
 
-@router.get(
-    "/playlists/{dir_name}/tracks", response_model=list[ExternalTrackResponse]
-)
+@router.get("/playlists/{dir_name}/tracks", response_model=list[ExternalTrackResponse])
 def list_playlist_tracks(
     dir_name: str,
     service: ExternalLibraryServiceDep,
@@ -326,25 +380,27 @@ def list_playlist_tracks(
 @router.post("/playlists/{dir_name}/sync", response_model=SyncPlaylistResponse)
 async def sync_playlist(
     dir_name: str,
-    service: ExternalLibraryServiceDep,
-    health: LibraryHealthServiceDep,
+    pipeline: SyncPipelineServiceDep,
     prefs: PreferencesStoreDep,
     body: SyncPlaylistRequest | None = None,
 ) -> SyncPlaylistResponse:
     _ensure_external_enabled(prefs)
     req = body if body is not None else SyncPlaylistRequest()
-    if not (req.enrich or req.raw_match or req.junk_match):
+    if not (req.enrich or req.raw_match or req.verify_meta or req.junk_match):
         raise HTTPException(
             status_code=400,
-            detail="at least one of enrich, raw_match, junk_match is required",
+            detail=(
+                "at least one of enrich, raw_match, verify_meta, junk_match is required"
+            ),
         )
     try:
         result = await asyncio.to_thread(
-            service.sync_playlist,
+            pipeline.sync_external_playlist,
             dir_name,
-            health,
+            trigger="playlist",
             enrich=req.enrich,
             raw_match=req.raw_match,
+            verify_meta=req.verify_meta,
             junk_match=req.junk_match,
         )
     except ValueError as e:
@@ -365,6 +421,7 @@ async def delete_playlist(
         pattern=(
             "^(forget_matched|"
             "delete_matched|move_matched_to_direct|add_matched_to_direct|"
+            "add_meta_verified_to_wanted|"
             "delete_unmatched|delete_all|"
             "clear_offline_delete|clear_offline_to_raw_delete)$"
         ),
@@ -382,6 +439,8 @@ async def delete_playlist(
         detail = str(e)
         code = 400 if "read-only" in detail or "unknown delete" in detail else 404
         raise HTTPException(status_code=code, detail=detail) from e
+    except RuntimeError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     return _to_delete_playlist_response(result)
 
 
@@ -430,24 +489,23 @@ async def match_one(
 ) -> MatchOneResponse:
     """Attempt a single match + ingest for one raw track by rel_path.
 
-    Manual match resets backoff counters first (plan: manual → from zero).
-    Incomplete tags: scrape once (file write when mutable, index-only when
-    readonly), then match.
+    Manual match resets backoff first. Incomplete tags: fill empty fields via
+    QQ/MB (never YTM), then YTM match. On miss returns YTM + meta candidates.
     """
     _ensure_external_enabled(prefs)
     health.ensure_healthy()
     try:
-        matched, video_id, ingested, mode_used, candidates = await asyncio.to_thread(
+        result = await asyncio.to_thread(
             service.match_one_manual, body.rel_path, mode=body.mode
         )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
     return MatchOneResponse(
         rel_path=body.rel_path,
-        matched=matched,
-        video_id=video_id,
-        ingested=ingested,
-        mode_used=mode_used,  # type: ignore[arg-type]
+        matched=result.matched,
+        video_id=result.video_id,
+        ingested=result.ingested,
+        mode_used=result.mode_used,  # type: ignore[arg-type]
         candidates=[
             MatchCandidateResponse(
                 video_id=c.video_id,
@@ -459,7 +517,21 @@ async def match_one(
                 artist_score=c.artist_score,
                 score=c.score,
             )
-            for c in candidates
+            for c in result.ytm_candidates
+        ],
+        meta_candidates=[
+            MetaCandidateResponse(
+                source=c.source,
+                source_id=c.source_id,
+                title=c.title,
+                artists=c.artists,
+                album=c.album,
+                source_url=c.source_url,
+                thumbnail_url=c.thumbnail_url,
+                duration_seconds=c.duration_seconds,
+                score=c.score,
+            )
+            for c in result.meta_candidates
         ],
     )
 
@@ -491,6 +563,37 @@ async def accept_match(
     )
 
 
+@router.post("/meta/accept", response_model=MetaAcceptResponse)
+async def accept_meta(
+    body: MetaAcceptRequest,
+    service: ExternalLibraryServiceDep,
+    prefs: PreferencesStoreDep,
+) -> MetaAcceptResponse:
+    """Accept a Wanted-source hit as tags-verified (no YTM video_id)."""
+    _ensure_external_enabled(prefs)
+    try:
+        ok = await asyncio.to_thread(
+            service.accept_meta_candidate,
+            body.rel_path,
+            source=body.source,
+            source_id=body.source_id,
+            title=body.title,
+            artists=body.artists,
+            album=body.album,
+            source_url=body.source_url,
+            thumbnail_url=body.thumbnail_url,
+        )
+    except ValueError as e:
+        detail = str(e)
+        code = 404 if "not found" in detail else 400
+        raise HTTPException(status_code=code, detail=detail) from e
+    return MetaAcceptResponse(
+        rel_path=body.rel_path,
+        verified=ok,
+        meta_status="verified" if ok else "pending",
+    )
+
+
 class DeleteTrackResponse(BaseModel):
     deleted_files: int = 0
     deleted_locations: int = 0
@@ -499,9 +602,7 @@ class DeleteTrackResponse(BaseModel):
     ok: bool = True
 
 
-@router.delete(
-    "/playlists/{dir_name}/tracks", response_model=DeleteTrackResponse
-)
+@router.delete("/playlists/{dir_name}/tracks", response_model=DeleteTrackResponse)
 async def delete_playlist_track(
     dir_name: str,
     service: ExternalLibraryServiceDep,
@@ -572,9 +673,7 @@ def reset_match(
         video_id=row.video_id,
         match_status=row.match_status,
         is_raw=True,
-        tags_complete=service.tags_complete_enough(
-            row.title, row.artists, row.album
-        ),
+        tags_complete=service.tags_complete_enough(row.title, row.artists, row.album),
         is_junk=False,
         junk_kind=None,
         album_artist=row.album_artist,

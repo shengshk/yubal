@@ -1,14 +1,20 @@
 import { basePath } from "@/lib/base-path";
+import { sharedJsonGet } from "./shared-get";
 
 /** "raw" = scanned but unmatched (no video_id); others mirror sync-ledger tiers. */
 export type ExternalTrackTier = "raw" | "draft" | "complete" | "premium";
-export type ExternalMatchStatus = "matched" | "unmatched" | "pending" | "rejected";
+export type ExternalMatchStatus =
+  | "matched"
+  | "unmatched"
+  | "pending"
+  | "rejected";
 
 export type ExternalDeleteMode =
   | "forget_matched"
   | "delete_matched"
   | "move_matched_to_direct"
   | "add_matched_to_direct"
+  | "add_meta_verified_to_wanted"
   | "delete_unmatched"
   | "delete_all"
   | "clear_offline_delete"
@@ -21,12 +27,14 @@ export type ExternalPlaylist = {
   show_junk: boolean;
   unmatched_count: number;
   matched_count: number;
+  meta_verified_count: number;
   cloud: number;
   local: number;
   offline: number;
   exclusive: number;
   shared: number;
   hardlink: number;
+  cover_track_path?: string | null;
   enabled: boolean;
   max_items: number;
   sync_jitter_seconds: number;
@@ -67,6 +75,7 @@ export type ExternalTrack = {
   tier?: ExternalTrackTier | null;
   cover_source?: string | null;
   cover_url?: string | null;
+  has_embedded_cover?: boolean;
   exists?: boolean;
   is_raw?: boolean;
   tags_complete?: boolean;
@@ -76,6 +85,10 @@ export type ExternalTrack = {
   junk_kind?: "rw" | "ro" | null;
   /** Already present under Direct (catalog); add button should stay disabled. */
   in_direct?: boolean;
+  meta_status?: "pending" | "verified" | "rejected" | string;
+  meta_source?: string | null;
+  meta_source_id?: string | null;
+  meta_source_url?: string | null;
 };
 
 export type ExternalScanResult = {
@@ -97,6 +110,18 @@ export type ExternalMatchCandidate = {
   score?: number;
 };
 
+export type ExternalMetaCandidate = {
+  source: string;
+  source_id: string;
+  title: string;
+  artists: string;
+  album?: string;
+  source_url?: string | null;
+  thumbnail_url?: string | null;
+  duration_seconds?: number | null;
+  score?: number;
+};
+
 export type ExternalMatchResult = {
   rel_path?: string;
   matched: boolean;
@@ -104,6 +129,7 @@ export type ExternalMatchResult = {
   ingested?: boolean;
   mode_used?: "strict" | "relaxed";
   candidates?: ExternalMatchCandidate[];
+  meta_candidates?: ExternalMetaCandidate[];
   match_status?: ExternalMatchStatus;
 };
 
@@ -122,6 +148,11 @@ export type ExternalSyncResult = {
   errors: number;
   deferred: number;
   rejected: number;
+  meta_checked: number;
+  meta_verified: number;
+  enriched: number;
+  upgraded: number;
+  asset_errors: number;
 };
 
 export type ExternalDeleteResult = {
@@ -146,13 +177,11 @@ async function errorFromResponse(res: Response): Promise<{ error: string }> {
 }
 
 export async function listExternalPlaylists(): Promise<ExternalPlaylist[]> {
-  const res = await fetch(`${basePath}/api/external/playlists`, {
-    credentials: "include",
-  });
-  if (!res.ok) return [];
-  const data = (await res.json()) as
-    | ExternalPlaylist[]
-    | { items?: ExternalPlaylist[] };
+  const result = await sharedJsonGet<
+    ExternalPlaylist[] | { items?: ExternalPlaylist[] }
+  >(`${basePath}/api/external/playlists`);
+  if (!result.ok || !result.data) return [];
+  const data = result.data;
   return Array.isArray(data) ? data : (data.items ?? []);
 }
 
@@ -176,14 +205,11 @@ export async function updateExternalPlaylist(
 export async function listExternalPlaylistTracks(
   dirName: string,
 ): Promise<ExternalTrack[]> {
-  const res = await fetch(
-    `${basePath}/api/external/playlists/${encodeURIComponent(dirName)}/tracks`,
-    { credentials: "include" },
-  );
-  if (!res.ok) return [];
-  const data = (await res.json()) as
-    | ExternalTrack[]
-    | { items?: ExternalTrack[] };
+  const result = await sharedJsonGet<
+    ExternalTrack[] | { items?: ExternalTrack[] }
+  >(`${basePath}/api/external/playlists/${encodeURIComponent(dirName)}/tracks`);
+  if (!result.ok || !result.data) return [];
+  const data = result.data;
   return Array.isArray(data) ? data : (data.items ?? []);
 }
 
@@ -203,12 +229,14 @@ export async function syncExternalPlaylist(
   actions?: {
     enrich?: boolean;
     raw_match?: boolean;
+    verify_meta?: boolean;
     junk_match?: boolean;
   },
 ): Promise<ExternalSyncResult | { error: string }> {
   const body = {
     enrich: actions?.enrich ?? true,
     raw_match: actions?.raw_match ?? true,
+    verify_meta: actions?.verify_meta ?? true,
     junk_match: actions?.junk_match ?? false,
   };
   const res = await fetch(
@@ -279,6 +307,27 @@ export async function acceptExternalMatch(
   });
   if (!res.ok) return errorFromResponse(res);
   return (await res.json()) as ExternalMatchResult;
+}
+
+/** Accept a Wanted-source hit as tags-verified (no YTM video_id). */
+export async function acceptExternalMeta(body: {
+  rel_path: string;
+  source: string;
+  source_id: string;
+  title: string;
+  artists: string;
+  album?: string;
+  source_url?: string | null;
+  thumbnail_url?: string | null;
+}): Promise<{ verified: boolean; meta_status: string } | { error: string }> {
+  const res = await fetch(`${basePath}/api/external/meta/accept`, {
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) return errorFromResponse(res);
+  return (await res.json()) as { verified: boolean; meta_status: string };
 }
 
 export type ExternalTrackDeleteMode =

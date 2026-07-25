@@ -1,16 +1,20 @@
 import type { Job } from "@/api/jobs";
-import { listSubscriptionTracks, type Subscription } from "@/api/subscriptions";
-import type { SyncLedgerEntry, SyncTrackItem } from "@/api/sync-ledger";
-import { listSyncTracks } from "@/api/sync-ledger";
+import type { Subscription } from "@/api/subscriptions";
+import type { SyncLedgerEntry } from "@/api/sync-ledger";
 import { albumCoverUrl, playlistCoverUrl, trackCoverUrl } from "@/api/library";
 import { AudioSpectrum } from "@/features/sync/audio-spectrum";
 import { LedgerTrackList } from "@/features/sync/ledger-track-list";
 import { useLibraryAudio } from "@/features/sync/library-audio";
 import type { PlayMode } from "@/features/sync/play-mode";
 import { PlaylistStatsLine } from "@/features/sync/playlist-stats-line";
-import { SYNC_ACTION_BTN, SYNC_CARD_ACTIONS } from "@/features/sync/track-columns";
+import { PlaylistTitleTooltip } from "@/features/sync/playlist-title-tooltip";
+import {
+  SYNC_ACTION_BTN,
+  SYNC_CARD_ACTIONS,
+} from "@/features/sync/track-columns";
 import { formatDateTime } from "@/lib/format";
 import { isActive, isRunning } from "@/lib/job-status";
+import { isLikedMusicUrl } from "@/lib/subscription-labels";
 import { Button, Card, CardBody, Image, Progress } from "@heroui/react";
 import {
   CaptionsIcon,
@@ -28,7 +32,7 @@ import {
   SkipForwardIcon,
   Trash2Icon,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 type Props = {
@@ -84,7 +88,7 @@ function PlayModeIcon({ mode }: { mode: PlayMode }) {
   }
 }
 
-function PlaybackTransport({
+export function PlaybackTransport({
   folder,
   isPlayingHere,
 }: {
@@ -203,8 +207,13 @@ export function LedgerCard({
   const active = activeJob ? isActive(activeJob.status) : false;
   const isSubscription = entry.kind === "subscription" && !!subscription;
   const isDirect = entry.kind === "direct";
+  const isLikedMusic = isLikedMusicUrl(subscription?.url);
 
-  const title = subscription?.name ?? entry.title;
+  const title = isDirect
+    ? t("sync.downloadCenterTitle")
+    : isLikedMusic
+      ? t("sync.likedCardTitle")
+      : (subscription?.name ?? entry.title);
   const folder = subscription?.save_folder ?? entry.save_folder;
   const thumb = subscription?.thumbnail_url ?? entry.thumbnail_url;
 
@@ -214,202 +223,39 @@ export function LedgerCard({
   // Shared: ≥2 subscriptions on this folder, or Direct folder also used by a sub.
   const folderShared = isDirect ? folderSubUsers >= 1 : folderSubUsers >= 2;
 
-  // Live stats combine on-disk files with Direct/subscription list membership.
-  const [subStats, setSubStats] = useState<{
-    synced: number;
-    total: number;
-    exclusive: number;
-    shared: number;
-    hardlink: number;
-    offline: number;
-    blocked: number;
-    missing: number;
-  } | null>(null);
-  const [directStats, setDirectStats] = useState<{
-    local: number;
-    cloud: number;
-    offline: number;
-    blocked: number;
-    exclusive: number;
-    shared: number;
-    hardlink: number;
-    missing: number;
-  } | null>(null);
-  // Direct has no meaningful playlist thumbnail; use its on-disk tracks' art.
-  // Subscriptions keep the same list so a dead remote thumb can fall back to
-  // embedded / YTM cover from the first present track.
-  const [coverTracks, setCoverTracks] = useState<SyncTrackItem[]>([]);
-
-  const loadStats = useCallback(() => {
-    if (!folder) {
-      setSubStats(null);
-      setDirectStats(null);
-      setCoverTracks([]);
-      return;
-    }
-
-    if (isSubscription && subscription?.id) {
-      setDirectStats(null);
-      void Promise.all([
-        listSyncTracks(folder),
-        listSubscriptionTracks(subscription.id),
-      ]).then(([files, members]) => {
-        const present = files.filter(
-          (f) => f.exists && f.storage !== "missing",
-        );
-        const presentIds = new Set(
-          present.map((f) => f.video_id).filter(Boolean) as string[],
-        );
-        const activeMembers = members.filter(
-          (m) => m.membership_status === "active",
-        );
-        const offlineMembers = members.filter(
-          (m) => m.membership_status === "offline",
-        );
-        const blockedMembers = members.filter(
-          (m) => m.membership_status === "blocked",
-        );
-        const hardlink = present.filter((f) => f.storage === "hardlink").length;
-        const real = present.length - hardlink;
-        // 云端 comes from ledger.total_count (recorded at trusted sync), not
-        // from membership math. loadStats only refreshes local/policy counters.
-        setSubStats({
-          synced: present.length,
-          total: 0, // unused — UI reads entry.total_count for 云端
-          hardlink,
-          exclusive: folderShared ? 0 : real,
-          shared: folderShared ? real : 0,
-          offline: offlineMembers.length,
-          blocked: blockedMembers.length,
-          missing: activeMembers.filter(
-            (m) => !presentIds.has(m.catalog_video_id || m.video_id),
-          ).length,
-        });
-        setCoverTracks(present);
-      });
-      return;
-    }
-
-    if (isDirect) {
-      setSubStats(null);
-      void listSyncTracks(folder).then((files) => {
-        const present = files.filter(
-          (f) => f.exists && f.storage !== "missing",
-        );
-        const presentIds = new Set(
-          present.map((f) => f.video_id).filter(Boolean) as string[],
-        );
-        const offlineMembers = files.filter(
-          (f) => f.membership_status === "offline",
-        );
-        const blockedMembers = files.filter(
-          (f) => f.membership_status === "blocked",
-        );
-        const activeMembers = files.filter(
-          (f) =>
-            f.membership_status !== "offline" &&
-            f.membership_status !== "blocked",
-        );
-        const listMembers = files.filter(
-          (f) => f.membership_status !== "offline",
-        );
-        const hardlink = present.filter((f) => f.storage === "hardlink").length;
-        const real = present.length - hardlink;
-        setDirectStats({
-          local: present.length,
-          cloud: listMembers.length,
-          offline: offlineMembers.length,
-          blocked: blockedMembers.length,
-          hardlink,
-          exclusive: folderShared ? 0 : real,
-          shared: folderShared ? real : 0,
-          missing: activeMembers.filter(
-            (f) => f.video_id && !presentIds.has(f.video_id),
-          ).length,
-        });
-        // Backend returns newest downloads first for Direct.
-        setCoverTracks(present);
-      });
-      return;
-    }
-    setCoverTracks([]);
-
-    setSubStats(null);
-    setDirectStats(null);
-  }, [isSubscription, isDirect, subscription?.id, folder, folderShared]);
-
-  useEffect(() => {
-    loadStats();
-  }, [
-    loadStats,
-    subscription?.last_synced_at,
-    entry.last_synced_at,
+  // The ledger endpoint now supplies the compact card summary. Full track
+  // lists are fetched only by LedgerTrackList when the card is expanded.
+  const ownership = ownershipCounts(
     entry.synced_count,
     entry.hardlink_count,
-  ]);
+    folderShared,
+  );
+  const syncedCount = entry.synced_count;
+  const totalCount = entry.total_count;
+  const offlineCount = entry.offline_count ?? 0;
+  const blockedCount = entry.blocked_count ?? 0;
+  const missing = entry.missing_count ?? 0;
 
-  useEffect(() => {
-    const onLedgerChanged = () => loadStats();
-    window.addEventListener("yubal:ledger-changed", onLedgerChanged);
-    return () =>
-      window.removeEventListener("yubal:ledger-changed", onLedgerChanged);
-  }, [loadStats]);
-
-  const useSub = isSubscription && subStats !== null;
-  const useDirect = isDirect && directStats !== null;
-  const ownership = useSub
-    ? {
-        exclusive: subStats.exclusive,
-        shared: subStats.shared,
-        hardlink: subStats.hardlink,
-      }
-    : useDirect
-      ? {
-          exclusive: directStats.exclusive,
-          shared: directStats.shared,
-          hardlink: directStats.hardlink,
-        }
-      : ownershipCounts(entry.synced_count, entry.hardlink_count, folderShared);
-  const syncedCount = useSub
-    ? subStats.synced
-    : useDirect
-      ? directStats.local
-      : entry.synced_count;
-  const totalCount = useSub
-    ? entry.total_count
-    : useDirect
-      ? directStats.cloud
-      : entry.total_count;
-  const offlineCount = useSub
-    ? subStats.offline
-    : useDirect
-      ? directStats.offline
-      : 0;
-  const blockedCount = useSub
-    ? subStats.blocked
-    : useDirect
-      ? directStats.blocked
-      : 0;
-  const missing = useSub
-    ? subStats.missing
-    : useDirect
-      ? directStats.missing
-      : 0;
-
-  const statsItems =
-    isSubscription || isDirect
+  const statsItems = isSubscription
+    ? [
+        { label: t("sync.statCloud"), value: totalCount },
+        { label: t("sync.statLocal"), value: syncedCount },
+        { label: t("sync.statBlocked"), value: blockedCount },
+        { label: t("sync.statNotInCloudPlaylist"), value: offlineCount },
+        {
+          label: t("sync.statIdInvalid"),
+          value: entry.id_invalid_count ?? 0,
+        },
+        { label: t("sync.statExclusive"), value: ownership.exclusive },
+        { label: t("sync.statShared"), value: ownership.shared },
+        { label: t("sync.statHardlink"), value: ownership.hardlink },
+      ]
+    : isDirect
       ? [
           { label: t("sync.statCloud"), value: totalCount },
           { label: t("sync.statLocal"), value: syncedCount },
           { label: t("sync.statBlocked"), value: blockedCount },
-          {
-            label: t(
-              isSubscription
-                ? "sync.statNotInCloudPlaylist"
-                : "sync.statIdInvalid",
-            ),
-            value: offlineCount,
-          },
+          { label: t("sync.statIdInvalid"), value: offlineCount },
           { label: t("sync.statExclusive"), value: ownership.exclusive },
           { label: t("sync.statShared"), value: ownership.shared },
           { label: t("sync.statHardlink"), value: ownership.hardlink },
@@ -525,12 +371,6 @@ export function LedgerCard({
     statsWithFolder
   );
 
-  const trackPath = useCallback(
-    (track: SyncTrackItem) =>
-      `${folder}/${track.relative_path}`.replace(/\/+/g, "/"),
-    [folder],
-  );
-
   // Ordered cover candidates; on load error we fall through to the next one,
   // and finally to the folder icon — so a dead URL never leaves a blank hole.
   // Idle: playlist sidecar → online playlist thumb (subs) → album cover.jpg →
@@ -541,16 +381,11 @@ export function LedgerCard({
       if (url && !list.includes(url)) list.push(url);
     };
 
-    const playing = playingTrackKey
-      ? coverTracks.find((tk) => trackPath(tk) === playingTrackKey)
-      : null;
-    const primary = playing ?? coverTracks[0];
-    const primaryPath = primary ? trackPath(primary) : null;
+    const primaryPath = playingTrackKey ?? entry.cover_track_path ?? null;
 
     if (playingTrackKey && primaryPath) {
       push(trackCoverUrl(playingTrackKey));
       push(albumCoverUrl(primaryPath));
-      push(primary?.cover_url);
     }
 
     if (folder) push(playlistCoverUrl(folder));
@@ -559,10 +394,9 @@ export function LedgerCard({
     if (primaryPath && !playingTrackKey) {
       push(albumCoverUrl(primaryPath));
       push(trackCoverUrl(primaryPath));
-      push(primary?.cover_url);
     }
     return list;
-  }, [isDirect, playingTrackKey, coverTracks, trackPath, thumb, folder]);
+  }, [entry.cover_track_path, isDirect, playingTrackKey, thumb, folder]);
 
   const coverKey = coverCandidates.join("|");
   useEffect(() => {
@@ -699,9 +533,19 @@ export function LedgerCard({
           >
             <div className="min-w-0 flex-1">
               <div className="flex min-w-0 flex-nowrap items-center gap-2">
-                <p className="text-foreground min-w-0 truncate text-sm font-medium">
+                <PlaylistTitleTooltip
+                  kind={
+                    isDirect
+                      ? "direct"
+                      : isLikedMusic
+                        ? "liked"
+                        : "subscription"
+                  }
+                  saveFolder={folder}
+                  className="text-foreground min-w-0 truncate text-sm font-medium"
+                >
                   {headline}
-                </p>
+                </PlaylistTitleTooltip>
               </div>
 
               <p className={LINE}>{subline}</p>
@@ -830,7 +674,6 @@ export function LedgerCard({
           open={tracksOpen}
           canDelete={isDirect || isSubscription}
           subscriptionId={subscription?.id}
-          onMembershipChanged={loadStats}
           onDeleted={onDirectTrackDeleted}
         />
       </Card>

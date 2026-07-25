@@ -249,6 +249,7 @@ class MetadataExtractorService:
                 artists=raw.get("artists", []),
                 album=raw.get("album"),
                 reason=SkipReason(raw["reason"]),
+                video_id=raw.get("video_id", ""),
             )
             for raw in playlist.unavailable_tracks_raw
         ]

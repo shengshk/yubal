@@ -1,4 +1,9 @@
 import { updateExternalPlaylist, type ExternalPlaylist } from "@/api/external";
+import { HoverHint } from "@/components/common/hover-hint";
+import {
+  externalPlaylistDisplayName,
+  specialExternalPit,
+} from "@/lib/playlist-labels";
 import { showErrorToast, showSuccessToast } from "@/lib/toast";
 import {
   Button,
@@ -44,6 +49,10 @@ export function ExternalPlaylistEditModal({
   const [showRaw, setShowRaw] = useState(true);
   const [showJunk, setShowJunk] = useState(true);
   const [saving, setSaving] = useState(false);
+  const cleanupActionsHint = [
+    `${t("sync.idInvalidActionToRawDelete")}：${t("sync.cleanupActionArchiveHint")}`,
+    `${t("sync.idInvalidActionDelete")}：${t("sync.cleanupActionDeleteHint")}`,
+  ].join("\n");
 
   useEffect(() => {
     if (!playlist || !isOpen) return;
@@ -91,7 +100,7 @@ export function ExternalPlaylistEditModal({
   };
 
   const isSystemPlaylist =
-    playlist?.dir_name === "default" || playlist?.dir_name === "delete";
+    specialExternalPit(playlist?.dir_name ?? "") !== null;
 
   const handleSave = async () => {
     if (!playlist) return;
@@ -135,174 +144,169 @@ export function ExternalPlaylistEditModal({
     >
       <ModalContent>
         <ModalHeader>
-          {t("sync.editExternalTitle", { name: playlist?.dir_name ?? "" })}
+          {t("sync.editExternalTitle", {
+            name: playlist
+              ? externalPlaylistDisplayName(playlist.dir_name, t)
+              : "",
+          })}
         </ModalHeader>
         <ModalBody className="gap-4">
-          <div className="flex items-center justify-between gap-3">
-            <div>
+          <HoverHint content={t("sync.externalAutoRecoverHint")}>
+            <div className="flex items-center justify-between gap-3">
               <p className="text-sm font-medium">
                 {t("sync.externalAutoRecover")}
               </p>
-              <p className="text-foreground-400 text-xs">
-                {t("sync.externalAutoRecoverHint")}
-              </p>
+              <Switch
+                isSelected={enabled}
+                isDisabled={!isSchedulerEnabled}
+                onValueChange={setEnabled}
+                aria-label={t("sync.externalAutoRecover")}
+              />
             </div>
-            <Switch
-              isSelected={enabled}
-              isDisabled={!isSchedulerEnabled}
-              onValueChange={setEnabled}
-              aria-label={t("sync.externalAutoRecover")}
-            />
-          </div>
+          </HoverHint>
 
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-            <Input
-              type="number"
-              label={t("sync.perRoundCap")}
-              value={String(maxItems)}
-              min={1}
-              max={10000}
-              onChange={(e) => {
-                const value = parseInt(e.target.value, 10);
-                if (!Number.isNaN(value) && value >= 1) setMaxItems(value);
-              }}
-            />
-            <Input
-              type="number"
-              label={t("sync.syncJitter")}
-              value={String(jitterSeconds)}
-              min={0}
-              max={600}
-              onChange={(e) => {
-                const value = parseInt(e.target.value, 10);
-                if (Number.isNaN(value)) {
-                  setJitterSeconds(0);
-                  return;
-                }
-                setJitterSeconds(Math.min(600, Math.max(0, value)));
-              }}
-            />
+            <HoverHint content={t("sync.perRoundCapHint")}>
+              <Input
+                type="number"
+                label={t("sync.perRoundCap")}
+                value={String(maxItems)}
+                min={1}
+                max={10000}
+                onChange={(e) => {
+                  const value = parseInt(e.target.value, 10);
+                  if (!Number.isNaN(value) && value >= 1) setMaxItems(value);
+                }}
+              />
+            </HoverHint>
+            <HoverHint content={t("sync.syncJitterHint")}>
+              <Input
+                type="number"
+                label={t("sync.syncJitter")}
+                value={String(jitterSeconds)}
+                min={0}
+                max={600}
+                onChange={(e) => {
+                  const value = parseInt(e.target.value, 10);
+                  if (Number.isNaN(value)) {
+                    setJitterSeconds(0);
+                    return;
+                  }
+                  setJitterSeconds(Math.min(600, Math.max(0, value)));
+                }}
+              />
+            </HoverHint>
           </div>
 
-          <div className="flex items-center justify-between gap-3">
-            <div>
+          <HoverHint content={t("sync.externalOfflineMarkingHint")}>
+            <div className="flex items-center justify-between gap-3">
               <p className="text-sm font-medium">
                 {t("sync.externalOfflineMarking")}
               </p>
-              <p className="text-foreground-400 text-xs">
-                {t("sync.externalOfflineMarkingHint")}
-              </p>
+              <Switch
+                isSelected={offlineMarking}
+                onValueChange={handleOfflineToggle}
+                aria-label={t("sync.externalOfflineMarking")}
+              />
             </div>
-            <Switch
-              isSelected={offlineMarking}
-              onValueChange={handleOfflineToggle}
-              aria-label={t("sync.externalOfflineMarking")}
-            />
-          </div>
+          </HoverHint>
 
-          <div className="flex items-center justify-between gap-3">
-            <div>
+          <HoverHint content={t("sync.idInvalidCleanupHint")}>
+            <div className="flex items-center justify-between gap-3">
               <p className="text-sm font-medium">
                 {t("sync.idInvalidCleanup")}
               </p>
-              <p className="text-foreground-400 text-xs">
-                {t("sync.idInvalidCleanupHint")}
-              </p>
+              <Switch
+                isSelected={offlineCleanup}
+                isDisabled={!offlineMarking}
+                onValueChange={setOfflineCleanup}
+                aria-label={t("sync.idInvalidCleanup")}
+              />
             </div>
-            <Switch
-              isSelected={offlineCleanup}
-              isDisabled={!offlineMarking}
-              onValueChange={setOfflineCleanup}
-              aria-label={t("sync.idInvalidCleanup")}
-            />
-          </div>
+          </HoverHint>
           {offlineCleanup ? (
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-              <Select
-                label={t("sync.idInvalidCleanupAction")}
-                selectedKeys={[cleanupAction]}
-                onSelectionChange={(keys) => {
-                  const value = Array.from(keys)[0];
-                  if (value === "delete" || value === "archive") {
-                    setCleanupAction(value);
-                  }
-                }}
-              >
-                <SelectItem key="archive">
-                  {t("sync.idInvalidActionToRawDelete")}
-                </SelectItem>
-                <SelectItem key="delete">
-                  {t("sync.idInvalidActionDelete")}
-                </SelectItem>
-              </Select>
-              <Input
-                type="number"
-                label={t("sync.idInvalidCleanupDelay")}
-                description={t("sync.idInvalidCleanupDelayHint")}
-                value={String(cleanupDelayHours)}
-                min={0}
-                max={8760}
-                onChange={(e) => {
-                  const value = parseInt(e.target.value, 10);
-                  if (!Number.isNaN(value) && value >= 0) {
-                    setCleanupDelayHours(value);
-                  }
-                }}
-              />
+              <HoverHint content={cleanupActionsHint}>
+                <Select
+                  label={t("sync.idInvalidCleanupAction")}
+                  selectedKeys={[cleanupAction]}
+                  onSelectionChange={(keys) => {
+                    const value = Array.from(keys)[0];
+                    if (value === "delete" || value === "archive") {
+                      setCleanupAction(value);
+                    }
+                  }}
+                >
+                  <SelectItem key="archive">
+                    {t("sync.idInvalidActionToRawDelete")}
+                  </SelectItem>
+                  <SelectItem key="delete">
+                    {t("sync.idInvalidActionDelete")}
+                  </SelectItem>
+                </Select>
+              </HoverHint>
+              <HoverHint content={t("sync.idInvalidCleanupDelayHint")}>
+                <Input
+                  type="number"
+                  label={t("sync.idInvalidCleanupDelay")}
+                  value={String(cleanupDelayHours)}
+                  min={0}
+                  max={8760}
+                  onChange={(e) => {
+                    const value = parseInt(e.target.value, 10);
+                    if (!Number.isNaN(value) && value >= 0) {
+                      setCleanupDelayHours(value);
+                    }
+                  }}
+                />
+              </HoverHint>
             </div>
           ) : null}
 
-          <div className="flex items-center justify-between gap-3">
-            <div>
-              <p className="text-sm font-medium">
-                {t("sync.externalShowRaw")}
-              </p>
-              <p className="text-foreground-400 text-xs">
-                {t("sync.externalShowRawHint")}
-              </p>
+          <HoverHint content={t("sync.externalShowRawHint")}>
+            <div className="flex items-center justify-between gap-3">
+              <p className="text-sm font-medium">{t("sync.externalShowRaw")}</p>
+              <Switch
+                isSelected={showRaw}
+                onValueChange={handleShowRawToggle}
+                aria-label={t("sync.externalShowRaw")}
+              />
             </div>
-            <Switch
-              isSelected={showRaw}
-              onValueChange={handleShowRawToggle}
-              aria-label={t("sync.externalShowRaw")}
-            />
-          </div>
+          </HoverHint>
 
-          <div className="flex items-center justify-between gap-3">
-            <div>
+          <HoverHint content={t("sync.externalShowJunkHint")}>
+            <div className="flex items-center justify-between gap-3">
               <p className="text-sm font-medium">
                 {t("sync.externalShowJunk")}
               </p>
-              <p className="text-foreground-400 text-xs">
-                {t("sync.externalShowJunkHint")}
-              </p>
+              <Switch
+                isSelected={showJunk}
+                isDisabled={!showRaw}
+                onValueChange={handleShowJunkToggle}
+                aria-label={t("sync.externalShowJunk")}
+              />
             </div>
-            <Switch
-              isSelected={showJunk}
-              isDisabled={!showRaw}
-              onValueChange={handleShowJunkToggle}
-              aria-label={t("sync.externalShowJunk")}
-            />
-          </div>
+          </HoverHint>
 
-          <div className="flex items-center justify-between gap-3">
-            <div>
+          <HoverHint
+            content={
+              isSystemPlaylist
+                ? t("sync.externalReadonlySystemLocked")
+                : t("sync.externalReadonlyHint")
+            }
+          >
+            <div className="flex items-center justify-between gap-3">
               <p className="text-sm font-medium">
                 {t("sync.externalReadonly")}
               </p>
-              <p className="text-foreground-400 text-xs">
-                {isSystemPlaylist
-                  ? t("sync.externalReadonlySystemLocked")
-                  : t("sync.externalReadonlyHint")}
-              </p>
+              <Switch
+                isSelected={!allowMutate}
+                isDisabled={isSystemPlaylist}
+                onValueChange={(readonly) => handleReadonlyToggle(!readonly)}
+                aria-label={t("sync.externalReadonly")}
+              />
             </div>
-            <Switch
-              isSelected={!allowMutate}
-              isDisabled={isSystemPlaylist}
-              onValueChange={(readonly) => handleReadonlyToggle(!readonly)}
-              aria-label={t("sync.externalReadonly")}
-            />
-          </div>
+          </HoverHint>
         </ModalBody>
         <ModalFooter>
           <Button variant="light" onPress={onClose} isDisabled={saving}>

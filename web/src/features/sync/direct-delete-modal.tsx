@@ -22,6 +22,7 @@ const LIGHT: DirectPlaylistDeleteMode[] = ["keep_list"];
 const ID_INVALID: DirectPlaylistDeleteMode[] = [
   "clear_offline_delete",
   "clear_offline_to_raw_delete",
+  "clear_offline_to_wanted",
 ];
 const HEAVY: DirectPlaylistDeleteMode[] = ["wipe_list", "migrate_to_external"];
 
@@ -60,6 +61,7 @@ export function DirectDeleteModal({
       wipe_list: "sync.deleteDirectWipeList",
       clear_offline_delete: "sync.clearIdInvalidDelete",
       clear_offline_to_raw_delete: "sync.clearIdInvalidToRawDelete",
+      clear_offline_to_wanted: "sync.clearIdInvalidToWanted",
       migrate_to_external: "sync.migrateToExternal",
     })[m];
 
@@ -69,6 +71,7 @@ export function DirectDeleteModal({
       wipe_list: "sync.deleteDirectWipeListHint",
       clear_offline_delete: "sync.clearIdInvalidDeleteHint",
       clear_offline_to_raw_delete: "sync.clearIdInvalidToRawDeleteHint",
+      clear_offline_to_wanted: "sync.clearIdInvalidToWantedHint",
       migrate_to_external: "sync.migrateToExternalPlaylistHint",
     })[m];
 
@@ -82,6 +85,8 @@ export function DirectDeleteModal({
         return t("sync.clearIdInvalidConfirmDelete");
       case "clear_offline_to_raw_delete":
         return t("sync.clearIdInvalidConfirmRawDelete");
+      case "clear_offline_to_wanted":
+        return t("sync.clearIdInvalidConfirmWanted");
       case "migrate_to_external":
         return t("sync.migrateDirectConfirm");
       default:
@@ -99,6 +104,7 @@ export function DirectDeleteModal({
         return t("sync.migrateDirectWarn");
       case "clear_offline_delete":
       case "clear_offline_to_raw_delete":
+      case "clear_offline_to_wanted":
         return t("sync.clearStaleWarn");
       default:
         return t("sync.clearStaleWarn");
@@ -133,7 +139,8 @@ export function DirectDeleteModal({
   const soft =
     mode === "keep_list" ||
     mode === "migrate_to_external" ||
-    mode === "clear_offline_to_raw_delete";
+    mode === "clear_offline_to_raw_delete" ||
+    mode === "clear_offline_to_wanted";
 
   return (
     <Modal isOpen={isOpen} onClose={handleClose} placement="center" size="lg">

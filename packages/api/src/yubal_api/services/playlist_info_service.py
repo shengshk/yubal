@@ -65,6 +65,10 @@ class PlaylistInfoService:
         thumbnail_url = playlist.thumbnails[-1].url if playlist.thumbnails else None
         return PlaylistMetadata(title=title, thumbnail_url=thumbnail_url)
 
+    def get_account_fingerprint(self) -> str:
+        """Return a private identifier for the currently authenticated account."""
+        return self._client.get_account_fingerprint()
+
     def get_content_info(self, url: str) -> ContentInfo:
         """Get content info for any supported YouTube URL.
 

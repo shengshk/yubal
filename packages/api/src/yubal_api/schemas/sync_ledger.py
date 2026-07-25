@@ -41,7 +41,10 @@ class SyncLedgerResponse(BaseModel):
     offline_cleanup_action: str | None = None
     offline_cleanup_delay_hours: int | None = None
     offline_count: int | None = None
+    id_invalid_count: int | None = None
     blocked_count: int | None = None
+    missing_count: int | None = None
+    cover_track_path: str | None = None
 
     model_config = {"from_attributes": True}
 
@@ -73,7 +76,9 @@ class SyncTrackItem(BaseModel):
     has_embedded_cover: bool = False
     has_lyrics: bool = False
     has_synced_lyrics: bool = False
-    # Provenance of the embedded cover (apple | ytm | embedded); None if unknown.
+    # Provenance of the embedded cover (apple | ytm | manual | embedded).
+    # "embedded" means the file already contained art; its original provider
+    # cannot be established reliably.
     cover_source: str | None = None
     # Direct list membership (active | offline); null for subscription disks scans.
     membership_status: str | None = None

@@ -5,9 +5,11 @@ from pydantic import BaseModel, Field
 
 from yubal_api.api.deps import (
     LibraryEnrichmentServiceDep,
+    MembershipServiceDep,
     SchedulerDep,
     SyncLedgerServiceDep,
 )
+from yubal_api.db.subscription_membership import MembershipStatus
 from yubal_api.db.sync_ledger import LedgerKind, SyncLedgerEntry
 from yubal_api.schemas.sync_ledger import (
     SyncLedgerListResponse,
@@ -28,7 +30,7 @@ class DirectUpdateRequest(BaseModel):
     offline_marking_enabled: bool | None = None
     offline_cleanup_enabled: bool | None = None
     offline_cleanup_action: str | None = Field(
-        default=None, pattern="^(delete|archive)$"
+        default=None, pattern="^(delete|archive|to_wanted)$"
     )
     offline_cleanup_delay_hours: int | None = Field(default=None, ge=0, le=8760)
 
@@ -56,12 +58,45 @@ def _direct_response(
 
 
 @router.get("", response_model=SyncLedgerListResponse)
-def list_sync_ledger(service: SyncLedgerServiceDep) -> SyncLedgerListResponse:
+def list_sync_ledger(
+    service: SyncLedgerServiceDep,
+    membership: MembershipServiceDep,
+) -> SyncLedgerListResponse:
     """List durable sync ledger rows (reconciled against on-disk files)."""
     items = service.list(reconcile=True)
-    return SyncLedgerListResponse(
-        items=[_direct_response(i, service) for i in items]
-    )
+    responses: list[SyncLedgerResponse] = []
+    for item in items:
+        response = _direct_response(item, service)
+        summary = service.folder_track_summary(item.save_folder)
+        updates: dict[str, int | str | None] = {
+            "missing_count": summary.missing_active_count,
+            "cover_track_path": summary.cover_track_path,
+        }
+        if item.kind == LedgerKind.SUBSCRIPTION and item.subscription_id is not None:
+            members = membership.list_membership(item.subscription_id)
+            updates.update(
+                {
+                    "offline_count": sum(
+                        row.membership_status == MembershipStatus.OFFLINE
+                        for row in members
+                    ),
+                    "id_invalid_count": sum(
+                        row.membership_status == MembershipStatus.ID_INVALID
+                        for row in members
+                    ),
+                    "blocked_count": sum(
+                        row.membership_status == MembershipStatus.BLOCKED
+                        for row in members
+                    ),
+                    "missing_count": sum(
+                        row.membership_status == MembershipStatus.ACTIVE
+                        and row.catalog_video_id not in summary.present_video_ids
+                        for row in members
+                    ),
+                }
+            )
+        responses.append(response.model_copy(update=updates))
+    return SyncLedgerListResponse(items=responses)
 
 
 @router.get("/tracks", response_model=SyncTrackListResponse)
@@ -83,7 +118,7 @@ def delete_direct_track(
     relative_path: str = Query(min_length=1, max_length=800),
     mode: str = Query(
         default="keep_list",
-        pattern="^(keep_list|wipe_list|block|migrate_to_external)$",
+        pattern="^(keep_list|wipe_list|block|migrate_to_external|migrate_to_wanted)$",
     ),
 ) -> SyncLedgerResponse:
     """Delete or migrate one Direct-download audio file.
@@ -92,6 +127,7 @@ def delete_direct_track(
     wipe_list: also remove catalog membership.
     block: delete file + ban auto-recover (禁止回补).
     migrate_to_external: move file+list into Organized/Default.
+    migrate_to_wanted: strip id, hardlink into wishlist, drop list+file.
     """
     try:
         entry = service.delete_direct_track(relative_path, mode=mode)
@@ -206,7 +242,7 @@ def delete_direct(
         default="wipe_list",
         pattern=(
             "^(keep_list|wipe_list|clear_offline_delete|"
-            "clear_offline_to_raw_delete|migrate_to_external)$"
+            "clear_offline_to_raw_delete|clear_offline_to_wanted|migrate_to_external)$"
         ),
     ),
 ) -> None:

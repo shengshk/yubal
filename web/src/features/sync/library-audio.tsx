@@ -6,6 +6,7 @@ import {
   trackCoverUrl,
 } from "@/api/library";
 import { fetchSearchLyrics, type SearchLyrics } from "@/api/search";
+import { listWantedTracks, WANTED_FOLDER } from "@/api/wanted";
 import {
   cyclePlayMode,
   getPlayMode,
@@ -260,8 +261,26 @@ export function LibraryAudioProvider({ children }: { children: ReactNode }) {
   const ensurePlaylist = useCallback(async (folder: string) => {
     let tracks = playlistsRef.current.get(folder) ?? [];
     if (tracks.length === 0) {
-      const items = await listSyncTracks(folder);
-      tracks = toPlaylistTracks(folder, items);
+      // Wanted lives on its own root, outside the sync ledger folders.
+      if (folder === WANTED_FOLDER) {
+        const items = await listWantedTracks();
+        tracks = items
+          .filter((item) => item.has_file && item.relative_path)
+          .map((item) => {
+            const path = `${WANTED_FOLDER}/${item.relative_path}`.replace(
+              /\/+/g,
+              "/",
+            );
+            return {
+              key: path,
+              path,
+              label: formatArtistTitle(item.artists, item.title),
+            };
+          });
+      } else {
+        const items = await listSyncTracks(folder);
+        tracks = toPlaylistTracks(folder, items);
+      }
       playlistsRef.current.set(folder, tracks);
     }
     return tracks;

@@ -14,6 +14,10 @@ import {
   type TextMatchHit,
 } from "@/api/library-lookup";
 import {
+  getLibraryTrackSummary,
+  type LibraryTrackSummary,
+} from "@/api/library";
+import {
   deleteSearchResults,
   getSearchResults,
   searchSongs,
@@ -52,8 +56,10 @@ import {
 import {
   clearSubscriptionOffline,
   type Subscription,
+  type SyncStepResult,
 } from "@/api/subscriptions";
 import { getSettings } from "@/api/settings";
+import { getWantedSummary, type WantedSummary } from "@/api/wanted";
 import { cardActionClass, cardShadow, layout } from "@/lib/ui-styles";
 import { classifyUnifiedInput } from "@/lib/url";
 import {
@@ -68,7 +74,7 @@ import {
   Spinner,
 } from "@heroui/react";
 import { DownloadIcon, SearchIcon, ZapIcon } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 const DEFAULT_MAX_ITEMS = 50;
@@ -96,6 +102,7 @@ export function JobsPage() {
   } = useSubscriptions();
 
   const [url, setUrl] = useState("");
+  const [syncSteps, setSyncSteps] = useState<SyncStepResult[]>([]);
   const [directLimitExceeded, setDirectLimitExceeded] = useState<{
     url: string;
     trackCount: number;
@@ -123,6 +130,10 @@ export function JobsPage() {
   >([]);
   const [externalEnabled, setExternalEnabled] = useState(false);
   const [externalLoading, setExternalLoading] = useState(true);
+  const [wantedSummary, setWantedSummary] = useState<WantedSummary | null>(
+    null,
+  );
+  const [wantedEnabled, setWantedEnabled] = useState(false);
   const [editingExternal, setEditingExternal] =
     useState<ExternalPlaylist | null>(null);
   const [deletingExternal, setDeletingExternal] =
@@ -131,17 +142,20 @@ export function JobsPage() {
   const [isSearching, setIsSearching] = useState(false);
   const [isAdding, setIsAdding] = useState(false);
   const [isInspecting, setIsInspecting] = useState(false);
-  const [directDownloadLimit, setDirectDownloadLimit] = useState(
-    DEFAULT_DIRECT_LIMIT,
-  );
+  const [directDownloadLimit, setDirectDownloadLimit] =
+    useState(DEFAULT_DIRECT_LIMIT);
   const [isSyncingAll, setIsSyncingAll] = useState(false);
   const [editing, setEditing] = useState<Subscription | null>(null);
   const [deleting, setDeleting] = useState<Subscription | null>(null);
   const [editingDirect, setEditingDirect] = useState(false);
   const [deletingDirect, setDeletingDirect] = useState(false);
-  const [searchSnapshot, setSearchSnapshot] =
-    useState<SearchSnapshot | null>(null);
+  const [searchSnapshot, setSearchSnapshot] = useState<SearchSnapshot | null>(
+    null,
+  );
   const [expandedKey, setExpandedKey] = useState<string | null>(null);
+  const [librarySummary, setLibrarySummary] =
+    useState<LibraryTrackSummary | null>(null);
+  const previousJobStatusesRef = useRef<Map<string, string> | null>(null);
 
   const canAct = url.trim().length > 0;
   const inputKind = classifyUnifiedInput(url);
@@ -158,6 +172,10 @@ export function JobsPage() {
     setLedgerLoading(false);
   }, []);
 
+  const refreshLibrarySummary = useCallback(async () => {
+    setLibrarySummary(await getLibraryTrackSummary());
+  }, []);
+
   const refreshExternal = useCallback(async () => {
     const settings = await getSettings();
     const enabled = Boolean(settings?.external_library_enabled);
@@ -172,6 +190,17 @@ export function JobsPage() {
     setExternalLoading(false);
   }, []);
 
+  const refreshWanted = useCallback(async () => {
+    const settings = await getSettings();
+    const enabled = Boolean(settings?.wanted_enabled ?? true);
+    setWantedEnabled(enabled);
+    if (!enabled) {
+      setWantedSummary(null);
+      return;
+    }
+    setWantedSummary(await getWantedSummary());
+  }, []);
+
   const refreshSearch = useCallback(async () => {
     setSearchSnapshot(await getSearchResults());
   }, []);
@@ -183,33 +212,55 @@ export function JobsPage() {
 
   useEffect(() => {
     void refreshLedger();
+    void refreshLibrarySummary();
     void refreshSearch();
     void refreshDirectDownloadLimit();
     void refreshExternal();
-  }, [refreshDirectDownloadLimit, refreshExternal, refreshLedger, refreshSearch]);
+    void refreshWanted();
+  }, [
+    refreshDirectDownloadLimit,
+    refreshExternal,
+    refreshLedger,
+    refreshLibrarySummary,
+    refreshSearch,
+    refreshWanted,
+  ]);
 
   useEffect(() => {
     const onSettingsChanged = () => {
       void refreshSubscriptions();
       void refreshDirectDownloadLimit();
       void refreshExternal();
+      void refreshLibrarySummary();
+      void refreshWanted();
     };
     window.addEventListener("yubal:settings-changed", onSettingsChanged);
     return () => {
       window.removeEventListener("yubal:settings-changed", onSettingsChanged);
     };
-  }, [refreshDirectDownloadLimit, refreshExternal, refreshSubscriptions]);
+  }, [
+    refreshDirectDownloadLimit,
+    refreshExternal,
+    refreshLibrarySummary,
+    refreshSubscriptions,
+    refreshWanted,
+  ]);
 
   useEffect(() => {
-    const onLedgerChanged = () => {
+    const onLedgerChanged = (event: Event) => {
+      const detail = (event as CustomEvent<{ skipPageRefresh?: boolean }>)
+        .detail;
+      if (detail?.skipPageRefresh) return;
       void refreshLedger();
+      void refreshLibrarySummary();
       void refreshExternal();
+      void refreshWanted();
     };
     window.addEventListener("yubal:ledger-changed", onLedgerChanged);
     return () => {
       window.removeEventListener("yubal:ledger-changed", onLedgerChanged);
     };
-  }, [refreshExternal, refreshLedger]);
+  }, [refreshExternal, refreshLedger, refreshLibrarySummary, refreshWanted]);
 
   const lastDataUpdatedAt = useMemo(() => {
     let max: string | null = null;
@@ -228,26 +279,50 @@ export function JobsPage() {
   }, [ledger, subscriptions]);
 
   useEffect(() => {
-    const hasActive = jobs.some(
-      (j) =>
-        j.status === "pending" ||
-        j.status === "fetching_info" ||
-        j.status === "downloading" ||
-        j.status === "importing",
-    );
-    const hasTerminal = jobs.some(
-      (j) =>
-        j.status === "completed" ||
-        j.status === "failed" ||
-        j.status === "cancelled",
-    );
-    if (!hasActive && hasTerminal) {
-      void refreshLedger();
-      void refreshSubscriptions();
-      void refreshSearch();
-      window.dispatchEvent(new Event("yubal:ledger-changed"));
-    }
-  }, [jobs, refreshLedger, refreshSearch, refreshSubscriptions]);
+    const next = new Map(jobs.map((job) => [job.id, job.status]));
+    const previous = previousJobStatusesRef.current;
+    previousJobStatusesRef.current = next;
+    if (previous === null) return;
+
+    const becameTerminal = jobs.some((job) => {
+      const oldStatus = previous.get(job.id);
+      if (!oldStatus) return false;
+      const wasActive =
+        oldStatus === "pending" ||
+        oldStatus === "fetching_info" ||
+        oldStatus === "downloading" ||
+        oldStatus === "importing";
+      const isTerminal =
+        job.status === "completed" ||
+        job.status === "failed" ||
+        job.status === "cancelled";
+      return wasActive && isTerminal;
+    });
+    if (!becameTerminal) return;
+
+    void Promise.all([
+      refreshLedger(),
+      refreshLibrarySummary(),
+      refreshSubscriptions(),
+      refreshSearch(),
+      refreshWanted(),
+      refreshExternal(),
+    ]).then(() => {
+      window.dispatchEvent(
+        new CustomEvent("yubal:ledger-changed", {
+          detail: { skipPageRefresh: true },
+        }),
+      );
+    });
+  }, [
+    jobs,
+    refreshExternal,
+    refreshLedger,
+    refreshLibrarySummary,
+    refreshSearch,
+    refreshSubscriptions,
+    refreshWanted,
+  ]);
 
   const requireUrl = () => {
     if (inputKind === "ytm_url") return true;
@@ -421,14 +496,11 @@ export function JobsPage() {
 
     // The backend reports null for a single track; jobs already treats it as 1.
     const trackCount = Math.max(1, info.track_count ?? 1);
-    const isSingle =
-      info.kind === "track" || trackCount === 1;
+    const isSingle = info.kind === "track" || trackCount === 1;
 
     if (isSingle) {
       const videoId = info.playlist_id || "";
-      const presence = videoId
-        ? await lookupTrackPresence(videoId)
-        : null;
+      const presence = videoId ? await lookupTrackPresence(videoId) : null;
       setIsInspecting(false);
       if (presence && !("error" in presence)) {
         const outcome = await applyTrackPresence(presence, targetUrl);
@@ -512,7 +584,8 @@ export function JobsPage() {
 
   const handleSyncAll = async () => {
     setIsSyncingAll(true);
-    await syncAll();
+    const steps = await syncAll();
+    if (steps) setSyncSteps(steps);
     await reconcileDirect();
     await refreshLedger();
     await refreshSubscriptions();
@@ -534,22 +607,36 @@ export function JobsPage() {
   const handleRowDelete = async (action: DeleteFileAction) => {
     if (!deleting) return false;
     if (
-      action === "clear_offline_delete" ||
-      action === "clear_offline_to_raw_delete"
+      action.startsWith("clear_offline") ||
+      action.startsWith("clear_id_invalid")
     ) {
-      const result = await clearSubscriptionOffline(
-        deleting.id,
-        action === "clear_offline_to_raw_delete" ? "to_raw_delete" : "delete",
-      );
+      const mode = action.endsWith("to_raw_delete")
+        ? "to_raw_delete"
+        : action.endsWith("to_wanted")
+          ? "to_wanted"
+          : "delete";
+      const status = action.startsWith("clear_id_invalid")
+        ? "id_invalid"
+        : "offline";
+      const result = await clearSubscriptionOffline(deleting.id, mode, status);
       if (result) {
-        await refreshLedger();
         window.dispatchEvent(new Event("yubal:ledger-changed"));
         return true;
       }
       return false;
     }
-    const ok = await deleteSubscription(deleting.id, action);
-    if (ok) await refreshLedger();
+    const ok = await deleteSubscription(
+      deleting.id,
+      action === "keep_list" ||
+        action === "move_to_direct" ||
+        action === "delete"
+        ? action
+        : "keep",
+    );
+    if (ok) {
+      await refreshLedger();
+      void refreshLibrarySummary();
+    }
     return ok;
   };
 
@@ -565,7 +652,6 @@ export function JobsPage() {
   const handleDirectDelete = async (mode: DirectPlaylistDeleteMode) => {
     const ok = await deleteDirect(true, mode);
     if (ok) {
-      await refreshLedger();
       window.dispatchEvent(new Event("yubal:ledger-changed"));
     }
     return ok;
@@ -574,9 +660,7 @@ export function JobsPage() {
   const handleDeleteSearch = async () => {
     if (await deleteSearchResults()) {
       setSearchSnapshot(null);
-      setExpandedKey((current) =>
-        current === SEARCH_FOLDER ? null : current,
-      );
+      setExpandedKey((current) => (current === SEARCH_FOLDER ? null : current));
     }
   };
 
@@ -605,11 +689,13 @@ export function JobsPage() {
   return (
     <>
       <SchedulerBar
+        librarySummary={librarySummary}
         enabledCount={enabledCount}
         totalCount={subscriptions.length}
         schedulerStatus={schedulerStatus}
         lastDataUpdatedAt={lastDataUpdatedAt}
         isSyncing={isSyncingAll}
+        syncSteps={syncSteps}
         canSyncAll={!isSyncingAll && !subsLoading}
         onSyncAll={() => {
           void handleSyncAll();
@@ -619,7 +705,9 @@ export function JobsPage() {
         }}
       />
 
-      <section className={`${layout.blockMargin} flex flex-col gap-3 md:flex-row md:flex-nowrap md:items-center md:gap-3`}>
+      <section
+        className={`${layout.blockMargin} flex flex-col gap-3 md:flex-row md:flex-nowrap md:items-center md:gap-3`}
+      >
         <div className="flex min-w-0 flex-1 flex-row items-center gap-2 sm:gap-3 md:contents">
           <div className="min-w-0 flex-1 md:min-w-[200px]">
             <UrlInput
@@ -717,7 +805,6 @@ export function JobsPage() {
             onDelete={handleDeleteSearch}
             onDownload={handleSearchTrackDownload}
             onImported={() => {
-              void refreshLedger();
               window.dispatchEvent(new Event("yubal:ledger-changed"));
             }}
             onExpired={() => {
@@ -751,6 +838,7 @@ export function JobsPage() {
               next[idx] = entry;
               return next;
             });
+            void refreshLibrarySummary();
           }}
           schedulerEnabled={schedulerStatus?.enabled !== false}
           externalPlaylists={externalPlaylists}
@@ -759,7 +847,10 @@ export function JobsPage() {
           onDeleteExternal={setDeletingExternal}
           onExternalChanged={() => {
             void refreshExternal();
+            void refreshLibrarySummary();
           }}
+          wantedSummary={wantedSummary}
+          showWantedSection={wantedEnabled}
         />
         <LogsPanel jobs={jobs} />
       </section>
@@ -775,6 +866,7 @@ export function JobsPage() {
         subscription={deleting}
         isOpen={deleting !== null}
         externalEnabled={externalEnabled}
+        wantedEnabled={wantedEnabled}
         onClose={() => setDeleting(null)}
         onConfirm={handleRowDelete}
       />
@@ -793,8 +885,9 @@ export function JobsPage() {
                 offline_cleanup_enabled:
                   directEntry.offline_cleanup_enabled ?? false,
                 offline_cleanup_action:
-                  directEntry.offline_cleanup_action === "delete"
-                    ? "delete"
+                  directEntry.offline_cleanup_action === "delete" ||
+                  directEntry.offline_cleanup_action === "to_wanted"
+                    ? directEntry.offline_cleanup_action
                     : "archive",
                 offline_cleanup_delay_hours:
                   directEntry.offline_cleanup_delay_hours ?? 72,
@@ -844,6 +937,7 @@ export function JobsPage() {
             t("sync.deleteExternalDone"),
           );
           void refreshExternal();
+          void refreshLibrarySummary();
           return true;
         }}
       />
@@ -939,7 +1033,11 @@ export function JobsPage() {
                 ))}
               </ModalBody>
               <ModalFooter>
-                <Button variant="light" isDisabled={isDirecting} onPress={onClose}>
+                <Button
+                  variant="light"
+                  isDisabled={isDirecting}
+                  onPress={onClose}
+                >
                   {t("sync.cancel")}
                 </Button>
               </ModalFooter>
@@ -979,7 +1077,7 @@ export function JobsPage() {
                   <Button
                     key={match.video_id}
                     variant="flat"
-                    className="h-auto min-h-10 w-full justify-start whitespace-normal py-2 text-left"
+                    className="h-auto min-h-10 w-full justify-start py-2 text-left whitespace-normal"
                     isDisabled={isSearching || isDirecting}
                     onPress={() => {
                       void handleTextMatchSelect(match);

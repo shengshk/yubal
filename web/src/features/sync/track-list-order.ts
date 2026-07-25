@@ -13,6 +13,7 @@ export type TrackBucket =
   | "active"
   | "offline"
   | "blocked"
+  | "meta_verified"
   | "unmatched"
   | "junk_rw"
   | "junk_ro";
@@ -23,6 +24,7 @@ export const TRACK_BUCKET_ORDER: readonly TrackBucket[] = [
   "active",
   "offline",
   "blocked",
+  "meta_verified",
   "unmatched",
   "junk_rw",
   "junk_ro",
@@ -32,9 +34,27 @@ const BUCKET_PREFIX: Record<TrackBucket, string> = {
   active: "",
   offline: "L",
   blocked: "B",
+  meta_verified: "V",
   unmatched: "X",
   junk_rw: "W",
   junk_ro: "R",
+};
+
+/** i18n key suffix for each display-number prefix (external / Direct / Sub). */
+export const BUCKET_PREFIX_HINT_KEY: Record<string, string> = {
+  "": "indexHintActive",
+  L: "indexHintOffline",
+  B: "indexHintBlocked",
+  V: "indexHintMetaVerified",
+  X: "indexHintUnmatched",
+  W: "indexHintJunkRw",
+  R: "indexHintJunkRo",
+};
+
+/** Wanted-list numbering prefixes. */
+export const WANTED_PREFIX_HINT_KEY: Record<string, string> = {
+  "": "indexHintWantedMatched",
+  W: "indexHintWantedUnmatched",
 };
 
 const BUCKET_RANK = Object.fromEntries(
@@ -61,6 +81,11 @@ export function resolveJunkKind(
   track: SyncTrackItem,
   allowMutate: boolean,
 ): JunkKind | null {
+  // A valid Wanted-source verification outranks a failed YTM lookup. Keep the
+  // row in V so the list, summary count, and heart action share one meaning.
+  if (track.meta_status === "verified") {
+    return null;
+  }
   if (track.junk_kind === "rw" || track.junk_kind === "ro") {
     return track.junk_kind;
   }
@@ -91,12 +116,12 @@ export function classifyTrackBucket(
     return "offline";
   }
 
-  const unmatched =
-    track.tier === "raw" || (ctx.external && !track.video_id);
+  const unmatched = track.tier === "raw" || (ctx.external && !track.video_id);
   if (ctx.external && unmatched) {
     const kind = resolveJunkKind(track, ctx.allowMutate);
     if (kind === "rw") return "junk_rw";
     if (kind === "ro") return "junk_ro";
+    if (track.meta_status === "verified") return "meta_verified";
     return "unmatched";
   }
   return "active";
@@ -128,7 +153,7 @@ export function sortTracksUnified(
 
 /**
  * Bucket-stable display numbers. Independent of pin / screen order.
- * Prefixes: (none) / L / B / X / W / R.
+ * Prefixes: (none) / L / B / V / X / W / R.
  */
 export function assignDisplayNumbers(
   tracks: readonly SyncTrackItem[],
@@ -140,6 +165,7 @@ export function assignDisplayNumbers(
     active: 0,
     offline: 0,
     blocked: 0,
+    meta_verified: 0,
     unmatched: 0,
     junk_rw: 0,
     junk_ro: 0,
@@ -156,6 +182,12 @@ export function assignDisplayNumbers(
   return numbers;
 }
 
+/** Letter prefix of a display index like ``V3`` / ``12`` / ``W1``. */
+export function displayIndexPrefix(displayIndex: string): string {
+  const m = /^([A-Za-z]*)/.exec(displayIndex.trim());
+  return m?.[1] ?? "";
+}
+
 /**
  * A–Z sections over an already bucket-sorted list.
  * Letter may repeat when a new bucket starts; order is never re-sorted.
@@ -167,9 +199,7 @@ export function buildOrderedTrackSections(
   const sections: TrackSection[] = [];
   let current: TrackSection | null = null;
   for (const track of orderedTracks) {
-    const letter: IndexLetter = indexLetterFor(
-      trackSortValue(track, sortKey),
-    );
+    const letter: IndexLetter = indexLetterFor(trackSortValue(track, sortKey));
     if (!current || current.letter !== letter) {
       current = { letter, tracks: [] };
       sections.push(current);

@@ -33,6 +33,7 @@ class MembershipDelta:
     added: tuple[SubscriptionTrack, ...] = ()
     restored: tuple[SubscriptionTrack, ...] = ()
     offline: tuple[SubscriptionTrack, ...] = ()
+    id_invalid: tuple[SubscriptionTrack, ...] = ()
     removed: tuple[SubscriptionTrack, ...] = ()
 
 
@@ -213,14 +214,17 @@ class SubscriptionMembershipRepository:
         subscription: Subscription,
         remote: list[RemoteMembership],
         *,
+        unavailable_video_ids: set[str] | None = None,
         seen_at: datetime | None = None,
     ) -> MembershipDelta:
         """Atomically reconcile one authoritative remote membership snapshot."""
         now = seen_at or datetime.now(UTC)
         remote_by_id = {item.video_id: item for item in remote if item.video_id}
+        unavailable = unavailable_video_ids or set()
         added: list[SubscriptionTrack] = []
         restored: list[SubscriptionTrack] = []
         offline: list[SubscriptionTrack] = []
+        id_invalid: list[SubscriptionTrack] = []
         removed: list[SubscriptionTrack] = []
 
         with Session(self._engine) as session:
@@ -250,7 +254,10 @@ class SubscriptionMembershipRepository:
                     session.add(row)
                     added.append(row)
                     continue
-                was_offline = row.membership_status == MembershipStatus.OFFLINE
+                was_offline = row.membership_status in (
+                    MembershipStatus.OFFLINE,
+                    MembershipStatus.ID_INVALID,
+                )
                 was_blocked = row.membership_status == MembershipStatus.BLOCKED
                 row.title = item.title
                 row.catalog_video_id = item.catalog_video_id
@@ -278,13 +285,44 @@ class SubscriptionMembershipRepository:
                 if subscription.sync_mode == SubscriptionSyncMode.MIRROR:
                     removed.append(row)
                     session.delete(row)
-                elif subscription.offline_marking_enabled:
-                    if row.membership_status != MembershipStatus.OFFLINE:
-                        row.membership_status = MembershipStatus.OFFLINE
-                        row.missing_since = now
-                        offline.append(row)
+                    continue
+
+                # Mutually exclusive: dead ID vs removed-from-playlist.
+                in_unavailable = row.video_id in unavailable
+                target: MembershipStatus | None = None
+                if in_unavailable and getattr(
+                    subscription, "id_invalid_marking_enabled", True
+                ):
+                    target = MembershipStatus.ID_INVALID
+                elif (
+                    not in_unavailable
+                    and subscription.offline_marking_enabled
+                ):
+                    target = MembershipStatus.OFFLINE
+                elif (
+                    in_unavailable
+                    and not getattr(
+                        subscription, "id_invalid_marking_enabled", True
+                    )
+                    and subscription.offline_marking_enabled
+                ):
+                    # ID-invalid marking off: fall back to not-in-playlist mark.
+                    target = MembershipStatus.OFFLINE
+
+                if target is None:
                     row.updated_at = now
                     session.add(row)
+                    continue
+
+                if row.membership_status != target:
+                    row.membership_status = target
+                    row.missing_since = now
+                    if target == MembershipStatus.ID_INVALID:
+                        id_invalid.append(row)
+                    else:
+                        offline.append(row)
+                row.updated_at = now
+                session.add(row)
 
             session.commit()
 
@@ -292,6 +330,7 @@ class SubscriptionMembershipRepository:
             added=tuple(added),
             restored=tuple(restored),
             offline=tuple(offline),
+            id_invalid=tuple(id_invalid),
             removed=tuple(removed),
         )
 

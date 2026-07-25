@@ -88,7 +88,7 @@ class DirectDownloadLimitExceededError(APIError):
         self.limit = limit
         super().__init__(
             f"Content contains {track_count} tracks, exceeding the "
-            f"direct download limit of {limit}."
+            f"instant download limit of {limit}."
         )
 
 
