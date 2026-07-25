@@ -3,6 +3,7 @@
 import logging
 from collections.abc import Iterator
 from dataclasses import FrozenInstanceError
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -482,6 +483,80 @@ class TestDownloadService:
         call_args = mock_tag.call_args[0]
         assert call_args[1] == sample_track  # track metadata
         assert call_args[2] == b"cover data"  # cover bytes
+
+    def test_fresh_download_ignores_prior_cover_freshness(
+        self,
+        sample_track: TrackMetadata,
+        download_config: DownloadConfig,
+        tmp_path: Path,
+    ) -> None:
+        """A fresh audio file must run its own cover comparison."""
+        service = DownloadService(download_config, MockDownloader())
+        path = tmp_path / "fresh.opus"
+        path.touch()
+
+        with (
+            patch.object(
+                service,
+                "_resolve_best_cover_bytes",
+                return_value=b"fresh cover",
+            ) as resolve_cover,
+            patch.object(service._tagger, "apply_metadata_tags"),
+        ):
+            service._apply_metadata_tags(path, sample_track, lyrics="[00:00.00]test")
+
+        resolve_cover.assert_called_once_with(
+            path, sample_track, respect_freshness=False
+        )
+
+    def test_missing_cover_never_uses_prior_cover_freshness(
+        self,
+        sample_track: TrackMetadata,
+        download_config: DownloadConfig,
+        tmp_path: Path,
+    ) -> None:
+        """A cached comparison cannot stand in for an actual embedded cover."""
+        service = DownloadService(download_config, MockDownloader())
+        path = tmp_path / "missing-cover.opus"
+        path.touch()
+        video_id = service._video_key(sample_track)
+        state = service._scrape_state.get(video_id)
+        state.apple_checked_at = datetime.now(UTC)
+        state.cover_source = "apple"
+        state.cover_width = 1200
+        state.cover_height = 1200
+        service._scrape_state.set(video_id, state)
+        best = MagicMock(
+            source="apple",
+            dims=(1200, 1200),
+            data=b"resolved cover",
+        )
+
+        with (
+            patch(
+                "yubal.services.download_service.read_embedded_cover",
+                return_value=None,
+            ),
+            patch(
+                "yubal.services.download_service.search_apple_cover_url",
+                return_value=None,
+            ),
+            patch(
+                "yubal.services.download_service.probe_image_dimensions",
+                return_value=None,
+            ),
+            patch(
+                "yubal.services.download_service.select_best_cover",
+                return_value=best,
+            ) as select_cover,
+        ):
+            cover = service._resolve_best_cover_bytes(path, sample_track)
+
+        assert cover == b"resolved cover"
+        select_cover.assert_called_once()
+        refreshed = service._scrape_state.get(video_id)
+        assert refreshed.cover_compared_at is not None
+        assert refreshed.cover_check_kind == "download"
 
 
 class TestLyricsFallback:

@@ -1035,9 +1035,7 @@ class DownloadService:
         if lyrics:
             self._ensure_embedded_lyrics(path, lyrics)
 
-    def finalize_local_file(
-        self, path: Path, track: TrackMetadata
-    ) -> str | None:
+    def finalize_local_file(self, path: Path, track: TrackMetadata) -> str | None:
         """Bring an externally-sourced audio file up to normal-download quality.
 
         Reuses the exact tagging / cover / lyrics helpers a fresh download runs,
@@ -1056,6 +1054,7 @@ class DownloadService:
         *,
         rewrite_metadata: bool = False,
         respect_lyrics_cooldown: bool = True,
+        embed_assets: bool = True,
     ) -> EnrichmentOutcome:
         """Enrich an existing file and report authoritative asset state.
 
@@ -1072,11 +1071,12 @@ class DownloadService:
         error: str | None = None
         lyrics: str | None = None
         cover: bytes | None = None
-        try:
-            cover = self._resolve_best_cover_bytes(path, track)
-        except Exception as e:
-            logger.exception("Failed to resolve cover for %s: %s", path, e)
-            error = str(e) or e.__class__.__name__
+        if embed_assets:
+            try:
+                cover = self._resolve_best_cover_bytes(path, track)
+            except Exception as e:
+                logger.exception("Failed to resolve cover for %s: %s", path, e)
+                error = str(e) or e.__class__.__name__
 
         try:
             lyrics = self._ensure_lyrics_sidecar(
@@ -1084,16 +1084,14 @@ class DownloadService:
                 track,
                 respect_cooldown=respect_lyrics_cooldown,
             )
-            if rewrite_metadata:
+            if rewrite_metadata and embed_assets:
                 self._tagger.apply_metadata_tags(path, track, cover, lyrics)
-            else:
+            elif embed_assets:
                 if cover:
                     current = read_embedded_cover(path)
-                    if (
-                        current is None
-                        or cover_quality_score(cover)
-                        > cover_quality_score(current[0])
-                    ):
+                    if current is None or cover_quality_score(
+                        cover
+                    ) > cover_quality_score(current[0]):
                         from mediafile import Image, MediaFile
 
                         audio = MediaFile(path)
@@ -1146,7 +1144,10 @@ class DownloadService:
         """
         cover: bytes | None = None
         try:
-            cover = self._resolve_best_cover_bytes(path, track)
+            # A newly downloaded file must be judged from its actual assets.
+            # Prior scrape freshness describes an older file/check and must not
+            # suppress this download's cover comparison.
+            cover = self._resolve_best_cover_bytes(path, track, respect_freshness=False)
         except Exception as e:
             logger.exception("Failed to resolve cover for %s: %s", path, e)
 
@@ -1165,7 +1166,11 @@ class DownloadService:
         return track.video_id or track.source_video_id or ""
 
     def _resolve_best_cover_bytes(
-        self, path: Path, track: TrackMetadata
+        self,
+        path: Path,
+        track: TrackMetadata,
+        *,
+        respect_freshness: bool = True,
     ) -> bytes | None:
         """Pick cover via probe-or-download comparison (no permanent Apple seal).
 
@@ -1234,18 +1239,23 @@ class DownloadService:
             )
 
         # Still within shelf life from a prior round — keep local.
-        if state and cover_comparison_fresh(
-            state.effective_compared_at(),
-            state.effective_check_kind(),
-            probe_days=int(
-                getattr(self._config, "cover_probe_fresh_days", 7) or 7
-            ),
-            download_days=int(
-                getattr(self._config, "cover_download_fresh_days", 30) or 30
-            ),
+        if (
+            respect_freshness
+            and embedded is not None
+            and state
+            and cover_comparison_fresh(
+                state.effective_compared_at(),
+                state.effective_check_kind(),
+                probe_days=int(getattr(self._config, "cover_probe_fresh_days", 7) or 7),
+                download_days=int(
+                    getattr(self._config, "cover_download_fresh_days", 30) or 30
+                ),
+            )
         ):
-            if local_dims and video_id and (
-                state.cover_width is None or state.cover_height is None
+            if (
+                local_dims
+                and video_id
+                and (state.cover_width is None or state.cover_height is None)
             ):
                 new_state = self._scrape_state.get(video_id)
                 new_state.cover_width, new_state.cover_height = local_dims
@@ -1288,11 +1298,7 @@ class DownloadService:
 
         # Small embedded/YTM thumbs: always run a full Apple+YTM comparison when
         # the shelf has expired (we only reach here when not fresh).
-        if (
-            not need_download
-            and local_dims is not None
-            and min(local_dims) < 600
-        ):
+        if not need_download and local_dims is not None and min(local_dims) < 600:
             need_download = True
 
         if not need_download:
@@ -1358,9 +1364,7 @@ class DownloadService:
         if artist_dir != self._config.base_path and artist_dir.name:
             write_better_image(artist_dir / "artist.jpg", cover)
 
-    def _duration_seconds(
-        self, path: Path, track: TrackMetadata
-    ) -> int | None:
+    def _duration_seconds(self, path: Path, track: TrackMetadata) -> int | None:
         """Best duration for lyrics lookup: metadata, else audio length."""
         raw = track.duration_seconds
         if raw is not None:

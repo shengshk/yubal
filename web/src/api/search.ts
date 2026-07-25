@@ -1,4 +1,5 @@
 import { basePath } from "@/lib/base-path";
+import { sharedJsonGet } from "./shared-get";
 
 export type SearchTrack = {
   rank: number;
@@ -11,6 +12,12 @@ export type SearchTrack = {
   matched: boolean;
   local_path: string | null;
   preview_cached: boolean;
+  /** "ytm" (default) | "meta" (wishlist metadata hit). */
+  result_kind?: "ytm" | "meta" | string;
+  source?: string | null;
+  source_id?: string | null;
+  source_url?: string | null;
+  wishable?: boolean;
 };
 
 export type SearchSnapshot = {
@@ -25,7 +32,10 @@ export type SearchSnapshot = {
 
 type ApiResult<T> = { data: T } | { error: string };
 
-async function errorText(response: Response, fallback: string): Promise<string> {
+async function errorText(
+  response: Response,
+  fallback: string,
+): Promise<string> {
   const body = (await response.json().catch(() => null)) as {
     detail?: string;
     message?: string;
@@ -34,11 +44,10 @@ async function errorText(response: Response, fallback: string): Promise<string> 
 }
 
 export async function getSearchResults(): Promise<SearchSnapshot | null> {
-  const response = await fetch(`${basePath}/api/search`, {
-    credentials: "include",
-  });
-  if (!response.ok) return null;
-  return (await response.json()) as SearchSnapshot | null;
+  const result = await sharedJsonGet<SearchSnapshot | null>(
+    `${basePath}/api/search`,
+  );
+  return result.ok ? result.data : null;
 }
 
 export async function searchSongs(
@@ -105,7 +114,9 @@ export async function fetchSearchLyrics(
 
 export async function importSearchPreview(
   videoId: string,
-): Promise<ApiResult<{ video_id: string; local_path: string; snapshot: SearchSnapshot }>> {
+): Promise<
+  ApiResult<{ video_id: string; local_path: string; snapshot: SearchSnapshot }>
+> {
   const response = await fetch(
     `${basePath}/api/search/download/${encodeURIComponent(videoId)}`,
     {

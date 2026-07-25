@@ -1,4 +1,22 @@
 import { basePath } from "@/lib/base-path";
+import { sharedJsonGet } from "./shared-get";
+
+export type LibraryTrackSummary = {
+  effective_count: number;
+  identified_count: number;
+  unidentified_count: number;
+  verified_count: number;
+  unverified_count: number;
+  physical_count: number;
+  hardlink_duplicate_count: number;
+};
+
+export async function getLibraryTrackSummary(): Promise<LibraryTrackSummary | null> {
+  const result = await sharedJsonGet<LibraryTrackSummary>(
+    `${basePath}/api/library/track-summary`,
+  );
+  return result.ok ? result.data : null;
+}
 
 export type LibraryFolders = {
   items: string[];
@@ -95,6 +113,11 @@ export function playlistCoverUrl(folder: string): string {
   return `${basePath}/api/library/playlist-cover?folder=${encodeURIComponent(folder)}`;
 }
 
+/** Default wishlist cover: empty (no hardlinks) vs matched. */
+export function wantedCoverUrl(hasMatched: boolean): string {
+  return `${basePath}/api/library/wanted-cover?matched=${hasMatched ? "1" : "0"}`;
+}
+
 export function albumCoverUrl(filePath: string): string {
   return `${basePath}/api/library/album-cover?path=${encodeURIComponent(filePath)}`;
 }
@@ -105,9 +128,7 @@ export type TrackLyrics = {
   source?: string | null;
 };
 
-export async function fetchTrackLyrics(
-  filePath: string,
-): Promise<TrackLyrics> {
+export async function fetchTrackLyrics(filePath: string): Promise<TrackLyrics> {
   const res = await fetch(
     `${basePath}/api/library/track-lyrics?path=${encodeURIComponent(filePath)}`,
     { credentials: "include" },

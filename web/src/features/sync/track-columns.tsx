@@ -50,12 +50,16 @@ export function TrackTextCells({
   passThroughClicks?: boolean;
 }) {
   const pass = passThroughClicks ? " pointer-events-none relative z-10" : "";
+  // Singles frequently carry no album tags; fall back so every row keeps four
+  // filled columns instead of collapsing to three.
+  const albumText = album || title;
+  const albumArtistText = albumArtist || artist || "";
   return (
     <>
       <span className={`${TRACK_CELL_WIDE}${pass}`}>{title}</span>
       <span className={`${TRACK_CELL}${pass}`}>{artist || ""}</span>
-      <span className={`${TRACK_CELL}${pass}`}>{album || ""}</span>
-      <span className={`${TRACK_CELL_WIDE}${pass}`}>{albumArtist || ""}</span>
+      <span className={`${TRACK_CELL}${pass}`}>{albumText}</span>
+      <span className={`${TRACK_CELL_WIDE}${pass}`}>{albumArtistText}</span>
     </>
   );
 }

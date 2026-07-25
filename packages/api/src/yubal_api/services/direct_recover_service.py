@@ -18,6 +18,7 @@ from yubal import (
     create_downloader,
 )
 from yubal.models.enums import ContentKind, VideoType
+from yubal.utils.library import resolve_under_data
 
 from yubal_api.db.track_catalog import LocationMembershipStatus, TrackRecord
 from yubal_api.db.track_catalog_repository import TrackCatalogRepository
@@ -25,7 +26,6 @@ from yubal_api.domain.enums import ProgressStep
 from yubal_api.domain.job import ContentInfo
 from yubal_api.services.preferences import PreferencesStore
 from yubal_api.services.sync_service import ProgressCallback, SyncResult
-from yubal.utils.library import resolve_under_data
 
 logger = logging.getLogger(__name__)
 
@@ -133,7 +133,7 @@ class DirectRecoverService:
         if on_progress:
             on_progress(
                 ProgressStep.FETCHING_INFO,
-                f"Direct recover: {len(missing)} missing",
+                f"Download Center recovery: {len(missing)} missing",
                 2.0,
                 {"content_info": content_info.model_dump()},
             )
@@ -213,7 +213,8 @@ class DirectRecoverService:
                 )
                 marked_offline += 1
                 logger.info(
-                    "Marked Direct track %s offline after unavailable download",
+                    "Marked Download Center track %s offline after "
+                    "unavailable download",
                     video_id,
                 )
 
@@ -262,11 +263,14 @@ class DirectRecoverService:
                 cleaned = self._immediate_cleanup()
                 if cleaned:
                     logger.info(
-                        "Immediate Direct ID-invalid cleanup removed %d track(s)",
+                        "Immediate Download Center ID-invalid cleanup "
+                        "removed %d track(s)",
                         cleaned,
                     )
             except Exception:
-                logger.exception("Immediate Direct ID-invalid cleanup failed")
+                logger.exception(
+                    "Immediate Download Center ID-invalid cleanup failed"
+                )
 
         return SyncResult(
             success=True,

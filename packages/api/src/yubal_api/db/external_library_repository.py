@@ -12,6 +12,9 @@ from yubal_api.db.external_library import (
     MATCH_PENDING,
     MATCH_REJECTED,
     MATCH_UNMATCHED,
+    META_PENDING,
+    META_REJECTED,
+    META_VERIFIED,
     ExternalPlaylist,
     ExternalRawTrack,
 )
@@ -150,12 +153,14 @@ class ExternalLibraryRepository:
             return row
 
     def count_unmatched_for_dir(self, dir_name: str) -> int:
+        """Count YTM-unmatched rows that are *not* meta-verified (pure X bucket)."""
         with Session(self._engine) as session:
             stmt = select(ExternalRawTrack.rel_path).where(
                 ExternalRawTrack.dir_name == dir_name,
                 col(ExternalRawTrack.match_status).in_(
                     [MATCH_UNMATCHED, MATCH_PENDING, MATCH_REJECTED]
                 ),
+                col(ExternalRawTrack.meta_status) != META_VERIFIED,
             )
             return len(list(session.exec(stmt).all()))
 
@@ -341,6 +346,128 @@ class ExternalLibraryRepository:
                     return []
                 stmt = stmt.where(col(ExternalRawTrack.dir_name).in_(dir_names))
             stmt = stmt.order_by(col(ExternalRawTrack.updated_at)).limit(limit)
+            return list(session.exec(stmt).all())
+
+    def record_meta_verified(
+        self,
+        rel_path: str,
+        *,
+        source: str,
+        source_id: str,
+        source_url: str | None,
+        title: str,
+        artists: str,
+        album: str,
+        thumbnail_url: str | None,
+        fingerprint: str,
+    ) -> None:
+        with Session(self._engine) as session:
+            row = session.get(ExternalRawTrack, rel_path)
+            if row is None:
+                return
+            row.meta_status = META_VERIFIED
+            row.meta_source = (source or "")[:32] or None
+            row.meta_source_id = (source_id or "")[:128] or None
+            row.meta_source_url = source_url
+            row.meta_title = (title or "")[:500] or None
+            row.meta_artists = (artists or "")[:500] or None
+            row.meta_album = (album or "")[:500] or None
+            row.meta_thumbnail_url = thumbnail_url
+            row.meta_fingerprint = fingerprint[:600]
+            row.meta_verified_at = datetime.now(UTC)
+            row.meta_fail_count = 0
+            row.meta_next_eligible_at = None
+            row.updated_at = datetime.now(UTC)
+            session.add(row)
+            session.commit()
+
+    def record_meta_rejected(
+        self,
+        rel_path: str,
+        *,
+        fingerprint: str,
+        next_eligible_at: datetime,
+    ) -> None:
+        with Session(self._engine) as session:
+            row = session.get(ExternalRawTrack, rel_path)
+            if row is None:
+                return
+            row.meta_status = META_REJECTED
+            row.meta_source = None
+            row.meta_source_id = None
+            row.meta_source_url = None
+            row.meta_title = None
+            row.meta_artists = None
+            row.meta_album = None
+            row.meta_thumbnail_url = None
+            row.meta_fingerprint = fingerprint[:600]
+            row.meta_verified_at = None
+            row.meta_fail_count = int(row.meta_fail_count or 0) + 1
+            row.meta_next_eligible_at = next_eligible_at
+            row.updated_at = datetime.now(UTC)
+            session.add(row)
+            session.commit()
+
+    def defer_meta_retry(
+        self,
+        rel_path: str,
+        *,
+        next_eligible_at: datetime,
+    ) -> None:
+        """Backoff after transport/parse failure without marking rejected."""
+        with Session(self._engine) as session:
+            row = session.get(ExternalRawTrack, rel_path)
+            if row is None:
+                return
+            # Keep pending (or prior verified invalidation state); only delay retry.
+            if row.meta_status == META_REJECTED:
+                row.meta_status = META_PENDING
+            row.meta_next_eligible_at = next_eligible_at
+            row.updated_at = datetime.now(UTC)
+            session.add(row)
+            session.commit()
+
+    def invalidate_meta(self, rel_path: str) -> None:
+        """Clear verification when local tags change (fingerprint mismatch)."""
+        with Session(self._engine) as session:
+            row = session.get(ExternalRawTrack, rel_path)
+            if row is None:
+                return
+            row.meta_status = META_PENDING
+            row.meta_source = None
+            row.meta_source_id = None
+            row.meta_source_url = None
+            row.meta_title = None
+            row.meta_artists = None
+            row.meta_album = None
+            row.meta_thumbnail_url = None
+            row.meta_fingerprint = None
+            row.meta_verified_at = None
+            row.meta_next_eligible_at = None
+            row.updated_at = datetime.now(UTC)
+            session.add(row)
+            session.commit()
+
+    def count_meta_verified_unmatched(self, dir_name: str) -> int:
+        with Session(self._engine) as session:
+            stmt = select(ExternalRawTrack).where(
+                ExternalRawTrack.dir_name == dir_name,
+                ExternalRawTrack.meta_status == META_VERIFIED,
+                col(ExternalRawTrack.match_status) != MATCH_MATCHED,
+            )
+            return len(list(session.exec(stmt).all()))
+
+    def list_meta_verified_unmatched(self, dir_name: str) -> list[ExternalRawTrack]:
+        with Session(self._engine) as session:
+            stmt = (
+                select(ExternalRawTrack)
+                .where(
+                    ExternalRawTrack.dir_name == dir_name,
+                    ExternalRawTrack.meta_status == META_VERIFIED,
+                    col(ExternalRawTrack.match_status) != MATCH_MATCHED,
+                )
+                .order_by(col(ExternalRawTrack.rel_path))
+            )
             return list(session.exec(stmt).all())
 
     def record_match_success(

@@ -84,6 +84,15 @@ def _to_response(
         telegram_daily_limit=prefs.telegram_daily_limit,
         telegram_api_url=telegram_api_url,
         telegram_bot_running=telegram_bot_running,
+        wanted_enabled=prefs.wanted_enabled,
+        wanted_auto_match_enabled=prefs.wanted_auto_match_enabled,
+        wanted_max_items=prefs.wanted_max_items,
+        wanted_sync_jitter_seconds=prefs.wanted_sync_jitter_seconds,
+        wanted_source_musicbrainz=prefs.wanted_source_musicbrainz,
+        wanted_source_qq=prefs.wanted_source_qq,
+        wanted_source_discogs=prefs.wanted_source_discogs,
+        wanted_source_lastfm=prefs.wanted_source_lastfm,
+        lastfm_api_key=prefs.lastfm_api_key,
     )
 
 

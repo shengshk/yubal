@@ -17,6 +17,7 @@ export type TrackDeleteMode =
   | "clear_match"
   | "delete_raw"
   | "migrate_to_external"
+  | "migrate_to_wanted"
   | "add_to_direct";
 
 type Props = {
@@ -24,14 +25,23 @@ type Props = {
   isOpen: boolean;
   busy?: boolean;
   /**
-   * direct: keep_list | block | wipe_list | migrate_to_external?
-   * subscription: keep_list | block
+   * direct: keep_list | block | wipe_list | migrate_to_external? | migrate_to_wanted?
+   * subscription: keep_list | block | migrate_to_wanted?
    * external: keep_match | clear_match | move_to_direct?
    * external_raw: single delete_raw confirm
    */
   variant?: "direct" | "subscription" | "external" | "external_raw";
   /** Show migrate / add-to-direct options when external library is enabled. */
   externalEnabled?: boolean;
+  /** Show migrate-to-wanted when wishlist is enabled (offline rows). */
+  wantedEnabled?: boolean;
+  /** Offline / ID-invalid / not-in-playlist row. */
+  offline?: boolean;
+  /**
+   * Wanted migration is for dead IDs only — not “not in cloud playlist”.
+   * Direct offline rows are always ID-invalid; subscriptions pass id_invalid.
+   */
+  allowMigrateToWanted?: boolean;
   onClose: () => void;
   onConfirm: (mode: TrackDeleteMode) => void;
 };
@@ -42,6 +52,9 @@ export function TrackDeleteModal({
   busy = false,
   variant = "direct",
   externalEnabled = false,
+  wantedEnabled = false,
+  offline = false,
+  allowMigrateToWanted = false,
   onClose,
   onConfirm,
 }: Props) {
@@ -66,6 +79,7 @@ export function TrackDeleteModal({
       return t("sync.deleteFilesKeepList");
     if (mode === "block") return t("sync.deleteTrackBlockAction");
     if (mode === "migrate_to_external") return t("sync.migrateToExternalAction");
+    if (mode === "migrate_to_wanted") return t("sync.migrateToWantedAction");
     if (mode === "add_to_direct") return t("sync.addToDirectAction");
     return t("sync.deleteFilesForever");
   })();
@@ -172,6 +186,28 @@ export function TrackDeleteModal({
                       </span>
                       <span className="text-foreground-400 text-xs">
                         {t("sync.migrateToExternalHint")}
+                      </span>
+                    </span>
+                  </Button>
+                )}
+                {(isDirect || isSub) &&
+                  wantedEnabled &&
+                  offline &&
+                  allowMigrateToWanted && (
+                  <Button
+                    variant={mode === "migrate_to_wanted" ? "solid" : "flat"}
+                    color={
+                      mode === "migrate_to_wanted" ? "primary" : "default"
+                    }
+                    className="justify-start h-auto py-3 whitespace-normal"
+                    onPress={() => setMode("migrate_to_wanted")}
+                  >
+                    <span className="text-left">
+                      <span className="block font-medium">
+                        {t("sync.migrateToWanted")}
+                      </span>
+                      <span className="text-foreground-400 text-xs">
+                        {t("sync.migrateToWantedHint")}
                       </span>
                     </span>
                   </Button>

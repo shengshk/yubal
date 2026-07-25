@@ -33,6 +33,7 @@ export function SubscriptionsPage() {
   const [maxItems, setMaxItems] = useState(DEFAULT_MAX_ITEMS);
   const [isAdding, setIsAdding] = useState(false);
   const [externalEnabled, setExternalEnabled] = useState(false);
+  const [wantedEnabled, setWantedEnabled] = useState(false);
   const {
     subscriptions,
     schedulerStatus,
@@ -85,30 +86,40 @@ export function SubscriptionsPage() {
   const handleDeleteConfirm = async (action: DeleteFileAction) => {
     if (!deleting) return false;
     if (
-      action === "clear_offline_delete" ||
-      action === "clear_offline_to_raw_delete"
+      action.startsWith("clear_offline") ||
+      action.startsWith("clear_id_invalid")
     ) {
-      const result = await clearSubscriptionOffline(
-        deleting.id,
-        action === "clear_offline_to_raw_delete" ? "to_raw_delete" : "delete",
-      );
+      const mode = action.endsWith("to_raw_delete")
+        ? "to_raw_delete"
+        : action.endsWith("to_wanted")
+          ? "to_wanted"
+          : "delete";
+      const status = action.startsWith("clear_id_invalid")
+        ? "id_invalid"
+        : "offline";
+      const result = await clearSubscriptionOffline(deleting.id, mode, status);
       return Boolean(result);
     }
-    return deleteSubscription(deleting.id, action);
+    return deleteSubscription(
+      deleting.id,
+      action === "keep_list" ||
+        action === "move_to_direct" ||
+        action === "delete"
+        ? action
+        : "keep",
+    );
   };
 
   useEffect(() => {
     void getSettings().then((s) => {
       setExternalEnabled(Boolean(s?.external_library_enabled));
+      setWantedEnabled(Boolean(s?.wanted_enabled));
     });
   }, []);
 
-  const countdown = useScheduleCountdown(
-    schedulerStatus?.next_run_at,
-    () => {
-      void refreshScheduler();
-    },
-  );
+  const countdown = useScheduleCountdown(schedulerStatus?.next_run_at, () => {
+    void refreshScheduler();
+  });
   const nextTitle = schedulerStatus?.next_run_subscription_name?.trim() || null;
   const nextUpdateLabel =
     countdown === "—"
@@ -165,7 +176,7 @@ export function SubscriptionsPage() {
           }}
           className={`${cardActionClass} shrink-0`}
         >
-          <CardBody className="text-inherit flex flex-row items-center justify-center gap-2 px-3 py-0 sm:px-4">
+          <CardBody className="flex flex-row items-center justify-center gap-2 px-3 py-0 text-inherit sm:px-4">
             {isAdding ? (
               <Spinner size="sm" color="current" />
             ) : (
@@ -264,6 +275,7 @@ export function SubscriptionsPage() {
         subscription={deleting}
         isOpen={deleting !== null}
         externalEnabled={externalEnabled}
+        wantedEnabled={wantedEnabled}
         onClose={() => setDeleting(null)}
         onConfirm={handleDeleteConfirm}
       />

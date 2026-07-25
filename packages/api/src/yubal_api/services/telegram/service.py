@@ -5,8 +5,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from datetime import UTC, datetime
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -38,6 +38,7 @@ from yubal_api.services.telegram.admin_reports import (
 from yubal_api.services.telegram.client import BotApiClient
 from yubal_api.services.telegram.sender import AudioSender, extract_delivery
 from yubal_api.services.telegram.stores import DailyQuota, FileIdStore
+from yubal_api.services.wanted_service import WantedService
 
 if TYPE_CHECKING:
     from yubal_api.services.library_health_service import LibraryHealthService
@@ -105,6 +106,10 @@ class ChatSession:
     preview_msg_id: int | None = None
     query: str = ""
     online_ids: list[str] = field(default_factory=list)
+    # Parallel to online result rows: "ytm" | "meta"
+    online_kinds: list[str] = field(default_factory=list)
+    # Meta wish payloads aligned by index when kind == meta
+    online_meta: list[dict[str, Any]] = field(default_factory=list)
     pending_url: str = ""
     busy: bool = False
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -128,6 +133,8 @@ def _callback_toast(data: str) -> str:
         return "订阅中…"
     if data.startswith("os:"):
         return "已选择"
+    if data.startswith("ow:"):
+        return "已加入心愿"
     return "处理中…"
 
 
@@ -160,6 +167,7 @@ class TelegramBotService:
         scheduler: Scheduler | None = None,
         library_health: LibraryHealthService | None = None,
         db_engine: object | None = None,
+        wanted_service: WantedService | None = None,
     ) -> None:
         self._preferences = preferences
         self._catalog = catalog
@@ -171,6 +179,7 @@ class TelegramBotService:
         self._subscriptions = subscriptions
         self._scheduler = scheduler
         self._library_health = library_health
+        self._wanted = wanted_service
         self._db_engine = db_engine or getattr(catalog, "_engine", None)
         self._data_path = data_path
         self._tg_api_url = (tg_api_url or "").strip()
@@ -648,7 +657,7 @@ class TelegramBotService:
             await self._cleanup(chat_id)
             return
         if playlist.in_direct_url:
-            await self._say(chat_id, "该链接已在 Direct。")
+            await self._say(chat_id, "该链接已在下载中心。")
             await self._cleanup(chat_id)
             return
         if role != "admin":
@@ -770,7 +779,7 @@ class TelegramBotService:
                 label = label[:57] + "…"
             rows.append([(label, f"loc:{video_id}")])
         if role == "admin":
-            rows.append([("加入 Direct", f"jd:{video_id}")])
+            rows.append([("加入下载中心", f"jd:{video_id}")])
         rows.append([("在线搜索", "onl"), ("取消", "x")])
         self._session(chat_id).query = url
         self._session(chat_id).pending_url = url
@@ -801,19 +810,56 @@ class TelegramBotService:
             await self._cleanup(chat_id)
             return
 
-        tracks = snapshot.tracks[:5]
-        self._session(chat_id).query = query
-        self._session(chat_id).online_ids = [t.video_id for t in tracks]
+        ytm = [t for t in snapshot.tracks if (t.result_kind or "ytm") == "ytm" and t.video_id][
+            :3
+        ]
+        meta = [t for t in snapshot.tracks if t.wishable or (t.result_kind or "") == "meta"][
+            :3
+        ]
+        tracks = ytm + meta
+        if not tracks:
+            await self._say(chat_id, "在线无结果。")
+            await self._cleanup(chat_id)
+            return
+
+        session = self._session(chat_id)
+        session.query = query
+        session.online_ids = []
+        session.online_kinds = []
+        session.online_meta = []
         rows: list[list[tuple[str, str]]] = []
         for idx, track in enumerate(tracks):
+            kind = "meta" if (track.wishable or track.result_kind == "meta") else "ytm"
             label = f"{track.artist} - {track.title}"
+            if kind == "meta":
+                src = (track.source or "meta").upper()
+                label = f"♡ [{src}] {label}"
             if len(label) > 60:
                 label = label[:57] + "…"
-            rows.append([(label, f"os:{idx}")])
+            session.online_kinds.append(kind)
+            if kind == "ytm":
+                session.online_ids.append(track.video_id)
+                session.online_meta.append({})
+                rows.append([(label, f"os:{idx}")])
+            else:
+                session.online_ids.append("")
+                session.online_meta.append(
+                    {
+                        "title": track.title,
+                        "artists": track.artist,
+                        "album": track.album or "",
+                        "source": track.source or "manual",
+                        "source_id": track.source_id or "",
+                        "source_url": track.source_url,
+                        "thumbnail_url": track.thumbnail_url,
+                        "duration_seconds": track.duration_seconds,
+                    }
+                )
+                rows.append([(label, f"ow:{idx}")])
         rows.append([("取消", "x")])
         await self._say(
             chat_id,
-            "在线结果：",
+            "在线结果（前3 YTM / 后3 心愿）：",
             reply_markup=_inline(rows),
         )
 
@@ -908,16 +954,61 @@ class TelegramBotService:
             if idx < 0 or idx >= len(session.online_ids):
                 await self._cleanup(chat_id)
                 return
+            if idx < len(session.online_kinds) and session.online_kinds[idx] != "ytm":
+                await self._cleanup(chat_id)
+                return
             video_id = session.online_ids[idx]
+            if not video_id:
+                await self._cleanup(chat_id)
+                return
             rows = [[("试听", f"pv:{video_id}")]]
             if role == "admin":
-                rows[0].append(("直接下载", f"dl:{video_id}"))
+                rows[0].append(("立即下载", f"dl:{video_id}"))
             rows.append([("取消", "x")])
             await self._say(
                 chat_id,
                 "请选择操作：",
                 reply_markup=_inline(rows),
             )
+            return
+
+        if data.startswith("ow:"):
+            try:
+                idx = int(data[3:])
+            except ValueError:
+                await self._cleanup(chat_id)
+                return
+            if idx < 0 or idx >= len(session.online_meta):
+                await self._cleanup(chat_id)
+                return
+            payload = session.online_meta[idx] or {}
+            if self._wanted is None:
+                await self._say(chat_id, "心愿歌单不可用。")
+                await self._cleanup(chat_id)
+                return
+            from yubal_api.schemas.wanted import WantedAddRequest
+
+            try:
+                await asyncio.to_thread(
+                    self._wanted.add,
+                    WantedAddRequest(
+                        title=str(payload.get("title") or ""),
+                        artists=str(payload.get("artists") or ""),
+                        album=str(payload.get("album") or ""),
+                        source=str(payload.get("source") or "manual"),
+                        source_id=str(payload.get("source_id") or ""),
+                        source_url=payload.get("source_url"),
+                        thumbnail_url=payload.get("thumbnail_url"),
+                        duration_seconds=payload.get("duration_seconds"),
+                    ),
+                )
+                await self._say(chat_id, "已加入心愿歌单。")
+            except ValueError as exc:
+                await self._say(chat_id, f"加入失败：{exc}")
+            except Exception:
+                logger.exception("Telegram add wanted failed")
+                await self._say(chat_id, "加入心愿失败。")
+            await self._cleanup(chat_id)
             return
 
         if data.startswith("pv:"):

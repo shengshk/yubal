@@ -11,7 +11,7 @@ class SearchRequest(BaseModel):
 
 class SearchTrackResponse(BaseModel):
     rank: int
-    video_id: str
+    video_id: str = ""
     title: str
     artist: str
     album: str | None = None
@@ -20,6 +20,12 @@ class SearchTrackResponse(BaseModel):
     matched: bool = False
     local_path: str | None = None
     preview_cached: bool = False
+    # ytm (default) | musicbrainz | qq | discogs | lastfm
+    result_kind: str = "ytm"
+    source: str | None = None
+    source_id: str | None = None
+    source_url: str | None = None
+    wishable: bool = False
 
 
 class SearchSnapshotResponse(BaseModel):

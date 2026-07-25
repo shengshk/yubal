@@ -66,3 +66,60 @@ def test_direct_id_invalid_cleanup_respects_delay(tmp_path: Path) -> None:
     catalog.delete_location.assert_called_once_with(
         folder, "Artist/Album/01 - Song.flac"
     )
+
+
+def test_direct_id_invalid_cleanup_to_wanted(tmp_path: Path) -> None:
+    data = tmp_path / "Download"
+    data.mkdir()
+    folder = "Direct"
+    album = data / folder / "Artist" / "Album"
+    album.mkdir(parents=True)
+    track = album / "01 - Song.flac"
+    track.write_bytes(b"audio")
+
+    loc = SimpleNamespace(
+        video_id="vid1",
+        save_folder=folder,
+        relative_path="Artist/Album/01 - Song.flac",
+        membership_status=LocationMembershipStatus.OFFLINE,
+        missing_since=datetime.now(UTC) - timedelta(hours=2),
+    )
+    rec = SimpleNamespace(
+        video_id="vid1",
+        title="Song",
+        artist="Artist",
+        album="Album",
+        album_artist="Artist",
+        year=None,
+        track_number=None,
+        thumbnail_url=None,
+    )
+    catalog = MagicMock()
+    catalog.list_for_save_folder.return_value = [(loc, rec)]
+
+    prefs_obj = SimpleNamespace(
+        direct_folder=folder,
+        direct_offline_cleanup_enabled=True,
+        direct_offline_cleanup_action="to_wanted",
+        direct_offline_cleanup_delay_hours=1,
+    )
+    prefs = MagicMock()
+    prefs.effective.return_value = prefs_obj
+
+    wanted = MagicMock()
+    service = SyncLedgerService(
+        repository=MagicMock(),
+        data_path=data,
+        preferences_store=prefs,
+        track_catalog=catalog,
+    )
+    service.bind_wanted_service(wanted)
+    service.reconcile_direct = MagicMock()  # type: ignore[method-assign]
+
+    cleared = service.run_id_invalid_cleanup(now=datetime.now(UTC))
+    assert cleared == 1
+    wanted.add_from_offline.assert_called_once()
+    assert not track.is_file()
+    catalog.delete_location.assert_called_once_with(
+        folder, "Artist/Album/01 - Song.flac"
+    )

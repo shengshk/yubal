@@ -115,6 +115,9 @@ class SyncResult:
     download_results: list | None = None
     remote_tracks: list[TrackMetadata] | None = None
     unavailable_track_count: int = 0
+    # Source ids of playlist entries that are still listed but unplayable
+    # (region-locked / removed). Empty ids (no videoId at all) are omitted.
+    unavailable_video_ids: list[str] = field(default_factory=list)
     destination: str | None = None
     error: str | None = None
 
@@ -628,6 +631,11 @@ class _SyncWorkflow:
             download_results=list(result.download_results),
             remote_tracks=list(result.source_tracks),
             unavailable_track_count=len(result.playlist_info.unavailable_tracks),
+            unavailable_video_ids=[
+                ut.video_id
+                for ut in result.playlist_info.unavailable_tracks
+                if ut.video_id
+            ],
             destination=destination,
         )
 

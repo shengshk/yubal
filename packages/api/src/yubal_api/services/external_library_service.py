@@ -19,6 +19,7 @@ import os
 import re
 import shutil
 import threading
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -54,12 +55,18 @@ from yubal.utils.library import (
     same_filesystem,
     sanitize_direct_folder,
 )
-from yubal.utils.normalize_text import normalize_artist_key, normalize_music_text
+from yubal.utils.normalize_text import (
+    has_cjk,
+    normalize_artist_key,
+    normalize_music_text,
+)
 
 from yubal_api.db.external_library import (
     MATCH_MATCHED,
     MATCH_REJECTED,
     MATCH_UNMATCHED,
+    META_PENDING,
+    META_VERIFIED,
     ExternalPlaylist,
     ExternalRawTrack,
 )
@@ -67,7 +74,6 @@ from yubal_api.db.external_library_repository import ExternalLibraryRepository
 from yubal_api.db.track_catalog import (
     LocationMembershipStatus,
     TrackLocation,
-    TrackRecord,
 )
 from yubal_api.db.track_catalog_repository import TrackCatalogRepository
 from yubal_api.services.library_health_service import LibraryHealthService
@@ -122,12 +128,38 @@ class MatchCandidate:
     auto_ok: bool
 
 
+@dataclass(frozen=True)
+class MetaCandidate:
+    """Wanted-source hit for tag verification / fill (QQ / MusicBrainz / …)."""
+
+    source: str
+    source_id: str
+    title: str
+    artists: str
+    album: str
+    source_url: str | None = None
+    thumbnail_url: str | None = None
+    duration_seconds: int | None = None
+    score: float = 0.0
+
+
+@dataclass(frozen=True)
+class MatchOneManualResult:
+    matched: bool
+    video_id: str | None
+    ingested: bool
+    mode_used: str
+    ytm_candidates: list[MatchCandidate]
+    meta_candidates: list[MetaCandidate]
+
+
 _MANUAL_CANDIDATE_LIMIT = 5
 # Drop picker rows whose (relaxed) title similarity is below this — avoids
 # "artist-overlap only" noise like game-OST dumps with unrelated titles.
 _MANUAL_CANDIDATE_MIN_TITLE = 40.0
 _RANK_TITLE_WEIGHT = 0.7
 _RANK_ARTIST_WEIGHT = 0.3
+_META_CANDIDATE_LIMIT = 5
 
 _ARTIST_SPLIT_RE = re.compile(
     r"\s*/\s*|\s*&\s*|\s*;\s*|\s*,\s*|\s+feat\.?\s+|\s+ft\.?\s+",
@@ -136,7 +168,9 @@ _ARTIST_SPLIT_RE = re.compile(
 
 
 def _split_artist_names(artists: str) -> list[str]:
-    return [part.strip() for part in _ARTIST_SPLIT_RE.split(artists or "") if part.strip()]
+    return [
+        part.strip() for part in _ARTIST_SPLIT_RE.split(artists or "") if part.strip()
+    ]
 
 
 def _search_title(title: str) -> str:
@@ -160,6 +194,11 @@ class SyncPlaylistResult:
     errors: int = 0
     deferred: int = 0
     rejected: int = 0
+    meta_checked: int = 0
+    meta_verified: int = 0
+    enriched: int = 0
+    upgraded: int = 0
+    asset_errors: int = 0
 
 
 @dataclass
@@ -191,6 +230,7 @@ class PlaylistTrackView:
     junk_kind: str | None = None
     cover_url: str | None = None
     cover_source: str | None = None
+    has_embedded_cover: bool = False
     album_artist: str | None = None
     year: str | None = None
     track_number: int | None = None
@@ -198,6 +238,10 @@ class PlaylistTrackView:
     organized_relative_path: str | None = None
     # True when this video_id already has a catalog location under Direct/.
     in_direct: bool = False
+    meta_status: str = "pending"
+    meta_source: str | None = None
+    meta_source_id: str | None = None
+    meta_source_url: str | None = None
 
 
 @dataclass
@@ -208,12 +252,14 @@ class ExternalPlaylistView:
     show_junk: bool
     unmatched_count: int
     matched_count: int
+    meta_verified_count: int
     cloud: int
     local: int
     offline: int
     exclusive: int
     shared: int
     hardlink: int
+    cover_track_path: str | None
     enabled: bool
     max_items: int
     sync_jitter_seconds: int
@@ -273,9 +319,7 @@ def _is_strictly_better(a_key: tuple, b_key: tuple) -> bool:
     return a_key[:4] > b_key[:4]
 
 
-def _read_raw_tags(
-    path: Path, rel_path: str, dir_name: str
-) -> ExternalRawTrack | None:
+def _read_raw_tags(path: Path, rel_path: str, dir_name: str) -> ExternalRawTrack | None:
     """Probe one audio file's tags into an ExternalRawTrack row."""
     try:
         from mediafile import MediaFile
@@ -412,17 +456,20 @@ class ExternalLibraryService:
         # entries may point at either root (dual-root aware index).
         self._track_index = track_index or TrackFileIndex(DOWNLOAD_ROOT)
         self._enrichment = enrichment
+        self._wanted: object | None = None
         self._lock = threading.Lock()
 
     def bind_enrichment(self, enrichment: object | None) -> None:
         """Optional LibraryEnrichmentService for per-playlist enrich during sync."""
         self._enrichment = enrichment
 
+    def bind_wanted_service(self, wanted: object | None) -> None:
+        """Optional WantedService for migrating meta-verified unmatched rows."""
+        self._wanted = wanted
+
     def clear_match_cooldowns(self, *, include_rejected: bool = False) -> int:
         """Clear match backoff (and optionally requeue rejected junk)."""
-        return self._repository.clear_match_cooldowns(
-            include_rejected=include_rejected
-        )
+        return self._repository.clear_match_cooldowns(include_rejected=include_rejected)
 
     # -- Playlists --
 
@@ -472,6 +519,32 @@ class ExternalLibraryService:
             return None
         return self._build_playlist_view(playlist)
 
+    def record_playlist_sync_status(self, dir_name: str, *, status: str) -> None:
+        """Persist the final status after the shared sync core finishes."""
+        self._repository.record_sync(dir_name, status=status)
+
+    def inode_allows_asset_embedding(self, path: Path) -> bool:
+        """Whether a hardlinked file may change the shared audio inode.
+
+        Wanted files can be hardlinks to External/Raw. Resolve the originating
+        playlist by inode so a readonly source never gets modified indirectly.
+        App-owned sidecars remain allowed.
+        """
+        try:
+            target = path.stat()
+        except OSError:
+            return False
+        for playlist in self._repository.list_playlists():
+            for row in self._repository.list_for_dir(playlist.dir_name):
+                candidate = EXTERNAL_RAW_ROOT / row.rel_path
+                try:
+                    stat = candidate.stat()
+                except OSError:
+                    continue
+                if stat.st_dev == target.st_dev and stat.st_ino == target.st_ino:
+                    return bool(playlist.allow_mutate)
+        return True
+
     def _build_playlist_view(self, playlist: ExternalPlaylist) -> ExternalPlaylistView:
         from yubal_api.services.library_hardlink import is_cross_folder_hardlink
 
@@ -479,8 +552,12 @@ class ExternalLibraryService:
         locations = self._catalog.list_for_save_folder(save_folder)
         matched_count = len(locations)
         unmatched_count = self._repository.count_unmatched_for_dir(playlist.dir_name)
+        meta_verified_count = self._repository.count_meta_verified_unmatched(
+            playlist.dir_name
+        )
 
         cloud = offline = local = hardlink = 0
+        cover_track_path: str | None = None
         inode_cache: dict[str, list[tuple[str, tuple[int, int]]]] = {}
         for loc, _rec in locations:
             if loc.membership_status == LocationMembershipStatus.OFFLINE:
@@ -491,6 +568,10 @@ class ExternalLibraryService:
             if not abs_path.is_file():
                 continue
             local += 1
+            if cover_track_path is None:
+                cover_track_path = (
+                    f"External/{loc.save_folder}/{loc.relative_path}".replace("\\", "/")
+                )
             if is_cross_folder_hardlink(
                 abs_path,
                 video_id=loc.video_id,
@@ -508,21 +589,21 @@ class ExternalLibraryService:
             show_junk=bool(playlist.show_raw and playlist.show_junk),
             unmatched_count=unmatched_count,
             matched_count=matched_count,
+            meta_verified_count=meta_verified_count,
             cloud=cloud,
             local=local,
             offline=offline,
             exclusive=local - hardlink,
             shared=0,
             hardlink=hardlink,
+            cover_track_path=cover_track_path,
             enabled=playlist.enabled,
             max_items=playlist.max_items,
             sync_jitter_seconds=playlist.sync_jitter_seconds,
             offline_marking_enabled=playlist.offline_marking_enabled,
             offline_cleanup_enabled=playlist.offline_cleanup_enabled,
             offline_cleanup_action=playlist.offline_cleanup_action or "archive",
-            offline_cleanup_delay_hours=int(
-                playlist.offline_cleanup_delay_hours or 72
-            ),
+            offline_cleanup_delay_hours=int(playlist.offline_cleanup_delay_hours or 72),
             last_synced_at=playlist.last_synced_at,
             last_sync_status=playlist.last_sync_status,
         )
@@ -737,9 +818,7 @@ class ExternalLibraryService:
                         healed += 1
                         present.add(row.video_id)
                 except Exception:
-                    logger.exception(
-                        "Failed healing orphan match %s", row.rel_path
-                    )
+                    logger.exception("Failed healing orphan match %s", row.rel_path)
         if healed:
             logger.info("Healed %d orphan external matches", healed)
         return healed
@@ -761,15 +840,19 @@ class ExternalLibraryService:
         )
 
     @staticmethod
-    def junk_kind_for_row(
-        row: ExternalRawTrack, readonly: bool
-    ) -> str | None:
+    def junk_kind_for_row(row: ExternalRawTrack, readonly: bool) -> str | None:
         """Return ``rw`` / ``ro`` junk grade, or None when not junk.
+
+        Metadata verification is authoritative for the Wanted workflow. A row
+        that failed YTM matching can still be a valid, verified song and must
+        remain in the verified bucket rather than being downgraded to junk.
 
         - Writable junk (``rw``): ``MATCH_REJECTED`` on a mutable playlist.
         - Readonly junk (``ro``): rejected, or incomplete tags, on readonly.
         Mutable + incomplete tags (not rejected) is ordinary unmatched, not junk.
         """
+        if row.meta_status == META_VERIFIED:
+            return None
         if row.match_status == MATCH_REJECTED:
             return "ro" if readonly else "rw"
         if readonly and not ExternalLibraryService.tags_complete_enough(
@@ -781,9 +864,7 @@ class ExternalLibraryService:
     @staticmethod
     def is_junk_row(row: ExternalRawTrack, readonly: bool) -> bool:
         """Junk = rejected, or readonly playlist with incomplete tags."""
-        return (
-            ExternalLibraryService.junk_kind_for_row(row, readonly) is not None
-        )
+        return ExternalLibraryService.junk_kind_for_row(row, readonly) is not None
 
     @staticmethod
     def quality_key(row: ExternalRawTrack) -> tuple:
@@ -906,9 +987,9 @@ class ExternalLibraryService:
                 by_id[vid] = r
         results = list(by_id.values())
 
-        target_artists = [
-            Artist(name=part) for part in artist_parts
-        ] or [Artist(name=all_artists or "Unknown Artist")]
+        target_artists = [Artist(name=part) for part in artist_parts] or [
+            Artist(name=all_artists or "Unknown Artist")
+        ]
         # Primary-only set for scoring — featuring/game credits shouldn't dominate.
         primary_artists = (
             [Artist(name=primary_artist)] if primary_artist else target_artists
@@ -935,15 +1016,16 @@ class ExternalLibraryService:
             if thumbs:
                 best_thumb = max(
                     thumbs,
-                    key=lambda t: (getattr(t, "width", 0) or 0)
-                    * (getattr(t, "height", 0) or 0),
+                    key=lambda t: (
+                        (getattr(t, "width", 0) or 0) * (getattr(t, "height", 0) or 0)
+                    ),
                 )
                 thumb_url = getattr(best_thumb, "url", None)
 
             version_blocked = (
                 not relaxed
                 and not local_has_version
-                and has_version_marker(cand_title)
+                and (has_version_marker(cand_title) or has_version_marker(cand_album))
             )
 
             title_full = 0.0
@@ -995,6 +1077,10 @@ class ExternalLibraryService:
                 + artist_score * _RANK_ARTIST_WEIGHT
                 + album_boost
             )
+            # Studio local: demote Live/DJ/remix candidates in the picker too.
+            if version_blocked:
+                rank_score *= 0.35
+
             auto_ok = (
                 not version_blocked
                 and title_for_auto >= _MATCH_TITLE_THRESHOLD
@@ -1009,7 +1095,7 @@ class ExternalLibraryService:
                     thumbnail_url=thumb_url,
                     title_score=round(title_relaxed, 1),
                     artist_score=round(artist_score, 1),
-                    score=round(rank_score, 1),
+                    score=round(max(0.0, min(100.0, rank_score)), 1),
                     auto_ok=auto_ok,
                 )
             )
@@ -1061,7 +1147,7 @@ class ExternalLibraryService:
                 self._record_failure(row, rejected=rejected)
             return False, []
 
-        match_mode = (mode or self._preferences.effective().match_strictness or "strict")
+        match_mode = mode or self._preferences.effective().match_strictness or "strict"
         match_mode = match_mode.lower().strip()
         if match_mode not in {"strict", "relaxed"}:
             match_mode = "strict"
@@ -1082,11 +1168,9 @@ class ExternalLibraryService:
             )
             return True, []
 
-        picker = [
-            c
-            for c in ranked
-            if c.title_score >= _MANUAL_CANDIDATE_MIN_TITLE
-        ][:_MANUAL_CANDIDATE_LIMIT]
+        picker = [c for c in ranked if c.title_score >= _MANUAL_CANDIDATE_MIN_TITLE][
+            :_MANUAL_CANDIDATE_LIMIT
+        ]
         # Do not fall back to low-title noise; empty picker is preferable.
 
         if record_failure:
@@ -1259,15 +1343,22 @@ class ExternalLibraryService:
         *,
         enrich: bool = False,
         raw_match: bool = True,
+        verify_meta: bool = True,
         junk_match: bool = False,
     ) -> SyncPlaylistResult:
         """Sync one external playlist with selectable steps.
 
-        At least one of ``enrich`` / ``raw_match`` / ``junk_match`` is required.
+        Order (when flags on)::
+
+            scan → fill empty tags (QQ/MB) → YTM match
+            → meta-verify still-unmatched → cover/lyrics enrich → recover
+
+        At least one of ``enrich`` / ``raw_match`` / ``verify_meta`` /
+        ``junk_match`` is required.
         """
-        if not (enrich or raw_match or junk_match):
+        if not (enrich or raw_match or verify_meta or junk_match):
             raise ValueError(
-                "at least one of enrich, raw_match, junk_match is required"
+                "at least one of enrich, raw_match, verify_meta, junk_match is required"
             )
 
         playlist = self._repository.get_playlist(dir_name)
@@ -1280,12 +1371,14 @@ class ExternalLibraryService:
             health.ensure_healthy()
             readonly = not playlist.allow_mutate
 
-            if enrich:
-                self._enrich_organized_folder(dir_name)
-
             if raw_match:
-                # 1) rescan Raw  2) match non-junk  3) recover + collapse
                 self.scan_raw(health, dir_name=dir_name)
+                # A: fill empty title/artist/album via QQ/MB (never YTM).
+                self.fill_empty_tags_batch(
+                    dir_name,
+                    limit=max(playlist.max_items, 20),
+                    write_file=bool(playlist.allow_mutate),
+                )
                 match_result = self.match_batch(
                     health,
                     limit=playlist.max_items,
@@ -1301,9 +1394,23 @@ class ExternalLibraryService:
                 result.rejected += match_result.rejected
                 result.errors += match_result.errors
 
+            if verify_meta:
+                # B: only still-unmatched rows; every sync entry observes the
+                # same verification freshness/backoff rules.
+                meta_result = self.verify_meta_batch(
+                    dir_name,
+                    limit=max(playlist.max_items, 20),
+                    write_file=bool(playlist.allow_mutate),
+                    force=False,
+                )
+                result.meta_checked += int(meta_result.get("checked", 0))
+                result.meta_verified += int(meta_result.get("verified", 0))
+
+            if enrich:
+                # Cover/lyrics only — never rewrite title/artist/album here.
+                self._enrich_organized_folder(dir_name)
+
             if junk_match:
-                # Capture junk paths before index-only scrape (tags may become
-                # complete, which would clear the junk flag).
                 junk_paths = {
                     row.rel_path
                     for row in self._repository.list_for_dir(dir_name)
@@ -1314,11 +1421,13 @@ class ExternalLibraryService:
                     row = self._repository.get(rel)
                     if row is None:
                         continue
-                    # Rejected rows are not list_matchable until requeued.
                     if row.match_status == MATCH_REJECTED:
                         self._repository.reset_match_state(rel)
                         row = self._repository.get(rel) or row
-                    self._scrape_raw_tags_once(row, write_file=False)
+                    # Fill empty via QQ/MB (index-only for junk; file when mutable).
+                    self._fill_empty_tags_one(
+                        row, write_file=bool(playlist.allow_mutate)
+                    )
                 junk_result = self.match_batch(
                     health,
                     limit=playlist.max_items,
@@ -1580,16 +1689,20 @@ class ExternalLibraryService:
             "delete_matched",
             "move_matched_to_direct",
             "add_matched_to_direct",
+            "add_meta_verified_to_wanted",
             "delete_unmatched",
             "delete_all",
         }
         if mode not in ledger_modes | file_modes | cleanup_modes:
             raise ValueError(f"unknown delete mode: {mode}")
         if mode in file_modes and not playlist.allow_mutate:
-            raise ValueError(
-                "read-only playlist: use forget_matched or clear_offline_* modes; "
-                "other file-touching modes require allow_mutate"
-            )
+            # Meta→Wanted hardlinks the raw file; allowed on readonly playlists.
+            if mode != "add_meta_verified_to_wanted":
+                raise ValueError(
+                    "read-only playlist: use forget_matched, "
+                    "add_meta_verified_to_wanted, or clear_offline_* modes; "
+                    "other file-touching modes require allow_mutate"
+                )
 
         result = DeletePlaylistResult()
         liberate_ids: list[str] = []
@@ -1613,6 +1726,10 @@ class ExternalLibraryService:
             result.moved += added[0]
             result.errors += added[1]
             # Keep hukou — hardlink into Direct, still managed by origin.
+        if mode == "add_meta_verified_to_wanted":
+            added = self._add_meta_verified_to_wanted(dir_name)
+            result.moved += added[0]
+            result.errors += added[1]
         if mode in ("delete_unmatched", "delete_all"):
             unmatched = self._delete_unmatched_raw(dir_name)
             result.deleted_raw += unmatched[0]
@@ -1758,8 +1875,450 @@ class ExternalLibraryService:
                 added += 1
             except OSError:
                 errors += 1
-                logger.warning("Could not add %s to Direct", src)
+                logger.warning("Could not add %s to Download Center", src)
         return added, errors
+
+    def _add_meta_verified_to_wanted(self, dir_name: str) -> tuple[int, int]:
+        """Migrate unmatched meta-verified raw rows into the wishlist."""
+        if self._wanted is None:
+            raise RuntimeError("wanted service not configured")
+        prefs = self._preferences.effective()
+        if not prefs.wanted_enabled:
+            raise RuntimeError("wishlist is disabled")
+        add_fn = getattr(self._wanted, "add_from_external_meta", None)
+        if not callable(add_fn):
+            raise RuntimeError("wanted service missing add_from_external_meta")
+
+        added = errors = 0
+        from yubal_api.services.meta_verify import meta_fingerprint
+
+        for row in self._repository.list_meta_verified_unmatched(dir_name):
+            fp = meta_fingerprint(row.title, row.artists, row.album)
+            if row.meta_fingerprint and row.meta_fingerprint != fp:
+                self._repository.invalidate_meta(row.rel_path)
+                continue
+            src = EXTERNAL_RAW_ROOT / row.rel_path
+            title = (row.meta_title or row.title or "").strip()
+            artists = (row.meta_artists or row.artists or "").strip()
+            album = (row.meta_album or row.album or "").strip()
+            if not title or not artists or not album:
+                errors += 1
+                continue
+            try:
+                add_fn(
+                    title=title,
+                    artists=artists,
+                    album=album,
+                    source=row.meta_source or "manual",
+                    source_id=row.meta_source_id or "",
+                    source_url=row.meta_source_url,
+                    thumbnail_url=row.meta_thumbnail_url,
+                    source_path=src if src.is_file() else None,
+                )
+                added += 1
+            except Exception:
+                errors += 1
+                logger.exception("Failed meta-verified→wanted for %s", row.rel_path)
+        return added, errors
+
+    def _wanted_source_flags(self) -> dict[str, object]:
+        prefs = self._preferences.effective()
+        return {
+            "enable_musicbrainz": prefs.wanted_source_musicbrainz,
+            "enable_qq": prefs.wanted_source_qq,
+            "enable_discogs": prefs.wanted_source_discogs,
+            "enable_lastfm": prefs.wanted_source_lastfm,
+            "lastfm_api_key": prefs.lastfm_api_key,
+        }
+
+    def _fill_empty_tags_one(self, row: ExternalRawTrack, *, write_file: bool) -> bool:
+        """Fill empty title/artist/album from QQ/MB (never YTM)."""
+        from yubal_api.services.meta_verify import pick_fill_hit_for_empty_fields
+
+        if self.tags_complete_enough(row.title, row.artists, row.album):
+            return False
+        prefs = self._preferences.effective()
+        if not prefs.wanted_enabled:
+            return False
+        flags = self._wanted_source_flags()
+        if not any(
+            [
+                flags["enable_musicbrainz"],
+                flags["enable_qq"],
+                flags["enable_discogs"],
+                flags["enable_lastfm"],
+            ]
+        ):
+            return False
+
+        hit = pick_fill_hit_for_empty_fields(
+            title=row.title or "",
+            artists=row.artists or "",
+            album=row.album or "",
+            duration_ms=row.duration_ms,
+            enable_musicbrainz=bool(flags["enable_musicbrainz"]),
+            enable_qq=bool(flags["enable_qq"]),
+            enable_discogs=bool(flags["enable_discogs"]),
+            enable_lastfm=bool(flags["enable_lastfm"]),
+            lastfm_api_key=str(flags["lastfm_api_key"] or ""),
+        )
+        if hit is None:
+            return False
+
+        title = (row.title or "").strip() or (hit.title or "").strip()
+        artists = (row.artists or "").strip() or (hit.artist or "").strip()
+        album = (row.album or "").strip() or (hit.album or "").strip()
+        if not self.tags_complete_enough(title, artists, album):
+            # Still incomplete — apply whatever we can to the index.
+            pass
+        if (
+            title == (row.title or "").strip()
+            and artists == (row.artists or "").strip()
+            and album == (row.album or "").strip()
+        ):
+            return False
+
+        if write_file:
+            path = EXTERNAL_RAW_ROOT / row.rel_path
+            if path.is_file():
+                try:
+                    from mediafile import MediaFile
+
+                    audio = MediaFile(path)
+                    changed = False
+                    if not (str(audio.title or "").strip()) and title:
+                        audio.title = title
+                        changed = True
+                    if not (str(audio.artist or "").strip()) and artists:
+                        audio.artist = artists
+                        changed = True
+                    if not (str(audio.album or "").strip()) and album:
+                        audio.album = album
+                        changed = True
+                    if changed:
+                        audio.save()
+                    refreshed = _read_raw_tags(path, row.rel_path, row.dir_name)
+                    if refreshed is not None:
+                        refreshed.match_status = row.match_status
+                        refreshed.video_id = row.video_id
+                        refreshed.match_confidence = row.match_confidence
+                        refreshed.match_fail_count = row.match_fail_count
+                        refreshed.match_next_eligible_at = row.match_next_eligible_at
+                        if not (refreshed.title or "").strip():
+                            refreshed.title = title
+                            refreshed.title_norm = normalize_music_text(title)[:500]
+                        if not (refreshed.artists or "").strip():
+                            refreshed.artists = artists
+                            refreshed.artist_norm = normalize_artist_key(artists)[:500]
+                        if not (refreshed.album or "").strip():
+                            refreshed.album = album
+                            refreshed.album_norm = normalize_music_text(album)[:500]
+                        self._repository.upsert(refreshed)
+                        return True
+                except Exception:
+                    logger.exception("Failed filling empty tags on file %s", path)
+
+        refreshed = ExternalRawTrack(
+            rel_path=row.rel_path,
+            dir_name=row.dir_name,
+            mtime_ns=row.mtime_ns,
+            size=row.size,
+            inode=row.inode,
+            codec=row.codec,
+            sample_rate=row.sample_rate,
+            bit_depth=row.bit_depth,
+            channels=row.channels,
+            duration_ms=row.duration_ms,
+            title=title[:500],
+            artists=artists[:500],
+            album=album[:500],
+            album_artist=(row.album_artist or artists)[:500],
+            track_number=row.track_number,
+            disc_number=row.disc_number,
+            year=row.year,
+            title_norm=normalize_music_text(title)[:500],
+            artist_norm=normalize_artist_key(artists)[:500],
+            album_norm=normalize_music_text(album)[:500],
+            has_lyrics=row.has_lyrics,
+            lyrics_embedded=row.lyrics_embedded,
+            has_cover=row.has_cover,
+            cover_embedded=row.cover_embedded,
+            file_key=row.file_key,
+        )
+        self._repository.upsert(refreshed)
+        return True
+
+    def fill_empty_tags_batch(
+        self,
+        dir_name: str,
+        *,
+        limit: int = 50,
+        write_file: bool = False,
+    ) -> dict[str, int]:
+        """Pre-YTM pass: fill empty critical tags via Wanted sources (QQ/MB)."""
+        filled = skipped = checked = 0
+        for row in self._repository.list_for_dir(dir_name):
+            if checked >= limit:
+                break
+            if row.match_status == MATCH_MATCHED:
+                skipped += 1
+                continue
+            if self.tags_complete_enough(row.title, row.artists, row.album):
+                skipped += 1
+                continue
+            checked += 1
+            if checked > 1:
+                time.sleep(0.35)
+            if self._fill_empty_tags_one(row, write_file=write_file):
+                filled += 1
+        return {"checked": checked, "filled": filled, "skipped": skipped}
+
+    def verify_meta_batch(
+        self,
+        dir_name: str,
+        *,
+        limit: int = 50,
+        write_file: bool = False,
+        force: bool = False,
+    ) -> dict[str, int]:
+        """Verify unmatched complete-tag rows against Wanted-enabled sources.
+
+        Runs after scan, before YTM match. Mutable playlists write verified tags
+        back to the audio file; readonly only stores meta_* on the index.
+        """
+        from yubal_api.services.meta_verify import (
+            meta_fingerprint,
+            verify_tags_against_wanted_sources,
+        )
+
+        prefs = self._preferences.effective()
+        if not prefs.wanted_enabled:
+            return {"checked": 0, "verified": 0, "rejected": 0, "skipped": 0}
+        if not (
+            prefs.wanted_source_musicbrainz
+            or prefs.wanted_source_qq
+            or prefs.wanted_source_discogs
+            or prefs.wanted_source_lastfm
+        ):
+            return {"checked": 0, "verified": 0, "rejected": 0, "skipped": 0}
+
+        now = datetime.now(UTC)
+        checked = verified = rejected = skipped = 0
+        for row in self._repository.list_for_dir(dir_name):
+            if checked >= limit:
+                break
+            if row.match_status == MATCH_MATCHED:
+                skipped += 1
+                continue
+            if not self.tags_complete_enough(row.title, row.artists, row.album):
+                skipped += 1
+                continue
+
+            fp = meta_fingerprint(row.title, row.artists, row.album)
+            if (
+                row.meta_status == META_VERIFIED
+                and row.meta_fingerprint == fp
+                and not force
+            ):
+                skipped += 1
+                continue
+            if (
+                row.meta_status == META_VERIFIED
+                and row.meta_fingerprint
+                and row.meta_fingerprint != fp
+            ):
+                self._repository.invalidate_meta(row.rel_path)
+                row = self._repository.get(row.rel_path) or row
+            if (
+                not force
+                and row.meta_next_eligible_at is not None
+                and row.meta_next_eligible_at > now
+            ):
+                skipped += 1
+                continue
+
+            checked += 1
+            # MusicBrainz courtesy: ~1 req/s across providers that hit MB.
+            if checked > 1 and prefs.wanted_source_musicbrainz:
+                time.sleep(1.05)
+
+            result = verify_tags_against_wanted_sources(
+                title=row.title,
+                artists=row.artists,
+                album=row.album,
+                duration_ms=row.duration_ms,
+                enable_musicbrainz=prefs.wanted_source_musicbrainz,
+                enable_qq=prefs.wanted_source_qq,
+                enable_discogs=prefs.wanted_source_discogs,
+                enable_lastfm=prefs.wanted_source_lastfm,
+                lastfm_api_key=prefs.lastfm_api_key,
+            )
+            if result.hit is None and result.errored and not result.rejected:
+                # Provider transport failure — short backoff, keep pending.
+                fails = int(row.meta_fail_count or 0) + 1
+                delay_h = min(6, max(1, fails))
+                self._repository.defer_meta_retry(
+                    row.rel_path,
+                    next_eligible_at=now + timedelta(hours=delay_h),
+                )
+                skipped += 1
+                continue
+            if result.hit is None:
+                fails = int(row.meta_fail_count or 0) + 1
+                delay_h = min(24 * 7, 6 * max(1, fails))
+                self._repository.record_meta_rejected(
+                    row.rel_path,
+                    fingerprint=fp,
+                    next_eligible_at=now + timedelta(hours=delay_h),
+                )
+                rejected += 1
+                continue
+
+            hit = result.hit
+            if write_file:
+                # Stamp meta fields onto the in-memory row so write-back can
+                # re-record verified state after the file upsert.
+                row.meta_source = hit.source
+                row.meta_source_id = hit.source_id
+                row.meta_source_url = hit.source_url
+                row.meta_thumbnail_url = hit.thumbnail_url
+                wrote = self._write_meta_tags_to_file(
+                    row,
+                    title=hit.title,
+                    artists=hit.artist,
+                    album=hit.album or row.album,
+                )
+                if not wrote:
+                    self._repository.record_meta_verified(
+                        row.rel_path,
+                        source=hit.source,
+                        source_id=hit.source_id,
+                        source_url=hit.source_url,
+                        title=hit.title,
+                        artists=hit.artist,
+                        album=hit.album or row.album,
+                        thumbnail_url=hit.thumbnail_url,
+                        fingerprint=fp,
+                    )
+            else:
+                self._repository.record_meta_verified(
+                    row.rel_path,
+                    source=hit.source,
+                    source_id=hit.source_id,
+                    source_url=hit.source_url,
+                    title=hit.title,
+                    artists=hit.artist,
+                    album=hit.album or row.album,
+                    thumbnail_url=hit.thumbnail_url,
+                    fingerprint=fp,
+                )
+            verified += 1
+
+        return {
+            "checked": checked,
+            "verified": verified,
+            "rejected": rejected,
+            "skipped": skipped,
+        }
+
+    def verify_meta_enabled(
+        self, *, per_playlist_limit: int | None = None
+    ) -> dict[str, int]:
+        """Run meta verification for every enabled external playlist."""
+        totals = {"checked": 0, "verified": 0, "rejected": 0, "skipped": 0}
+        for dir_name in sorted(self._repository.list_enabled_dir_names()):
+            playlist = self._repository.get_playlist(dir_name)
+            if playlist is None:
+                continue
+            limit = per_playlist_limit
+            if limit is None:
+                limit = max(int(playlist.max_items or 25), 20)
+            try:
+                part = self.verify_meta_batch(
+                    dir_name,
+                    limit=limit,
+                    write_file=bool(playlist.allow_mutate),
+                )
+            except Exception:
+                logger.exception("External meta verify failed for %s", dir_name)
+                continue
+            for key in totals:
+                totals[key] += int(part.get(key, 0))
+        return totals
+
+    def _write_meta_tags_to_file(
+        self,
+        row: ExternalRawTrack,
+        *,
+        title: str,
+        artists: str,
+        album: str,
+    ) -> bool:
+        """Write verified tags conservatively: fill blanks or soft-equal polish only."""
+        from yubal_api.services.meta_verify import (
+            _soft_artist_equal,
+            _soft_text_equal,
+            meta_fingerprint,
+        )
+
+        path = EXTERNAL_RAW_ROOT / row.rel_path
+        if not path.is_file():
+            return False
+
+        def _should_write(local: str, remote: str, *, kind: str) -> bool:
+            loc = (local or "").strip()
+            rem = (remote or "").strip()
+            if not rem:
+                return False
+            if not loc:
+                return True
+            if kind == "artist":
+                return _soft_artist_equal(loc, rem) and loc != rem
+            return _soft_text_equal(loc, rem, album=(kind == "album")) and loc != rem
+
+        try:
+            from mediafile import MediaFile
+
+            audio = MediaFile(path)
+            changed = False
+            if _should_write(str(audio.title or ""), title, kind="title"):
+                audio.title = title
+                changed = True
+            if _should_write(str(audio.artist or ""), artists, kind="artist"):
+                audio.artist = artists
+                changed = True
+            if _should_write(str(audio.album or ""), album, kind="album"):
+                audio.album = album
+                changed = True
+            if changed:
+                audio.save()
+        except Exception:
+            logger.exception("Failed writing meta tags to %s", path)
+            return False
+        refreshed = _read_raw_tags(path, row.rel_path, row.dir_name)
+        if refreshed is None:
+            return False
+        refreshed.match_status = row.match_status
+        refreshed.video_id = row.video_id
+        refreshed.match_confidence = row.match_confidence
+        refreshed.match_fail_count = row.match_fail_count
+        refreshed.match_next_eligible_at = row.match_next_eligible_at
+        self._repository.upsert(refreshed)
+
+        self._repository.record_meta_verified(
+            row.rel_path,
+            source=row.meta_source or "manual",
+            source_id=row.meta_source_id or "",
+            source_url=row.meta_source_url,
+            title=title,
+            artists=artists,
+            album=album,
+            thumbnail_url=row.meta_thumbnail_url,
+            fingerprint=meta_fingerprint(
+                refreshed.title, refreshed.artists, refreshed.album
+            ),
+        )
+        return True
 
     def _move_matched_to_direct(
         self, dir_name: str, direct_folder: str
@@ -1976,9 +2535,7 @@ class ExternalLibraryService:
             return False
 
         canonical = self._catalog.resolve_canonical_path(video_id)
-        existing = (
-            canonical if canonical is not None and canonical.is_file() else None
-        )
+        existing = canonical if canonical is not None and canonical.is_file() else None
 
         try:
             if existing is not None and source.stat().st_ino == existing.stat().st_ino:
@@ -2127,9 +2684,7 @@ class ExternalLibraryService:
         dest = self._dest_for_row(row, organized_base, link_from.suffix.lower())
         if dest.resolve() != link_from.resolve():
             if not self._hardlink_only(link_from, dest):
-                logger.warning(
-                    "Organized hardlink failed (%s -> %s)", link_from, dest
-                )
+                logger.warning("Organized hardlink failed (%s -> %s)", link_from, dest)
                 return False
             self._hardlink_sidecar(link_from, dest)
         relative_path = str(dest.resolve().relative_to(organized_base.resolve()))
@@ -2292,9 +2847,7 @@ class ExternalLibraryService:
     ) -> list[PlaylistTrackView]:
         playlist = self._repository.get_playlist(dir_name)
         default_show_raw = playlist.show_raw if playlist else True
-        effective_show_raw = (
-            show_raw if show_raw is not None else default_show_raw
-        )
+        effective_show_raw = show_raw if show_raw is not None else default_show_raw
         effective_show_junk = bool(
             effective_show_raw and playlist is not None and playlist.show_junk
         )
@@ -2325,6 +2878,7 @@ class ExternalLibraryService:
                     junk_kind=None,
                     cover_url=rec.cover_url,
                     cover_source=rec.cover_source,
+                    has_embedded_cover=rec.has_embedded_cover,
                     album_artist=rec.album_artist,
                     year=rec.year,
                     track_number=rec.track_number,
@@ -2337,9 +2891,7 @@ class ExternalLibraryService:
             for row in self._repository.list_for_dir(dir_name):
                 if row.match_status == MATCH_MATCHED:
                     continue
-                tags_ok = self.tags_complete_enough(
-                    row.title, row.artists, row.album
-                )
+                tags_ok = self.tags_complete_enough(row.title, row.artists, row.album)
                 junk_kind = self.junk_kind_for_row(row, readonly)
                 if junk_kind is not None and not effective_show_junk:
                     continue
@@ -2360,6 +2912,10 @@ class ExternalLibraryService:
                         album_artist=row.album_artist,
                         year=row.year,
                         track_number=row.track_number,
+                        meta_status=row.meta_status or META_PENDING,
+                        meta_source=row.meta_source,
+                        meta_source_id=row.meta_source_id,
+                        meta_source_url=row.meta_source_url,
                     )
                 )
 
@@ -2452,9 +3008,7 @@ class ExternalLibraryService:
             "ok": errors == 0,
         }
 
-    def _delete_raw_paths(
-        self, dir_name: str, raw_rels: list[str]
-    ) -> tuple[int, int]:
+    def _delete_raw_paths(self, dir_name: str, raw_rels: list[str]) -> tuple[int, int]:
         deleted = errors = 0
         paths: list[str] = []
         stop_at = EXTERNAL_RAW_ROOT / dir_name
@@ -2482,19 +3036,13 @@ class ExternalLibraryService:
 
     def match_one_manual(
         self, rel_path: str, *, mode: str | None = None
-    ) -> tuple[bool, str | None, bool, str, list[MatchCandidate]]:
+    ) -> MatchOneManualResult:
         """Manual match for one raw track (``Raw/…`` or Raw-relative path).
 
-        - Readonly + incomplete critical tags: index-only scrape, then match
-          (single-track exempt from batch junk refusal).
-        - Readwrite: scrape tags once when incomplete, then match; on success
-          enrich with tag+file writes.
-        - Readonly + complete tags: match with available tags/filename; on
-          success, lyrics/cover file writes only.
+        Incomplete tags: fill empty fields via QQ/MB (never YTM), then YTM match.
+        On auto-miss, returns up to 5 YTM candidates and up to 5 meta candidates.
 
-        On auto-miss, returns up to 5 scored candidates for the UI picker.
-
-        Returns ``(matched, video_id, ingested, mode_used, candidates)``.
+        Returns ``MatchOneManualResult``.
         """
         raw_rel = rel_path.strip().replace("\\", "/").lstrip("/")
         if raw_rel.startswith("External/"):
@@ -2503,8 +3051,10 @@ class ExternalLibraryService:
             raw_rel = raw_rel[len(EXTERNAL_RAW_DIR) + 1 :]
 
         match_mode = (
-            mode or self._preferences.effective().match_strictness or "strict"
-        ).lower().strip()
+            (mode or self._preferences.effective().match_strictness or "strict")
+            .lower()
+            .strip()
+        )
         if match_mode not in {"strict", "relaxed"}:
             match_mode = "strict"
 
@@ -2518,29 +3068,86 @@ class ExternalLibraryService:
         complete = self.tags_complete_enough(row.title, row.artists, row.album)
 
         if not complete:
-            # Mutable: write tags to file. Readonly junk: index-only scrape.
-            self._scrape_raw_tags_once(row, write_file=mutable)
-            row = self.get_raw_track(raw_rel) or row
-            if not self.tags_complete_enough(row.title, row.artists, row.album):
-                return False, None, False, match_mode, []
-        elif mutable:
-            # Soft scrape-before-match so album/artist can be upgraded.
-            self._scrape_raw_tags_once(row, write_file=True)
+            self._fill_empty_tags_one(row, write_file=mutable)
             row = self.get_raw_track(raw_rel) or row
 
         matched, candidates = self._match_one_with_candidates(
             row, strict_tags=False, mode=match_mode
         )
-        ingested = False
-        video_id = row.video_id
         if matched:
             refreshed = self.get_raw_track(raw_rel)
-            video_id = refreshed.video_id if refreshed else video_id
+            video_id = refreshed.video_id if refreshed else row.video_id
             ingested = self.ingest_matched(raw_rel)
             if ingested and video_id:
-                self._post_match_enrich(video_id, rewrite_metadata=mutable)
-            return matched, video_id, ingested, match_mode, []
-        return False, None, False, match_mode, candidates
+                self._post_match_enrich(video_id, rewrite_metadata=False)
+            return MatchOneManualResult(
+                matched=True,
+                video_id=video_id,
+                ingested=ingested,
+                mode_used=match_mode,
+                ytm_candidates=[],
+                meta_candidates=[],
+            )
+
+        meta_candidates = self._list_meta_candidates_for_row(row)
+        return MatchOneManualResult(
+            matched=False,
+            video_id=None,
+            ingested=False,
+            mode_used=match_mode,
+            ytm_candidates=candidates,
+            meta_candidates=meta_candidates,
+        )
+
+    def _list_meta_candidates_for_row(
+        self, row: ExternalRawTrack
+    ) -> list[MetaCandidate]:
+        from yubal_api.services.meta_verify import list_meta_candidates
+
+        prefs = self._preferences.effective()
+        if not prefs.wanted_enabled:
+            return []
+        flags = self._wanted_source_flags()
+        if not any(
+            [
+                flags["enable_musicbrainz"],
+                flags["enable_qq"],
+                flags["enable_discogs"],
+                flags["enable_lastfm"],
+            ]
+        ):
+            return []
+        title = (row.title or Path(row.rel_path).stem).strip()
+        artists = (row.artists or "").strip()
+        album = (row.album or "").strip()
+        hits = list_meta_candidates(
+            title=title,
+            artists=artists,
+            album=album,
+            duration_ms=row.duration_ms,
+            enable_musicbrainz=bool(flags["enable_musicbrainz"]),
+            enable_qq=bool(flags["enable_qq"]),
+            enable_discogs=bool(flags["enable_discogs"]),
+            enable_lastfm=bool(flags["enable_lastfm"]),
+            lastfm_api_key=str(flags["lastfm_api_key"] or ""),
+            per_source_limit=_META_CANDIDATE_LIMIT,
+            limit=_META_CANDIDATE_LIMIT,
+            require_soft_match=True,
+        )
+        return [
+            MetaCandidate(
+                source=h.source,
+                source_id=h.source_id,
+                title=h.title,
+                artists=h.artist,
+                album=h.album or "",
+                source_url=h.source_url,
+                thumbnail_url=h.thumbnail_url,
+                duration_seconds=h.duration_seconds,
+                score=float(h.score or 0.0),
+            )
+            for h in hits
+        ]
 
     def accept_match(
         self, rel_path: str, video_id: str, *, confidence: float = 0.0
@@ -2563,9 +3170,6 @@ class ExternalLibraryService:
         if row is None:
             raise ValueError(f"raw track not found: {rel_path}")
 
-        playlist = self._repository.get_playlist(row.dir_name)
-        mutable = bool(playlist and playlist.allow_mutate)
-
         self._repository.record_match_success(
             raw_rel,
             video_id=video_id,
@@ -2573,24 +3177,110 @@ class ExternalLibraryService:
         )
         ingested = self.ingest_matched(raw_rel)
         if ingested:
-            self._post_match_enrich(video_id, rewrite_metadata=mutable)
+            self._post_match_enrich(video_id, rewrite_metadata=False)
         return True, video_id, ingested
+
+    def accept_meta_candidate(
+        self,
+        rel_path: str,
+        *,
+        source: str,
+        source_id: str,
+        title: str,
+        artists: str,
+        album: str = "",
+        source_url: str | None = None,
+        thumbnail_url: str | None = None,
+        write_file: bool | None = None,
+    ) -> bool:
+        """Mark a raw track meta-verified from a manually chosen Wanted-source hit.
+
+        Does not bind a YTM ``video_id``. Optional conservative tag write-back
+        when the playlist is mutable.
+        """
+        from yubal_api.services.meta_verify import meta_fingerprint
+
+        raw_rel = rel_path.strip().replace("\\", "/").lstrip("/")
+        if raw_rel.startswith("External/"):
+            raw_rel = raw_rel[len("External/") :]
+        if raw_rel.startswith(f"{EXTERNAL_RAW_DIR}/"):
+            raw_rel = raw_rel[len(EXTERNAL_RAW_DIR) + 1 :]
+
+        row = self.get_raw_track(raw_rel)
+        if row is None:
+            raise ValueError(f"raw track not found: {rel_path}")
+        if row.match_status == MATCH_MATCHED:
+            raise ValueError("track already YTM-matched")
+
+        playlist = self._repository.get_playlist(row.dir_name)
+        mutable = bool(playlist and playlist.allow_mutate)
+        do_write = mutable if write_file is None else bool(write_file) and mutable
+
+        title = (title or "").strip()
+        artists = (artists or "").strip()
+        album = (album or row.album or "").strip()
+        if not title or not artists:
+            raise ValueError("title and artists are required")
+
+        fp = meta_fingerprint(row.title, row.artists, row.album)
+        if do_write:
+            row.meta_source = source
+            row.meta_source_id = source_id
+            row.meta_source_url = source_url
+            row.meta_thumbnail_url = thumbnail_url
+            wrote = self._write_meta_tags_to_file(
+                row, title=title, artists=artists, album=album
+            )
+            if not wrote:
+                self._repository.record_meta_verified(
+                    row.rel_path,
+                    source=source,
+                    source_id=source_id,
+                    source_url=source_url,
+                    title=title,
+                    artists=artists,
+                    album=album,
+                    thumbnail_url=thumbnail_url,
+                    fingerprint=fp,
+                )
+        else:
+            self._repository.record_meta_verified(
+                row.rel_path,
+                source=source,
+                source_id=source_id,
+                source_url=source_url,
+                title=title,
+                artists=artists,
+                album=album,
+                thumbnail_url=thumbnail_url,
+                fingerprint=fp,
+            )
+        return True
 
     def _scrape_raw_tags_once(
         self, row: ExternalRawTrack, *, write_file: bool = True
     ) -> bool:
-        """Best-effort YTM search → update critical tags.
+        """Best-effort YTM search → fill missing critical tags only.
 
-        When ``write_file`` is True, write tags onto the Raw audio file then
-        refresh the index from disk. When False, upsert title/artists/album
-        into the ExternalRawTrack index only (readonly / junk path).
+        Never replaces a non-empty local field with YTM text. YTM often returns
+        romanized/pinyin titles for CJK catalog entries; overwriting would destroy
+        good local tags (e.g. 此生不换 → Ci Sheng Bu Huan).
+
+        When ``write_file`` is True, write filled tags onto the Raw audio file then
+        refresh the index from disk. When False, upsert into the index only.
         """
+        local_title = (row.title or "").strip()
+        local_artists = (row.artists or "").strip()
+        local_album = (row.album or "").strip()
+        if self.tags_complete_enough(local_title, local_artists, local_album):
+            return False
+
         query = " ".join(
             part
             for part in (
-                (row.artists or "").strip(),
-                (row.title or Path(row.rel_path).stem).strip(),
-                (row.album or "").strip(),
+                local_artists,
+                local_title or Path(row.rel_path).stem.strip(),
+                local_album,
             )
             if part
         ).strip()
@@ -2604,10 +3294,30 @@ class ExternalLibraryService:
         if not results:
             return False
         best = results[0]
-        title = (best.title or "").strip()
-        artists = " / ".join(a.name for a in best.artists if a.name).strip()
-        album = (best.album.name if best.album else "") or ""
+        remote_title = (best.title or "").strip()
+        remote_artists = " / ".join(a.name for a in best.artists if a.name).strip()
+        remote_album = (best.album.name if best.album else "") or ""
+        if not self.tags_complete_enough(
+            remote_title or local_title,
+            remote_artists or local_artists,
+            remote_album or local_album,
+        ):
+            return False
+
+        def _pick(local: str, remote: str) -> str:
+            if local:
+                # Keep CJK local over ASCII-only YTM romanization.
+                if has_cjk(local) and remote and not has_cjk(remote):
+                    return local
+                return local
+            return remote
+
+        title = _pick(local_title, remote_title)
+        artists = _pick(local_artists, remote_artists)
+        album = _pick(local_album, remote_album)
         if not self.tags_complete_enough(title, artists, album):
+            return False
+        if title == local_title and artists == local_artists and album == local_album:
             return False
 
         if not write_file:
@@ -2625,7 +3335,11 @@ class ExternalLibraryService:
                 title=title,
                 artists=artists,
                 album=album,
-                album_artist=artists if best.album else (row.album_artist or ""),
+                album_artist=(
+                    artists
+                    if best.album and not (row.album_artist or "").strip()
+                    else (row.album_artist or artists)
+                ),
                 track_number=row.track_number,
                 disc_number=row.disc_number,
                 year=row.year,
@@ -2649,10 +3363,17 @@ class ExternalLibraryService:
             from mediafile import MediaFile
 
             audio = MediaFile(path)
-            audio.title = title
-            audio.artist = artists
-            audio.album = album
-            if best.album and getattr(best, "artists", None):
+            if not (str(audio.title or "").strip()):
+                audio.title = title
+            if not (str(audio.artist or "").strip()):
+                audio.artist = artists
+            if not (str(audio.album or "").strip()):
+                audio.album = album
+            if (
+                best.album
+                and getattr(best, "artists", None)
+                and not (str(audio.albumartist or "").strip())
+            ):
                 audio.albumartist = artists
             audio.save()
         except Exception:
@@ -2667,6 +3388,16 @@ class ExternalLibraryService:
         refreshed.match_confidence = row.match_confidence
         refreshed.match_fail_count = row.match_fail_count
         refreshed.match_next_eligible_at = row.match_next_eligible_at
+        # Index may still need fills when file tags stayed empty.
+        if not (refreshed.title or "").strip():
+            refreshed.title = title
+            refreshed.title_norm = normalize_music_text(title)[:500]
+        if not (refreshed.artists or "").strip():
+            refreshed.artists = artists
+            refreshed.artist_norm = normalize_artist_key(artists)[:500]
+        if not (refreshed.album or "").strip():
+            refreshed.album = album
+            refreshed.album_norm = normalize_music_text(album)[:500]
         self._repository.upsert(refreshed)
         return True
 
@@ -2723,9 +3454,7 @@ class ExternalLibraryService:
                 ),
                 ytmusic_client=self._client,
             )
-            outcome = service.enrich_file(
-                path, meta, rewrite_metadata=rewrite_metadata
-            )
+            outcome = service.enrich_file(path, meta, rewrite_metadata=rewrite_metadata)
             self._catalog.update_asset_state(
                 video_id=video_id,
                 has_embedded_cover=outcome.has_embedded_cover,
@@ -2954,7 +3683,7 @@ class ExternalLibraryService:
             )
             self._collapse_video_inodes(rec.video_id)
         except OSError:
-            logger.warning("Could not add %s to Direct", src)
+            logger.warning("Could not add %s to Download Center", src)
             return {
                 "moved": 0,
                 "deleted_locations": 0,

@@ -66,9 +66,7 @@ def _has_synced_lyrics(record: TrackRecord, path: Path | None = None) -> bool:
     try:
         lrc = path.with_suffix(".lrc")
         if lrc.is_file():
-            return lyrics_are_synced(
-                lrc.read_text(encoding="utf-8", errors="ignore")
-            )
+            return lyrics_are_synced(lrc.read_text(encoding="utf-8", errors="ignore"))
     except OSError:
         pass
     return False
@@ -119,9 +117,7 @@ class LibraryEnrichmentService:
         finally:
             self._lock.release()
 
-    def enrich_track(
-        self, video_id: str, *, force: bool = True
-    ) -> EnrichmentSummary:
+    def enrich_track(self, video_id: str, *, force: bool = True) -> EnrichmentSummary:
         """Fill or upgrade one non-premium track by video_id.
 
         Single-track UI actions pass ``force=True`` (scrape/cover cooldown exempt).
@@ -278,6 +274,9 @@ class LibraryEnrichmentService:
             path,
             self._build_metadata(record, path),
             rewrite_metadata=rewrite_metadata,
+            # Immutable external sources may receive an app-owned .lrc sidecar,
+            # but the shared audio inode itself must never be changed.
+            embed_assets=not record.immutable,
         )
         lyrics_text = outcome.lyrics or record.lyrics
         new_tier = compute_track_tier(
@@ -303,9 +302,7 @@ class LibraryEnrichmentService:
                 last_enrich_error=outcome.error,
             )
         except Exception:
-            logger.exception(
-                "Failed to persist enrichment for %s", record.video_id
-            )
+            logger.exception("Failed to persist enrichment for %s", record.video_id)
         if outcome.error:
             summary.failed += 1
         else:
@@ -330,9 +327,7 @@ class LibraryEnrichmentService:
                         storage, f"{loc.save_folder}/{loc.relative_path}"
                     )
                 else:
-                    candidate = (
-                        self._data_path / loc.save_folder / loc.relative_path
-                    )
+                    candidate = self._data_path / loc.save_folder / loc.relative_path
             except ValueError:
                 continue
             if candidate.is_file():
@@ -379,11 +374,11 @@ class LibraryEnrichmentService:
         prefs = self._preferences.effective()
         excellence = int(getattr(prefs, "cover_excellence_px", 0) or 0)
         # force: treat cover shelf as expired so premium/complete re-checks run.
-        probe_days = 0 if force else int(getattr(prefs, "cover_probe_fresh_days", 7) or 7)
+        probe_days = (
+            0 if force else int(getattr(prefs, "cover_probe_fresh_days", 7) or 7)
+        )
         download_days = (
-            0
-            if force
-            else int(getattr(prefs, "cover_download_fresh_days", 30) or 30)
+            0 if force else int(getattr(prefs, "cover_download_fresh_days", 30) or 30)
         )
         if not video_id:
             return {
@@ -440,9 +435,7 @@ class LibraryEnrichmentService:
             scrape_cooldown_hours=0 if force else prefs.scrape_cooldown_hours,
             cover_excellence_px=int(getattr(prefs, "cover_excellence_px", 0) or 0),
             cover_probe_fresh_days=(
-                0
-                if force
-                else int(getattr(prefs, "cover_probe_fresh_days", 7) or 7)
+                0 if force else int(getattr(prefs, "cover_probe_fresh_days", 7) or 7)
             ),
             cover_download_fresh_days=(
                 0

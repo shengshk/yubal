@@ -32,8 +32,16 @@ class SubscriptionUpdate(BaseModel):
     sync_mode: SubscriptionSyncMode | None = None
     offline_marking_enabled: bool | None = None
     offline_cleanup_enabled: bool | None = None
-    offline_cleanup_action: OfflineCleanupAction | None = None
+    offline_cleanup_action: Literal["delete", "archive"] | None = None
     offline_cleanup_delay_hours: int | None = Field(
+        default=None,
+        ge=0,
+        le=8760,
+    )
+    id_invalid_marking_enabled: bool | None = None
+    id_invalid_cleanup_enabled: bool | None = None
+    id_invalid_cleanup_action: OfflineCleanupAction | None = None
+    id_invalid_cleanup_delay_hours: int | None = Field(
         default=None,
         ge=0,
         le=8760,
@@ -61,8 +69,12 @@ class SubscriptionResponse(BaseModel):
     sync_mode: SubscriptionSyncMode = SubscriptionSyncMode.INCREMENTAL
     offline_marking_enabled: bool = True
     offline_cleanup_enabled: bool = False
-    offline_cleanup_action: OfflineCleanupAction = OfflineCleanupAction.ARCHIVE
+    offline_cleanup_action: Literal["delete", "archive"] = "archive"
     offline_cleanup_delay_hours: int = 72
+    id_invalid_marking_enabled: bool = True
+    id_invalid_cleanup_enabled: bool = False
+    id_invalid_cleanup_action: OfflineCleanupAction = OfflineCleanupAction.ARCHIVE
+    id_invalid_cleanup_delay_hours: int = 72
     thumbnail_url: str | None = Field(default=None, json_schema_extra={"format": "uri"})
     created_at: UTCDateTime
     last_synced_at: UTCDateTime | None
@@ -80,6 +92,23 @@ class SyncResponse(BaseModel):
     """Response for sync operations."""
 
     job_ids: list[str]
+    steps: list["SyncStepResult"] = Field(default_factory=list)
+
+
+class SyncStepResult(BaseModel):
+    """Immediate Sync All pipeline step result."""
+
+    key: Literal[
+        "health",
+        "subscriptions",
+        "direct",
+        "enrichment",
+        "external",
+        "wanted",
+        "hardlinks",
+    ]
+    status: Literal["complete", "queued", "started", "skipped", "failed"]
+    count: int | None = None
 
 
 class SubscriptionTrackResponse(BaseModel):
@@ -107,7 +136,7 @@ class SubscriptionTrackListResponse(BaseModel):
 
 
 class SubscriptionTrackDisposeRequest(BaseModel):
-    action: OfflineCleanupAction = OfflineCleanupAction.DELETE
+    action: Literal["delete", "archive", "to_wanted"] = "delete"
 
 
 class SubscriptionTrackFileDeleteRequest(BaseModel):

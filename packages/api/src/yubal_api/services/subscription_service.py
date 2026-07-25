@@ -4,6 +4,7 @@ import logging
 import shutil
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 from uuid import UUID
 
 from yubal import (
@@ -12,12 +13,13 @@ from yubal import (
     PlaylistParseError,
     UnsupportedPlaylistError,
     UpstreamAPIError,
+    parse_playlist_id,
 )
+from yubal.services.track_index import rewrite_track_index_prefix
 from yubal.utils.library import (
     default_subscription_save_folder,
     sanitize_save_folder,
 )
-from yubal.services.track_index import rewrite_track_index_prefix
 
 from yubal_api.api.exceptions import (
     FolderConflictError,
@@ -31,6 +33,18 @@ from yubal_api.services.playlist_info_service import PlaylistInfoService
 from yubal_api.services.protocols import SubscriptionRepository
 
 logger = logging.getLogger(__name__)
+
+LIKED_MUSIC_PLAYLIST_ID = "LM"
+LIKED_MUSIC_NAME = "Liked Music"
+LIKED_MUSIC_SAVE_FOLDER = "liked"
+
+
+def is_liked_music_url(url: str) -> bool:
+    """Whether a subscription URL points to the account's Liked Music."""
+    try:
+        return parse_playlist_id(url) == LIKED_MUSIC_PLAYLIST_ID
+    except PlaylistParseError:
+        return False
 
 
 def _dir_has_entries(path: Path) -> bool:
@@ -69,12 +83,12 @@ class SubscriptionService:
         self._job_executor = None
         self._membership = None
 
-    def bind_maintenance(self, gate, job_executor) -> None:
+    def bind_maintenance(self, gate: Any, job_executor: Any) -> None:
         """Wire OperationGate + JobExecutor for exclusive save-folder moves."""
         self._gate = gate
         self._job_executor = job_executor
 
-    def bind_membership(self, membership_service) -> None:
+    def bind_membership(self, membership_service: Any) -> None:
         """Wire membership reconciler for reference-safe file operations."""
         self._membership = membership_service
 
@@ -114,17 +128,26 @@ class SubscriptionService:
             logger.warning("Unexpected error fetching metadata for %s: %s", url, e)
             raise MetadataFetchError(str(e), upstream_error=type(e).__name__) from e
 
-        save_folder = default_subscription_save_folder(
-            metadata.title, ascii_filenames=self._ascii_filenames
-        )
+        is_liked_music = is_liked_music_url(url)
+        if is_liked_music:
+            name = LIKED_MUSIC_NAME
+            save_folder = LIKED_MUSIC_SAVE_FOLDER
+            account_fingerprint = self._playlist_info.get_account_fingerprint()
+        else:
+            name = metadata.title
+            save_folder = default_subscription_save_folder(
+                metadata.title, ascii_filenames=self._ascii_filenames
+            )
+            account_fingerprint = None
         subscription = Subscription(
             type=SubscriptionType.PLAYLIST,
             url=url,
-            name=metadata.title,
+            name=name,
             save_folder=save_folder,
             thumbnail_url=metadata.thumbnail_url,
             enabled=True,
             max_items=max_items,
+            source_account_fingerprint=account_fingerprint,
             created_at=datetime.now(UTC),
         )
         return self._repository.create(subscription)
@@ -139,12 +162,28 @@ class SubscriptionService:
         if not fields:
             return self.get(subscription_id)
 
+        sub = self.get(subscription_id)
+        if is_liked_music_url(sub.url):
+            requested_folder = fields.get("save_folder")
+            if (
+                requested_folder is not None
+                and sanitize_save_folder(
+                    requested_folder,
+                    ascii_filenames=self._ascii_filenames,
+                )
+                != LIKED_MUSIC_SAVE_FOLDER
+            ):
+                raise SubscriptionConflictError(
+                    "Liked Music uses the fixed folder 'liked'.",
+                    subscription_id=subscription_id,
+                )
+            fields = {**fields, "name": LIKED_MUSIC_NAME}
+
         if "save_folder" in fields:
             new_folder = sanitize_save_folder(
                 fields["save_folder"], ascii_filenames=self._ascii_filenames
             )
             fields = {**fields, "save_folder": new_folder}
-            sub = self.get(subscription_id)
             old_folder = sub.save_folder or sub.name
             if new_folder != old_folder:
                 run_exclusive(
@@ -163,6 +202,33 @@ class SubscriptionService:
         if sub is None:
             raise SubscriptionNotFoundError(subscription_id)
         return sub
+
+    def prepare_for_sync(self, subscription: Subscription) -> Subscription:
+        """Validate fixed Liked Music settings and prevent account mixing."""
+        if not is_liked_music_url(subscription.url):
+            return subscription
+        if subscription.save_folder != LIKED_MUSIC_SAVE_FOLDER:
+            raise SubscriptionConflictError(
+                "Liked Music must use the fixed folder 'liked'.",
+                subscription_id=subscription.id,
+            )
+
+        current_fingerprint = self._playlist_info.get_account_fingerprint()
+        bound_fingerprint = subscription.source_account_fingerprint
+        if bound_fingerprint and bound_fingerprint != current_fingerprint:
+            raise SubscriptionConflictError(
+                "Liked Music belongs to a different YouTube Music account. "
+                "Sync was blocked to prevent mixing libraries.",
+                subscription_id=subscription.id,
+            )
+
+        updates: SubscriptionFields = {"name": LIKED_MUSIC_NAME}
+        if not bound_fingerprint:
+            updates["source_account_fingerprint"] = current_fingerprint
+        updated = self._repository.update(subscription.id, updates)
+        if updated is None:
+            raise SubscriptionNotFoundError(subscription.id)
+        return updated
 
     def _migrate_save_folder(
         self,
@@ -210,7 +276,9 @@ class SubscriptionService:
                     subscription_id=subscription_id,
                 )
             if self._membership is not None:
-                moved = self._membership.migrate_save_folder(sub, old_folder, new_folder)
+                moved = self._membership.migrate_save_folder(
+                    sub, old_folder, new_folder
+                )
                 logger.info(
                     "Migrated %d membership files: %s -> %s",
                     moved,

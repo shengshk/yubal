@@ -1,5 +1,6 @@
 """Tests for JobExecutor timeout enforcement."""
 
+import asyncio
 import time
 from typing import Any
 from uuid import UUID
@@ -34,6 +35,9 @@ class FakeJobStore:
     def transition(self, job_id: str, status: JobStatus, **kwargs: Any) -> Job:
         self.transitions.append((job_id, status))
         return Job(id=job_id, url="", audio_format=AudioCodec.OPUS, status=status)
+
+    def get(self, job_id: str) -> Job:
+        return Job(id=job_id, url="", audio_format=AudioCodec.OPUS)
 
     def pop_next_pending(self) -> Job | None:
         return self._pending.pop(0) if self._pending else None
@@ -85,6 +89,30 @@ class TestExecutorTimeout:
 
         # Active slot should have been released
         assert "test-job" in store.released
+
+    @pytest.mark.asyncio
+    async def test_create_job_from_scheduler_thread_uses_app_loop(
+        self,
+        store: FakeJobStore,
+        tmp_path: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Scheduler worker threads must dispatch jobs to the application loop."""
+        executor = JobExecutor(job_store=store, base_path=tmp_path)
+        completed = asyncio.Event()
+
+        async def fake_run_job(*_args: Any, **_kwargs: Any) -> None:
+            completed.set()
+
+        monkeypatch.setattr(executor, "_run_job", fake_run_job)
+
+        job = await asyncio.to_thread(
+            executor.create_and_start_job,
+            "https://example.com",
+        )
+
+        assert job is not None
+        await asyncio.wait_for(completed.wait(), timeout=1)
 
     @pytest.mark.asyncio
     async def test_normal_completion_within_timeout(

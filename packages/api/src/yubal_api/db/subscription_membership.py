@@ -10,7 +10,12 @@ from sqlmodel import Field, SQLModel
 
 class MembershipStatus(StrEnum):
     ACTIVE = "active"
+    # Removed from the cloud playlist entirely (no longer listed upstream).
     OFFLINE = "offline"
+    # Still listed upstream but the source id is unplayable (removed / private /
+    # region-locked). Kept distinct from OFFLINE so it can be surfaced/cleared
+    # like Direct's "ID invalid".
+    ID_INVALID = "id_invalid"
     # User-forbidden sync: keep list row, never auto-download until unblocked.
     BLOCKED = "blocked"
 

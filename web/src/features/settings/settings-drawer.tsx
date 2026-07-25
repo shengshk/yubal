@@ -1,5 +1,10 @@
 import { scanExternal } from "@/api/external";
-import { getLibraryHealth, type LibraryHealth } from "@/api/library-health";
+import {
+  auditLibrary,
+  getLibraryHealth,
+  type LibraryAudit,
+  type LibraryHealth,
+} from "@/api/library-health";
 import {
   clearMatchCooldowns,
   clearScrapeCooldowns,
@@ -11,6 +16,7 @@ import {
   type ReclaimPitTarget,
   type SettingsUpdate,
 } from "@/api/settings";
+import { HoverHint } from "@/components/common/hover-hint";
 import { LanguageToggler } from "@/components/layout/language-toggler";
 import { AnimatedThemeToggler } from "@/components/magicui/animated-theme-toggler";
 import { useAuth } from "@/features/auth/auth-context";
@@ -35,6 +41,7 @@ import {
 } from "@heroui/react";
 import {
   CookieIcon,
+  HeartIcon,
   LibraryIcon,
   LogOutIcon,
   Mic2Icon,
@@ -81,6 +88,15 @@ type FormState = {
   telegram_admin_ids: string;
   telegram_user_ids: string;
   telegram_daily_limit: string;
+  wanted_enabled: boolean;
+  wanted_auto_match_enabled: boolean;
+  wanted_max_items: string;
+  wanted_sync_jitter_seconds: string;
+  wanted_source_musicbrainz: boolean;
+  wanted_source_qq: boolean;
+  wanted_source_discogs: boolean;
+  wanted_source_lastfm: boolean;
+  lastfm_api_key: string;
 };
 
 function formFromSettings(data: AppSettings): FormState {
@@ -111,6 +127,15 @@ function formFromSettings(data: AppSettings): FormState {
     telegram_admin_ids: data.telegram_admin_ids ?? "",
     telegram_user_ids: data.telegram_user_ids ?? "",
     telegram_daily_limit: String(data.telegram_daily_limit ?? 5),
+    wanted_enabled: data.wanted_enabled ?? true,
+    wanted_auto_match_enabled: data.wanted_auto_match_enabled ?? true,
+    wanted_max_items: String(data.wanted_max_items ?? 50),
+    wanted_sync_jitter_seconds: String(data.wanted_sync_jitter_seconds ?? 600),
+    wanted_source_musicbrainz: data.wanted_source_musicbrainz ?? true,
+    wanted_source_qq: data.wanted_source_qq ?? true,
+    wanted_source_discogs: data.wanted_source_discogs ?? false,
+    wanted_source_lastfm: data.wanted_source_lastfm ?? false,
+    lastfm_api_key: data.lastfm_api_key ?? "",
   };
 }
 
@@ -139,6 +164,8 @@ export function SettingsDrawer({ isOpen, onOpenChange }: Props) {
     null,
   );
   const [externalScanning, setExternalScanning] = useState(false);
+  const [auditingLibrary, setAuditingLibrary] = useState(false);
+  const [libraryAudit, setLibraryAudit] = useState<LibraryAudit | null>(null);
   const [clearingCooldowns, setClearingCooldowns] = useState(false);
   const [reclaiming, setReclaiming] = useState(false);
   const [reclaimTarget, setReclaimTarget] = useState<ReclaimPitTarget | null>(
@@ -245,6 +272,28 @@ export function SettingsDrawer({ isOpen, onOpenChange }: Props) {
     window.dispatchEvent(new Event("yubal:ledger-changed"));
   };
 
+  const handleLibraryAudit = async () => {
+    setAuditingLibrary(true);
+    const result = await auditLibrary(true);
+    setAuditingLibrary(false);
+    if ("error" in result) {
+      showErrorToast(t("settings.libraryAuditFailed"), result.error);
+      return;
+    }
+    setLibraryAudit(result);
+    showSuccessToast(
+      t("settings.libraryAuditDoneTitle"),
+      t("settings.libraryAuditDone", {
+        physical: result.physical_count,
+        catalog: result.catalog_location_count,
+        repaired:
+          result.repaired_catalog_locations + result.repaired_index_entries,
+        untracked: result.untracked_physical_count,
+      }),
+    );
+    window.dispatchEvent(new Event("yubal:ledger-changed"));
+  };
+
   const handleClearScrapeCooldowns = async () => {
     setClearingCooldowns(true);
     const result = await clearScrapeCooldowns();
@@ -345,39 +394,39 @@ export function SettingsDrawer({ isOpen, onOpenChange }: Props) {
               </div>
 
               <div className="flex flex-col gap-3">
-                <div className="flex items-center justify-between gap-3">
-                  <span className="text-foreground-500 text-sm font-medium">
-                    {t("settings.schedulerTitle")}
-                  </span>
-                  <Switch
+                <HoverHint content={t("settings.schedulerScopeSummary")}>
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="text-foreground-500 text-sm font-medium">
+                      {t("settings.schedulerTitle")}
+                    </span>
+                    <Switch
+                      size="sm"
+                      isSelected={form?.scheduler_enabled ?? true}
+                      isDisabled={busy}
+                      onValueChange={(v) => {
+                        if (!form) return;
+                        setForm({ ...form, scheduler_enabled: v });
+                        patchField({ scheduler_enabled: v });
+                      }}
+                    />
+                  </div>
+                </HoverHint>
+                <HoverHint content={t("settings.schedulerCronHint")}>
+                  <Input
                     size="sm"
-                    isSelected={form?.scheduler_enabled ?? true}
-                    isDisabled={busy}
+                    label={t("settings.schedulerCron")}
+                    value={form?.scheduler_cron ?? ""}
+                    isDisabled={busy || !(form?.scheduler_enabled ?? true)}
                     onValueChange={(v) => {
                       if (!form) return;
-                      setForm({ ...form, scheduler_enabled: v });
-                      patchField({ scheduler_enabled: v });
+                      setForm({ ...form, scheduler_cron: v });
+                      patchFieldDebounced("scheduler_cron", {
+                        scheduler_cron: v.trim(),
+                      });
                     }}
+                    classNames={{ input: "font-mono" }}
                   />
-                </div>
-                <p className="text-foreground-400 text-pretty text-xs">
-                  {t("settings.schedulerScopeSummary")}
-                </p>
-                <Input
-                  size="sm"
-                  label={t("settings.schedulerCron")}
-                  title={t("settings.schedulerCronHint")}
-                  value={form?.scheduler_cron ?? ""}
-                  isDisabled={busy || !(form?.scheduler_enabled ?? true)}
-                  onValueChange={(v) => {
-                    if (!form) return;
-                    setForm({ ...form, scheduler_cron: v });
-                    patchFieldDebounced("scheduler_cron", {
-                      scheduler_cron: v.trim(),
-                    });
-                  }}
-                  classNames={{ input: "font-mono" }}
-                />
+                </HoverHint>
               </div>
 
               <div className="flex flex-col gap-3">
@@ -417,7 +466,11 @@ export function SettingsDrawer({ isOpen, onOpenChange }: Props) {
                       if (!form) return;
                       setForm({ ...form, audio_quality: v });
                       const quality = Number.parseInt(v, 10);
-                      if (Number.isNaN(quality) || quality < 0 || quality > 10) {
+                      if (
+                        Number.isNaN(quality) ||
+                        quality < 0 ||
+                        quality > 10
+                      ) {
                         return;
                       }
                       patchFieldDebounced("audio_quality", {
@@ -572,30 +625,45 @@ export function SettingsDrawer({ isOpen, onOpenChange }: Props) {
               </div>
 
               <div className="flex flex-col gap-3">
-                <div className="flex items-center justify-between gap-3">
-                  <span className="text-foreground-500 text-sm font-medium">
-                    {t("settings.externalTitle")}
-                  </span>
-                  <Switch
-                    size="sm"
-                    isSelected={form?.external_library_enabled ?? false}
-                    isDisabled={busy}
-                    onValueChange={(v) => {
-                      if (!form) return;
-                      setForm({ ...form, external_library_enabled: v });
-                      void patch({ external_library_enabled: v }).then(
-                        (result) => {
-                          if (result && v) {
-                            void getLibraryHealth().then(setLibraryHealth);
-                          }
-                        },
-                      );
-                    }}
-                  />
-                </div>
-                <p className="text-foreground-400 text-pretty text-xs">
-                  {t("settings.externalEnabledHint")}
-                </p>
+                <HoverHint
+                  content={
+                    <div className="space-y-1">
+                      <p>{t("settings.externalEnabledHint")}</p>
+                      <p>
+                        {t("settings.externalRawPath", {
+                          path: EXTERNAL_RAW_PATH,
+                        })}
+                      </p>
+                      <p>
+                        {t("settings.externalOrganizedPath", {
+                          path: EXTERNAL_ORGANIZED_PATH,
+                        })}
+                      </p>
+                    </div>
+                  }
+                >
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="text-foreground-500 text-sm font-medium">
+                      {t("settings.externalTitle")}
+                    </span>
+                    <Switch
+                      size="sm"
+                      isSelected={form?.external_library_enabled ?? false}
+                      isDisabled={busy}
+                      onValueChange={(v) => {
+                        if (!form) return;
+                        setForm({ ...form, external_library_enabled: v });
+                        void patch({ external_library_enabled: v }).then(
+                          (result) => {
+                            if (result && v) {
+                              void getLibraryHealth().then(setLibraryHealth);
+                            }
+                          },
+                        );
+                      }}
+                    />
+                  </div>
+                </HoverHint>
                 {form?.external_library_enabled ? (
                   <>
                     {libraryHealth ? (
@@ -609,18 +677,6 @@ export function SettingsDrawer({ isOpen, onOpenChange }: Props) {
                         {t(`libraryHealth.status.${libraryHealth.status}`)}
                       </p>
                     ) : null}
-                    <div className="text-foreground-400 flex flex-col gap-0.5 text-xs">
-                      <p>
-                        {t("settings.externalRawPath", {
-                          path: EXTERNAL_RAW_PATH,
-                        })}
-                      </p>
-                      <p>
-                        {t("settings.externalOrganizedPath", {
-                          path: EXTERNAL_ORGANIZED_PATH,
-                        })}
-                      </p>
-                    </div>
                     <div className="grid grid-cols-2 gap-2">
                       <Input
                         size="sm"
@@ -673,7 +729,7 @@ export function SettingsDrawer({ isOpen, onOpenChange }: Props) {
                       <Button
                         size="sm"
                         variant="flat"
-                        className="h-auto min-h-8 w-full whitespace-normal px-1 text-center text-[11px] leading-tight"
+                        className="h-auto min-h-8 w-full px-1 text-center text-[11px] leading-tight whitespace-normal"
                         isDisabled={busy || externalScanning}
                         isLoading={externalScanning}
                         onPress={() => {
@@ -687,7 +743,7 @@ export function SettingsDrawer({ isOpen, onOpenChange }: Props) {
                       <Button
                         size="sm"
                         variant="flat"
-                        className="h-auto min-h-8 w-full whitespace-normal px-1 text-center text-[11px] leading-tight"
+                        className="h-auto min-h-8 w-full px-1 text-center text-[11px] leading-tight whitespace-normal"
                         title={t("settings.clearMatchCooldownsHint")}
                         isDisabled={busy || clearingCooldowns}
                         isLoading={clearingCooldowns}
@@ -700,7 +756,7 @@ export function SettingsDrawer({ isOpen, onOpenChange }: Props) {
                       <Button
                         size="sm"
                         variant="flat"
-                        className="h-auto min-h-8 w-full whitespace-normal px-1 text-center text-[11px] leading-tight"
+                        className="h-auto min-h-8 w-full px-1 text-center text-[11px] leading-tight whitespace-normal"
                         title={t("settings.clearMatchCooldownsRejectedHint")}
                         isDisabled={busy || clearingCooldowns}
                         isLoading={clearingCooldowns}
@@ -716,105 +772,153 @@ export function SettingsDrawer({ isOpen, onOpenChange }: Props) {
               </div>
 
               <div className="flex flex-col gap-3">
-                <p className="text-foreground-500 text-sm font-medium">
-                  {t("settings.sectionStorage")}
-                </p>
-                <p className="text-foreground-400 text-pretty text-xs">
-                  {t("settings.diskHint")}
-                </p>
-                <div className="flex items-center justify-between gap-3">
-                  <span className="text-foreground-500 text-sm">
-                    {t("settings.downloadCacheEnabled")}
-                  </span>
-                  <Switch
-                    size="sm"
-                    isSelected={form?.download_cache_enabled ?? false}
-                    isDisabled={busy}
-                    onValueChange={(v) => {
-                      if (!form) return;
-                      setForm({ ...form, download_cache_enabled: v });
-                      patchField({ download_cache_enabled: v });
-                    }}
-                  />
-                </div>
+                <HoverHint content={t("settings.diskHint")}>
+                  <p className="text-foreground-500 text-sm font-medium">
+                    {t("settings.sectionStorage")}
+                  </p>
+                </HoverHint>
+                <HoverHint content={t("settings.cacheMinFreeHint")}>
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="text-foreground-500 text-sm">
+                      {t("settings.downloadCacheEnabled")}
+                    </span>
+                    <Switch
+                      size="sm"
+                      isSelected={form?.download_cache_enabled ?? false}
+                      isDisabled={busy}
+                      onValueChange={(v) => {
+                        if (!form) return;
+                        setForm({ ...form, download_cache_enabled: v });
+                        patchField({ download_cache_enabled: v });
+                      }}
+                    />
+                  </div>
+                </HoverHint>
                 <div className="grid grid-cols-2 gap-2">
-                  <Input
-                    size="sm"
-                    type="number"
-                    min={0}
-                    step={0.5}
-                    label={t("settings.cacheMinFreeGb")}
-                    title={settings?.cache_path ?? t("settings.cacheMinFreeHint")}
-                    description={
+                  <HoverHint
+                    content={[
+                      t("settings.cacheMinFreeHint"),
+                      settings?.cache_path ?? "",
                       loading || !settings
                         ? t("common.loading")
                         : settings.cache_available
                           ? t("settings.cacheFreeNow", {
                               free: settings.cache_free_gb,
                             })
-                          : t("settings.cacheUnavailable")
-                    }
-                    value={form?.cache_min_free_gb ?? "2"}
-                    isDisabled={busy}
-                    onValueChange={(v) => {
-                      if (!form) return;
-                      setForm({ ...form, cache_min_free_gb: v });
-                      const minimum = Number.parseFloat(v);
-                      if (Number.isNaN(minimum) || minimum < 0) return;
-                      patchFieldDebounced("cache_min_free_gb", {
-                        cache_min_free_gb: minimum,
-                      });
-                    }}
-                    endContent={
-                      <span className="text-foreground-400 text-xs">GiB</span>
-                    }
-                    classNames={{ input: "font-mono" }}
-                  />
-                  <Input
-                    size="sm"
-                    type="number"
-                    min={0}
-                    step={0.5}
-                    label={t("settings.minFreeGb")}
-                    title={settings?.data_path ?? t("settings.diskHint")}
-                    description={
+                          : t("settings.cacheUnavailable"),
+                    ]
+                      .filter(Boolean)
+                      .join("\n")}
+                  >
+                    <Input
+                      size="sm"
+                      type="number"
+                      min={0}
+                      step={0.5}
+                      label={t("settings.cacheMinFreeGb")}
+                      value={form?.cache_min_free_gb ?? "2"}
+                      isDisabled={busy}
+                      onValueChange={(v) => {
+                        if (!form) return;
+                        setForm({ ...form, cache_min_free_gb: v });
+                        const minimum = Number.parseFloat(v);
+                        if (Number.isNaN(minimum) || minimum < 0) return;
+                        patchFieldDebounced("cache_min_free_gb", {
+                          cache_min_free_gb: minimum,
+                        });
+                      }}
+                      endContent={
+                        <span className="text-foreground-400 text-xs">GiB</span>
+                      }
+                      classNames={{ input: "font-mono" }}
+                    />
+                  </HoverHint>
+                  <HoverHint
+                    content={[
+                      t("settings.diskHint"),
+                      settings?.data_path ?? "",
                       loading || !settings
                         ? t("common.loading")
                         : t("settings.freeNow", {
                             free: settings.free_gb,
-                          })
+                          }),
+                    ]
+                      .filter(Boolean)
+                      .join("\n")}
+                  >
+                    <Input
+                      size="sm"
+                      type="number"
+                      min={0}
+                      step={0.5}
+                      label={t("settings.minFreeGb")}
+                      value={form?.min_free_gb ?? "2"}
+                      isDisabled={busy}
+                      onValueChange={(v) => {
+                        if (!form) return;
+                        setForm({ ...form, min_free_gb: v });
+                        const minFree = Number.parseFloat(v);
+                        if (Number.isNaN(minFree) || minFree < 0) return;
+                        patchFieldDebounced("min_free_gb", {
+                          min_free_gb: minFree,
+                        });
+                      }}
+                      endContent={
+                        <span className="text-foreground-400 text-xs">GiB</span>
+                      }
+                      classNames={{ input: "font-mono" }}
+                    />
+                  </HoverHint>
+                </div>
+                <div className="flex flex-col gap-2">
+                  <HoverHint
+                    content={
+                      <div className="space-y-1">
+                        <p>
+                          {libraryAudit
+                            ? t("settings.libraryAuditResult", {
+                                physical: libraryAudit.physical_count,
+                                hardlinks:
+                                  libraryAudit.hardlink_duplicate_count,
+                                missing: libraryAudit.missing_catalog_locations,
+                                untracked:
+                                  libraryAudit.untracked_physical_count,
+                              })
+                            : t("settings.libraryAuditHint")}
+                        </p>
+                        <p>{t("settings.databaseBackupHint")}</p>
+                      </div>
                     }
-                    value={form?.min_free_gb ?? "2"}
-                    isDisabled={busy}
-                    onValueChange={(v) => {
-                      if (!form) return;
-                      setForm({ ...form, min_free_gb: v });
-                      const minFree = Number.parseFloat(v);
-                      if (Number.isNaN(minFree) || minFree < 0) return;
-                      patchFieldDebounced("min_free_gb", {
-                        min_free_gb: minFree,
-                      });
-                    }}
-                    endContent={
-                      <span className="text-foreground-400 text-xs">GiB</span>
-                    }
-                    classNames={{ input: "font-mono" }}
-                  />
+                  >
+                    <Button
+                      size="sm"
+                      variant="flat"
+                      className="w-full"
+                      isDisabled={busy || auditingLibrary}
+                      isLoading={auditingLibrary}
+                      onPress={() => {
+                        void handleLibraryAudit();
+                      }}
+                    >
+                      {auditingLibrary
+                        ? t("settings.libraryAuditing")
+                        : t("settings.libraryAudit")}
+                    </Button>
+                  </HoverHint>
                 </div>
                 {form?.external_library_enabled ? (
                   <div className="flex flex-col gap-2">
-                    <p className="text-foreground-500 text-sm">
-                      {t("settings.reclaimPitsTitle")}
-                    </p>
-                    <p className="text-foreground-400 text-pretty text-xs">
-                      {t("settings.reclaimPitsHint")}
-                    </p>
+                    <HoverHint content={t("settings.reclaimPitsHint")}>
+                      <p className="text-foreground-500 text-sm">
+                        {t("settings.reclaimPitsTitle")}
+                      </p>
+                    </HoverHint>
                     <div className="grid w-full grid-cols-3 gap-2">
                       <Button
                         size="sm"
                         color="danger"
                         variant="flat"
-                        className="h-auto min-h-8 w-full whitespace-normal px-1 text-center text-[11px] leading-tight"
+                        className="h-auto min-h-8 w-full px-1 text-center text-[11px] leading-tight whitespace-normal"
                         isDisabled={busy || reclaiming}
                         onPress={() => setReclaimTarget("delete")}
                       >
@@ -824,7 +928,7 @@ export function SettingsDrawer({ isOpen, onOpenChange }: Props) {
                         size="sm"
                         color="danger"
                         variant="flat"
-                        className="h-auto min-h-8 w-full whitespace-normal px-1 text-center text-[11px] leading-tight"
+                        className="h-auto min-h-8 w-full px-1 text-center text-[11px] leading-tight whitespace-normal"
                         isDisabled={busy || reclaiming}
                         onPress={() => setReclaimTarget("default")}
                       >
@@ -834,7 +938,7 @@ export function SettingsDrawer({ isOpen, onOpenChange }: Props) {
                         size="sm"
                         color="danger"
                         variant="flat"
-                        className="h-auto min-h-8 w-full whitespace-normal px-1 text-center text-[11px] leading-tight"
+                        className="h-auto min-h-8 w-full px-1 text-center text-[11px] leading-tight whitespace-normal"
                         isDisabled={busy || reclaiming}
                         onPress={() => setReclaimTarget("both")}
                       >
@@ -843,11 +947,94 @@ export function SettingsDrawer({ isOpen, onOpenChange }: Props) {
                     </div>
                   </div>
                 ) : (
-                  <p className="text-foreground-400 text-pretty text-xs">
+                  <p className="text-foreground-400 text-xs text-pretty">
                     {t("settings.reclaimNeedExternal")}
                   </p>
                 )}
               </div>
+            </section>
+
+            <Divider />
+
+            <section className="flex flex-col gap-3">
+              <HoverHint content={t("settings.wantedHint")}>
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-2">
+                    <HeartIcon className="text-foreground-500 h-4 w-4" />
+                    <h3 className="text-sm font-semibold">
+                      {t("settings.wantedTitle")}
+                    </h3>
+                  </div>
+                  <Switch
+                    size="sm"
+                    isSelected={form?.wanted_enabled ?? true}
+                    isDisabled={busy}
+                    onValueChange={(v) => {
+                      if (!form) return;
+                      setForm({ ...form, wanted_enabled: v });
+                      void patch({ wanted_enabled: v });
+                    }}
+                  />
+                </div>
+              </HoverHint>
+              {form?.wanted_enabled ? (
+                <>
+                  <p className="text-foreground-500 text-xs font-medium">
+                    {t("settings.wantedSources")}
+                  </p>
+                  <div className="flex flex-col gap-2">
+                    {(
+                      [
+                        [
+                          "wanted_source_musicbrainz",
+                          "settings.wantedSourceMusicbrainz",
+                        ],
+                        ["wanted_source_qq", "settings.wantedSourceQq"],
+                        [
+                          "wanted_source_discogs",
+                          "settings.wantedSourceDiscogs",
+                        ],
+                        ["wanted_source_lastfm", "settings.wantedSourceLastfm"],
+                      ] as const
+                    ).map(([key, labelKey]) => (
+                      <div
+                        key={key}
+                        className="flex items-center justify-between gap-3"
+                      >
+                        <span className="text-foreground-500 text-sm">
+                          {t(labelKey)}
+                        </span>
+                        <Switch
+                          size="sm"
+                          isSelected={form[key]}
+                          isDisabled={busy}
+                          onValueChange={(v) => {
+                            setForm({ ...form, [key]: v });
+                            patchField({ [key]: v });
+                          }}
+                        />
+                      </div>
+                    ))}
+                  </div>
+                  {form.wanted_source_lastfm ? (
+                    <Input
+                      size="sm"
+                      type="text"
+                      label={t("settings.lastfmApiKey")}
+                      title={t("settings.lastfmApiKeyHint")}
+                      value={form.lastfm_api_key}
+                      isDisabled={busy}
+                      onValueChange={(v) => {
+                        setForm({ ...form, lastfm_api_key: v });
+                        patchFieldDebounced("lastfm_api_key", {
+                          lastfm_api_key: v,
+                        });
+                      }}
+                      classNames={{ input: "font-mono" }}
+                    />
+                  ) : null}
+                </>
+              ) : null}
             </section>
 
             <Divider />
@@ -1027,7 +1214,7 @@ export function SettingsDrawer({ isOpen, onOpenChange }: Props) {
                 <p className="text-foreground-500 text-sm font-medium">
                   {t("settings.sectionTelegram")}
                 </p>
-                <p className="text-foreground-400 text-pretty text-xs">
+                <p className="text-foreground-400 text-xs text-pretty">
                   {settings?.telegram_bot_running
                     ? t("settings.telegramRunning", {
                         api:
@@ -1111,7 +1298,7 @@ export function SettingsDrawer({ isOpen, onOpenChange }: Props) {
                     {t("cookies.options")}
                   </p>
                 </div>
-                <p className="text-foreground-500 text-pretty text-xs">
+                <p className="text-foreground-500 text-xs text-pretty">
                   {!cookiesConfigured
                     ? t("cookies.uploadTooltip")
                     : cookiesStatus.status === "expired"
@@ -1132,7 +1319,9 @@ export function SettingsDrawer({ isOpen, onOpenChange }: Props) {
                 (cookiesStatus.status === "expired" ||
                   cookiesStatus.status === "incomplete" ||
                   cookiesStatus.status === "expiring_soon") ? (
-                  <p className="text-warning text-xs">{t("cookies.staleHint")}</p>
+                  <p className="text-warning text-xs">
+                    {t("cookies.staleHint")}
+                  </p>
                 ) : null}
                 <div
                   className={`grid w-full gap-2 ${cookiesConfigured ? "grid-cols-2" : "grid-cols-1"}`}

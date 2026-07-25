@@ -24,6 +24,10 @@ class UnavailableTrack(BaseModel):
     artists: list[str] = Field(default_factory=list)
     album: str | None = None
     reason: SkipReason
+    # Source video id when known (region-locked/removed rows keep it; tracks
+    # dropped for a missing id leave it empty). Lets consumers reconcile a
+    # dead playlist entry back to a stored track.
+    video_id: str = ""
 
     @property
     def artist_display(self) -> str:

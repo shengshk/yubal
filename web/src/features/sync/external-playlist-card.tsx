@@ -3,7 +3,6 @@ import {
   listExternalPlaylistTracks,
   syncExternalPlaylist,
   type ExternalPlaylist,
-  type ExternalTrack,
 } from "@/api/external";
 import { albumCoverUrl, playlistCoverUrl, trackCoverUrl } from "@/api/library";
 import { AudioSpectrum } from "@/features/sync/audio-spectrum";
@@ -11,8 +10,13 @@ import { LedgerTrackList } from "@/features/sync/ledger-track-list";
 import { useLibraryAudio } from "@/features/sync/library-audio";
 import type { PlayMode } from "@/features/sync/play-mode";
 import { PlaylistStatsLine } from "@/features/sync/playlist-stats-line";
-import { SYNC_ACTION_BTN, SYNC_CARD_ACTIONS } from "@/features/sync/track-columns";
+import { PlaylistTitleTooltip } from "@/features/sync/playlist-title-tooltip";
+import {
+  SYNC_ACTION_BTN,
+  SYNC_CARD_ACTIONS,
+} from "@/features/sync/track-columns";
 import { formatDateTime } from "@/lib/format";
+import { externalPlaylistDisplayName } from "@/lib/playlist-labels";
 import { showErrorToast, showSuccessToast } from "@/lib/toast";
 import {
   Button,
@@ -41,7 +45,7 @@ import {
   SkipForwardIcon,
   Trash2Icon,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 type Props = {
@@ -147,10 +151,6 @@ function PlaybackTransport({
   );
 }
 
-function isMatchedTrack(track: ExternalTrack): boolean {
-  return track.match_status === "matched" && Boolean(track.video_id) && !track.is_raw;
-}
-
 export function ExternalPlaylistCard({
   playlist,
   tracksOpen,
@@ -168,49 +168,50 @@ export function ExternalPlaylistCard({
   const [syncModalOpen, setSyncModalOpen] = useState(false);
   const [syncEnrich, setSyncEnrich] = useState(true);
   const [syncRawMatch, setSyncRawMatch] = useState(true);
+  const [syncVerifyMeta, setSyncVerifyMeta] = useState(true);
   const [syncJunkMatch, setSyncJunkMatch] = useState(false);
-  const [matchedTracks, setMatchedTracks] = useState<ExternalTrack[]>([]);
   const [coverIdx, setCoverIdx] = useState(0);
   const [addAllOpen, setAddAllOpen] = useState(false);
   const [addingAll, setAddingAll] = useState(false);
+  const [addMode, setAddMode] = useState<
+    "add_matched_to_direct" | "add_meta_verified_to_wanted"
+  >("add_matched_to_direct");
+  const metaVerifiedCount = playlist.meta_verified_count ?? 0;
+  const canAdd = playlist.matched_count > 0 || metaVerifiedCount > 0;
 
   const folder = `External/${playlist.dir_name}`;
   const isPlayingHere = audio.activeFolder === folder && audio.playing;
+  const preparingPlaylistRef = useRef<Promise<number> | null>(null);
 
-  const loadCoverTracks = useCallback(() => {
-    void listExternalPlaylistTracks(playlist.dir_name).then((items) => {
-      setMatchedTracks(items.filter(isMatchedTrack));
-    });
-  }, [playlist.dir_name]);
-
-  useEffect(() => {
-    loadCoverTracks();
-  }, [
-    loadCoverTracks,
-    playlist.matched_count,
-    playlist.last_synced_at,
-    playlist.hardlink,
-  ]);
-
-  useEffect(() => {
-    const onLedgerChanged = () => loadCoverTracks();
-    window.addEventListener("yubal:ledger-changed", onLedgerChanged);
-    return () =>
-      window.removeEventListener("yubal:ledger-changed", onLedgerChanged);
-  }, [loadCoverTracks]);
-
-  // Register playlist so cover hover play works even when the list is closed.
-  useEffect(() => {
-    const playable = matchedTracks.filter((tr) => tr.exists !== false);
-    audio.registerPlaylist(
-      folder,
-      playable.map((tr) => ({
-        key: tr.rel_path,
-        path: tr.rel_path,
-        label: [tr.artist, tr.title].filter(Boolean).join(" - ") || tr.title,
-      })),
-    );
-  }, [audio, folder, matchedTracks]);
+  const preparePlaylist = () => {
+    if (preparingPlaylistRef.current) return preparingPlaylistRef.current;
+    const request = listExternalPlaylistTracks(playlist.dir_name)
+      .then((items) => {
+        const playable = items.filter(
+          (track) =>
+            track.match_status === "matched" &&
+            Boolean(track.video_id) &&
+            !track.is_raw &&
+            track.exists !== false,
+        );
+        audio.registerPlaylist(
+          folder,
+          playable.map((track) => ({
+            key: track.rel_path,
+            path: track.rel_path,
+            label:
+              [track.artist, track.title].filter(Boolean).join(" - ") ||
+              track.title,
+          })),
+        );
+        return playable.length;
+      })
+      .finally(() => {
+        preparingPlaylistRef.current = null;
+      });
+    preparingPlaylistRef.current = request;
+    return request;
+  };
 
   const playingTrackKey =
     audio.activeFolder === folder && audio.key ? audio.key : null;
@@ -220,27 +221,18 @@ export function ExternalPlaylistCard({
     const push = (url: string | null | undefined) => {
       if (url && !list.includes(url)) list.push(url);
     };
-    const playing = playingTrackKey
-      ? matchedTracks.find((tr) => tr.rel_path === playingTrackKey)
-      : null;
-    const primary = playing ?? matchedTracks[0];
-    const primaryPath = primary?.rel_path;
-
-    if (playingTrackKey && primaryPath) {
+    if (playingTrackKey) {
       push(trackCoverUrl(playingTrackKey));
-      push(albumCoverUrl(primaryPath));
-      push(primary?.cover_url);
+      push(albumCoverUrl(playingTrackKey));
     }
 
     push(playlistCoverUrl(folder));
-
-    if (primaryPath && !playingTrackKey) {
-      push(albumCoverUrl(primaryPath));
-      push(trackCoverUrl(primaryPath));
-      push(primary?.cover_url);
+    if (playlist.cover_track_path && !playingTrackKey) {
+      push(albumCoverUrl(playlist.cover_track_path));
+      push(trackCoverUrl(playlist.cover_track_path));
     }
     return list;
-  }, [folder, matchedTracks, playingTrackKey]);
+  }, [folder, playlist.cover_track_path, playingTrackKey]);
 
   const coverKey = coverCandidates.join("|");
   useEffect(() => {
@@ -248,7 +240,7 @@ export function ExternalPlaylistCard({
   }, [coverKey]);
 
   const coverSrc = coverCandidates[coverIdx];
-  const hasPlayable = matchedTracks.some((tr) => tr.exists !== false);
+  const hasPlayable = playlist.local > 0;
 
   useEffect(() => {
     if (!tracksOpen) return;
@@ -272,13 +264,14 @@ export function ExternalPlaylistCard({
   const openSyncModal = () => {
     setSyncEnrich(true);
     setSyncRawMatch(true);
+    setSyncVerifyMeta(true);
     setSyncJunkMatch(false);
     setSyncModalOpen(true);
   };
 
   const handleSync = async () => {
     if (syncing) return;
-    if (!syncEnrich && !syncRawMatch && !syncJunkMatch) {
+    if (!syncEnrich && !syncRawMatch && !syncVerifyMeta && !syncJunkMatch) {
       showErrorToast(
         t("sync.externalSyncFailed"),
         t("sync.externalSyncNeedAction"),
@@ -290,6 +283,7 @@ export function ExternalPlaylistCard({
     const result = await syncExternalPlaylist(playlist.dir_name, {
       enrich: syncEnrich,
       raw_match: syncRawMatch,
+      verify_meta: syncVerifyMeta,
       junk_match: syncJunkMatch,
     });
     setSyncing(false);
@@ -301,11 +295,12 @@ export function ExternalPlaylistCard({
       t("sync.externalSyncDoneTitle"),
       t("sync.externalSyncDone", {
         matched: result.matched,
-        recovered: result.recovered,
+        verified: result.meta_verified,
+        enriched: result.enriched,
+        errors: result.errors + result.asset_errors,
       }),
     );
     onChanged();
-    loadCoverTracks();
   };
 
   let scheduleStatus: string | null = null;
@@ -334,7 +329,8 @@ export function ExternalPlaylistCard({
     resultLabel = t("sync.resultInterrupted");
   }
 
-  const neverRun = !syncing && !playlist.last_synced_at && !playlist.last_sync_status;
+  const neverRun =
+    !syncing && !playlist.last_synced_at && !playlist.last_sync_status;
   const historyLine = neverRun
     ? t("sync.neverSynced")
     : t("sync.historySync", { time: timeLabel, result: resultLabel });
@@ -344,13 +340,11 @@ export function ExternalPlaylistCard({
 
   const statsItems = [
     { label: t("sync.statUnmatched"), value: playlist.unmatched_count },
+    {
+      label: t("sync.statMetaVerified"),
+      value: playlist.meta_verified_count ?? 0,
+    },
     { label: t("sync.statMatched"), value: playlist.matched_count },
-    { label: t("sync.statCloud"), value: playlist.cloud },
-    { label: t("sync.statLocal"), value: playlist.local },
-    { label: t("sync.statIdInvalid"), value: playlist.offline },
-    { label: t("sync.statExclusive"), value: playlist.exclusive },
-    { label: t("sync.statShared"), value: playlist.shared },
-    { label: t("sync.statHardlink"), value: playlist.hardlink },
   ];
 
   return (
@@ -396,7 +390,13 @@ export function ExternalPlaylistCard({
               }
               onClick={(e) => {
                 e.stopPropagation();
-                audio.togglePlaylistFolder(folder);
+                if (isPlayingHere) {
+                  audio.togglePlaylistFolder(folder);
+                  return;
+                }
+                void preparePlaylist().then((count) => {
+                  if (count > 0) audio.togglePlaylistFolder(folder);
+                });
               }}
             >
               {coverSrc ? (
@@ -445,9 +445,14 @@ export function ExternalPlaylistCard({
             aria-label={t("sync.toggleTrackList")}
           >
             <div className="min-w-0 flex-1">
-              <p className="text-foreground min-w-0 truncate text-sm font-medium">
-                {playlist.dir_name}
-              </p>
+              <PlaylistTitleTooltip
+                kind="external"
+                dirName={playlist.dir_name}
+                allowMutate={playlist.allow_mutate}
+                className="text-foreground block min-w-0 truncate text-sm font-medium"
+              >
+                {externalPlaylistDisplayName(playlist.dir_name, t)}
+              </PlaylistTitleTooltip>
               <p className={LINE}>
                 <PlaylistStatsLine
                   items={statsItems}
@@ -469,17 +474,27 @@ export function ExternalPlaylistCard({
 
           <div className={SYNC_CARD_ACTIONS}>
             {tracksOpen && isPlayingHere ? (
-              <PlaybackTransport folder={folder} isPlayingHere={isPlayingHere} />
+              <PlaybackTransport
+                folder={folder}
+                isPlayingHere={isPlayingHere}
+              />
             ) : null}
             <Button
               variant="light"
               size="sm"
               isIconOnly
-              isDisabled={playlist.matched_count <= 0}
+              isDisabled={!canAdd}
               className={`${ACTION_BTN} hover:text-primary`}
-              aria-label={t("sync.addAllMatchedToDirect")}
-              title={t("sync.addAllMatchedToDirect")}
-              onPress={() => setAddAllOpen(true)}
+              aria-label={t("sync.externalAddMenu")}
+              title={t("sync.externalAddMenu")}
+              onPress={() => {
+                setAddMode(
+                  playlist.matched_count > 0
+                    ? "add_matched_to_direct"
+                    : "add_meta_verified_to_wanted",
+                );
+                setAddAllOpen(true);
+              }}
             >
               <PlusIcon className="h-4 w-4" />
             </Button>
@@ -489,9 +504,11 @@ export function ExternalPlaylistCard({
               isIconOnly
               className={`${ACTION_BTN} hover:text-primary`}
               aria-label={t("sync.editExternalTitle", {
-                name: playlist.dir_name,
+                name: externalPlaylistDisplayName(playlist.dir_name, t),
               })}
-              title={t("sync.editExternalTitle", { name: playlist.dir_name })}
+              title={t("sync.editExternalTitle", {
+                name: externalPlaylistDisplayName(playlist.dir_name, t),
+              })}
               onPress={() => onEdit(playlist)}
             >
               <PencilIcon className="h-4 w-4" />
@@ -569,6 +586,18 @@ export function ExternalPlaylistCard({
               </div>
             </Checkbox>
             <Checkbox
+              isSelected={syncVerifyMeta}
+              onValueChange={setSyncVerifyMeta}
+              isDisabled={syncing}
+            >
+              <div className="flex flex-col gap-0.5">
+                <span>{t("sync.externalSyncVerifyMeta")}</span>
+                <span className="text-foreground-400 text-xs font-normal">
+                  {t("sync.externalSyncVerifyMetaHint")}
+                </span>
+              </div>
+            </Checkbox>
+            <Checkbox
               isSelected={syncJunkMatch}
               onValueChange={setSyncJunkMatch}
               isDisabled={syncing}
@@ -592,7 +621,12 @@ export function ExternalPlaylistCard({
             <Button
               color="primary"
               isLoading={syncing}
-              isDisabled={!syncEnrich && !syncRawMatch && !syncJunkMatch}
+              isDisabled={
+                !syncEnrich &&
+                !syncRawMatch &&
+                !syncVerifyMeta &&
+                !syncJunkMatch
+              }
               onPress={() => {
                 void handleSync();
               }}
@@ -609,19 +643,54 @@ export function ExternalPlaylistCard({
           if (!addingAll) setAddAllOpen(false);
         }}
         placement="center"
+        size="lg"
       >
         <ModalContent>
-          <ModalHeader>{t("sync.addAllMatchedToDirect")}</ModalHeader>
-          <ModalBody className="gap-2 text-sm">
-            <p>
-              {t("sync.addAllMatchedToDirectBody", {
-                name: playlist.dir_name,
-                count: playlist.matched_count,
-              })}
-            </p>
+          <ModalHeader>{t("sync.externalAddMenu")}</ModalHeader>
+          <ModalBody className="gap-3 text-sm">
             <p className="text-foreground-400 text-xs">
-              {t("sync.addAllMatchedToDirectHint")}
+              {t("sync.externalAddMenuHint")}
             </p>
+            <Button
+              variant={addMode === "add_matched_to_direct" ? "solid" : "flat"}
+              color={
+                addMode === "add_matched_to_direct" ? "primary" : "default"
+              }
+              className="h-auto justify-start py-3 whitespace-normal"
+              isDisabled={playlist.matched_count <= 0}
+              onPress={() => setAddMode("add_matched_to_direct")}
+            >
+              <span className="text-left">
+                <span className="block font-medium">
+                  {t("sync.addAllMatchedToDirect")} ({playlist.matched_count})
+                </span>
+                <span className="text-foreground-400 text-xs">
+                  {t("sync.addAllMatchedToDirectHint")}
+                </span>
+              </span>
+            </Button>
+            <Button
+              variant={
+                addMode === "add_meta_verified_to_wanted" ? "solid" : "flat"
+              }
+              color={
+                addMode === "add_meta_verified_to_wanted"
+                  ? "primary"
+                  : "default"
+              }
+              className="h-auto justify-start py-3 whitespace-normal"
+              isDisabled={metaVerifiedCount <= 0}
+              onPress={() => setAddMode("add_meta_verified_to_wanted")}
+            >
+              <span className="text-left">
+                <span className="block font-medium">
+                  {t("sync.addMetaVerifiedToWanted")} ({metaVerifiedCount})
+                </span>
+                <span className="text-foreground-400 text-xs">
+                  {t("sync.addMetaVerifiedToWantedHint")}
+                </span>
+              </span>
+            </Button>
           </ModalBody>
           <ModalFooter>
             <Button
@@ -634,31 +703,38 @@ export function ExternalPlaylistCard({
             <Button
               color="primary"
               isLoading={addingAll}
+              isDisabled={
+                (addMode === "add_matched_to_direct" &&
+                  playlist.matched_count <= 0) ||
+                (addMode === "add_meta_verified_to_wanted" &&
+                  metaVerifiedCount <= 0)
+              }
               onPress={() => {
                 setAddingAll(true);
-                void deleteExternalPlaylist(
-                  playlist.dir_name,
-                  "add_matched_to_direct",
-                ).then((result) => {
-                  setAddingAll(false);
-                  if ("error" in result) {
-                    showErrorToast(
-                      t("sync.addAllMatchedToDirect"),
-                      result.error,
-                    );
-                    return;
-                  }
-                  setAddAllOpen(false);
-                  showSuccessToast(
-                    t("sync.addAllMatchedToDirect"),
-                    t("sync.addToDirectDone"),
-                  );
-                  onChanged();
-                  window.dispatchEvent(new Event("yubal:ledger-changed"));
-                });
+                const titleKey =
+                  addMode === "add_matched_to_direct"
+                    ? "sync.addAllMatchedToDirect"
+                    : "sync.addMetaVerifiedToWanted";
+                const doneKey =
+                  addMode === "add_matched_to_direct"
+                    ? "sync.addToDirectDone"
+                    : "sync.addMetaVerifiedToWantedDone";
+                void deleteExternalPlaylist(playlist.dir_name, addMode).then(
+                  (result) => {
+                    setAddingAll(false);
+                    if ("error" in result) {
+                      showErrorToast(t(titleKey), result.error);
+                      return;
+                    }
+                    setAddAllOpen(false);
+                    showSuccessToast(t(titleKey), t(doneKey));
+                    onChanged();
+                    window.dispatchEvent(new Event("yubal:ledger-changed"));
+                  },
+                );
               }}
             >
-              {t("sync.addToDirectAction")}
+              {t("sync.continue")}
             </Button>
           </ModalFooter>
         </ModalContent>

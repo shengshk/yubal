@@ -97,6 +97,7 @@ class TrackCatalogRepository:
         track_number: int | None = None,
         year: str | None = None,
         cover_url: str | None = None,
+        cover_source: str | None = None,
         lyrics: str | None = None,
         has_embedded_cover: bool = False,
         has_lyrics_embedded: bool = False,
@@ -117,6 +118,7 @@ class TrackCatalogRepository:
                     track_number=track_number,
                     year=year,
                     cover_url=cover_url,
+                    cover_source=cover_source,
                     lyrics=lyrics,
                     has_embedded_cover=has_embedded_cover,
                     has_lyrics_embedded=has_lyrics_embedded,
@@ -137,6 +139,8 @@ class TrackCatalogRepository:
             existing.year = year
             if cover_url:
                 existing.cover_url = cover_url
+            if cover_source:
+                existing.cover_source = cover_source
             if lyrics:
                 existing.lyrics = lyrics
             if lyrics_source:

@@ -3,8 +3,9 @@ from types import SimpleNamespace
 
 from sqlmodel import SQLModel, create_engine
 from yubal_api.db.track_catalog_repository import TrackCatalogRepository
+from yubal_api.services.meta_search import MetaHit
 from yubal_api.services.preferences import PreferencesStore
-from yubal_api.services.search_service import SearchService
+from yubal_api.services.search_service import SearchService, _supplementary_meta_hits
 
 
 class _Client:
@@ -34,6 +35,7 @@ def _service(tmp_path: Path) -> tuple[SearchService, TrackCatalogRepository]:
         tmp_path / "preferences.json",
         tmp_path / "data",
     )
+    preferences.update(wanted_enabled=False)
     service = SearchService(
         state_path=tmp_path / "search.json",
         preview_root=tmp_path / "preview",
@@ -111,3 +113,51 @@ def test_promote_preview_imports_into_direct(tmp_path: Path) -> None:
     assert updated.tracks[0].matched is True
     assert updated.tracks[0].local_path is not None
     assert (tmp_path / "data" / updated.tracks[0].local_path).is_file()
+
+
+def test_third_party_results_only_supplement_missing_ytm_recordings() -> None:
+    ytm_rows = [
+        {
+            "title": "如愿",
+            "artist": "王菲",
+            "duration_seconds": 266,
+        },
+        {
+            "title": "如愿 (Live)",
+            "artist": "李健",
+            "duration_seconds": 262,
+        },
+    ]
+    meta_hits = [
+        MetaHit(
+            source="musicbrainz",
+            source_id="duplicate",
+            title="如愿",
+            artist="王菲",
+            album="如愿",
+            duration_seconds=265,
+        ),
+        MetaHit(
+            source="musicbrainz",
+            source_id="other-artist",
+            title="如愿",
+            artist="周深",
+            album=None,
+            duration_seconds=266,
+        ),
+        MetaHit(
+            source="musicbrainz",
+            source_id="other-version",
+            title="如愿 (Live)",
+            artist="王菲",
+            album=None,
+            duration_seconds=280,
+        ),
+    ]
+
+    supplements = _supplementary_meta_hits(ytm_rows, meta_hits, limit=5)
+
+    assert [hit.source_id for hit in supplements] == [
+        "other-artist",
+        "other-version",
+    ]

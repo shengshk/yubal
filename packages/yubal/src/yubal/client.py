@@ -1,5 +1,6 @@
 """YouTube Music API client wrapper."""
 
+import hashlib
 import logging
 from collections import OrderedDict
 from collections.abc import Mapping
@@ -265,6 +266,7 @@ class YTMusicClient:
                         "artists": artists,
                         "album": album_name,
                         "reason": SkipReason.NO_VIDEO_ID.value,
+                        "video_id": "",
                     }
                 )
             elif not is_available:
@@ -274,6 +276,7 @@ class YTMusicClient:
                         "artists": artists,
                         "album": album_name,
                         "reason": SkipReason.REGION_UNAVAILABLE.value,
+                        "video_id": video_id,
                     }
                 )
             else:
@@ -594,6 +597,39 @@ class YTMusicClient:
             return auth_type != AuthType.UNAUTHORIZED
         except TypeError:
             return True
+
+    def get_account_fingerprint(self) -> str:
+        """Return a stable, non-reversible identifier for the active account."""
+        # Always rebuild production auth from the current cookie file. This
+        # makes an uploaded replacement cookie effective without a restart.
+        ytm = (
+            self._ytm_override
+            if self._ytm_override is not None
+            else self._create_ytmusic(self._cookies_path)
+        )
+        auth_type = getattr(ytm, "auth_type", None)
+        if auth_type == AuthType.UNAUTHORIZED:
+            raise AuthenticationRequiredError(
+                "An authenticated YouTube Music account is required."
+            )
+
+        try:
+            info = ytm.get_account_info()
+        except (YTMusicServerError, YTMusicUserError, YTMusicError) as e:
+            raise UpstreamAPIError(
+                f"Failed to identify the YouTube Music account: {e}"
+            ) from e
+
+        identity = (
+            info.get("channelHandle")
+            or info.get("accountPhotoUrl")
+            or info.get("accountName")
+        )
+        if not identity:
+            raise UpstreamAPIError(
+                "YouTube Music did not return an identifiable account."
+            )
+        return hashlib.sha256(str(identity).strip().encode("utf-8")).hexdigest()
 
     def _check_playlist_type(self, playlist_id: str) -> None:
         """Check if playlist type is supported before fetching.

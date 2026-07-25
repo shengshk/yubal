@@ -1,4 +1,5 @@
 import { FolderPicker } from "@/features/library/folder-picker";
+import { HoverHint } from "@/components/common/hover-hint";
 import {
   Button,
   Input,
@@ -22,7 +23,7 @@ export type DirectEditValues = {
   sync_jitter_seconds: number;
   offline_marking_enabled: boolean;
   offline_cleanup_enabled: boolean;
-  offline_cleanup_action: "delete" | "archive";
+  offline_cleanup_action: "delete" | "archive" | "to_wanted";
   offline_cleanup_delay_hours: number;
 };
 
@@ -53,11 +54,16 @@ export function DirectEditModal({
   const [jitterSeconds, setJitterSeconds] = useState(600);
   const [offlineMarking, setOfflineMarking] = useState(true);
   const [offlineCleanup, setOfflineCleanup] = useState(false);
-  const [cleanupAction, setCleanupAction] = useState<"delete" | "archive">(
-    "archive",
-  );
+  const [cleanupAction, setCleanupAction] = useState<
+    "delete" | "archive" | "to_wanted"
+  >("archive");
   const [cleanupDelayHours, setCleanupDelayHours] = useState(72);
   const [saving, setSaving] = useState(false);
+  const cleanupActionsHint = [
+    `${t("sync.idInvalidActionToRawDelete")}：${t("sync.cleanupActionArchiveHint")}`,
+    `${t("sync.migrateToWanted")}：${t("sync.migrateToWantedHint")}`,
+    `${t("sync.idInvalidActionDelete")}：${t("sync.cleanupActionDeleteHint")}`,
+  ].join("\n");
 
   useEffect(() => {
     if (!isOpen) return;
@@ -124,117 +130,122 @@ export function DirectEditModal({
             onChange={setFolder}
           />
 
-          <div className="flex items-center justify-between gap-3">
-            <div>
+          <HoverHint content={t("sync.directAutoRecoverHint")}>
+            <div className="flex items-center justify-between gap-3">
               <p className="text-sm font-medium">
                 {t("sync.directAutoRecover")}
               </p>
-              <p className="text-foreground-400 text-xs">
-                {t("sync.directAutoRecoverHint")}
-              </p>
+              <Switch
+                isSelected={enabled}
+                isDisabled={!isSchedulerEnabled}
+                onValueChange={setEnabled}
+                aria-label={t("sync.directAutoRecover")}
+              />
             </div>
-            <Switch
-              isSelected={enabled}
-              isDisabled={!isSchedulerEnabled}
-              onValueChange={setEnabled}
-              aria-label={t("sync.directAutoRecover")}
-            />
-          </div>
+          </HoverHint>
 
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-            <Input
-              type="number"
-              label={t("sync.perRoundCap")}
-              value={String(maxItems)}
-              min={1}
-              max={10000}
-              onChange={(e) => {
-                const value = parseInt(e.target.value, 10);
-                if (!Number.isNaN(value) && value >= 1) setMaxItems(value);
-              }}
-            />
-            <Input
-              type="number"
-              label={t("sync.syncJitter")}
-              value={String(jitterSeconds)}
-              min={0}
-              max={600}
-              onChange={(e) => {
-                const value = parseInt(e.target.value, 10);
-                if (Number.isNaN(value)) {
-                  setJitterSeconds(0);
-                  return;
-                }
-                setJitterSeconds(Math.min(600, Math.max(0, value)));
-              }}
-            />
+            <HoverHint content={t("sync.perRoundCapHint")}>
+              <Input
+                type="number"
+                label={t("sync.perRoundCap")}
+                value={String(maxItems)}
+                min={1}
+                max={10000}
+                onChange={(e) => {
+                  const value = parseInt(e.target.value, 10);
+                  if (!Number.isNaN(value) && value >= 1) setMaxItems(value);
+                }}
+              />
+            </HoverHint>
+            <HoverHint content={t("sync.syncJitterHint")}>
+              <Input
+                type="number"
+                label={t("sync.syncJitter")}
+                value={String(jitterSeconds)}
+                min={0}
+                max={600}
+                onChange={(e) => {
+                  const value = parseInt(e.target.value, 10);
+                  if (Number.isNaN(value)) {
+                    setJitterSeconds(0);
+                    return;
+                  }
+                  setJitterSeconds(Math.min(600, Math.max(0, value)));
+                }}
+              />
+            </HoverHint>
           </div>
 
-          <div className="flex items-center justify-between gap-3">
-            <div>
+          <HoverHint content={t("sync.directOfflineMarkingHint")}>
+            <div className="flex items-center justify-between gap-3">
               <p className="text-sm font-medium">
                 {t("sync.directOfflineMarking")}
               </p>
-              <p className="text-foreground-400 text-xs">
-                {t("sync.directOfflineMarkingHint")}
-              </p>
+              <Switch
+                isSelected={offlineMarking}
+                onValueChange={setOfflineMarking}
+                aria-label={t("sync.directOfflineMarking")}
+              />
             </div>
-            <Switch
-              isSelected={offlineMarking}
-              onValueChange={setOfflineMarking}
-              aria-label={t("sync.directOfflineMarking")}
-            />
-          </div>
+          </HoverHint>
 
-          <div className="flex items-center justify-between gap-3">
-            <div>
+          <HoverHint content={t("sync.idInvalidCleanupHint")}>
+            <div className="flex items-center justify-between gap-3">
               <p className="text-sm font-medium">
                 {t("sync.idInvalidCleanup")}
               </p>
-              <p className="text-foreground-400 text-xs">
-                {t("sync.idInvalidCleanupHint")}
-              </p>
+              <Switch
+                isSelected={offlineCleanup}
+                isDisabled={!offlineMarking}
+                onValueChange={setOfflineCleanup}
+                aria-label={t("sync.idInvalidCleanup")}
+              />
             </div>
-            <Switch
-              isSelected={offlineCleanup}
-              isDisabled={!offlineMarking}
-              onValueChange={setOfflineCleanup}
-              aria-label={t("sync.idInvalidCleanup")}
-            />
-          </div>
+          </HoverHint>
           {offlineCleanup ? (
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-              <Select
-                label={t("sync.idInvalidCleanupAction")}
-                selectedKeys={[cleanupAction]}
-                onSelectionChange={(keys) => {
-                  const value = Array.from(keys)[0];
-                  if (value === "delete" || value === "archive") {
-                    setCleanupAction(value);
-                  }
-                }}
-              >
-                <SelectItem key="archive">
-                  {t("sync.idInvalidActionToRawDelete")}
-                </SelectItem>
-                <SelectItem key="delete">
-                  {t("sync.idInvalidActionDelete")}
-                </SelectItem>
-              </Select>
-              <Input
-                type="number"
-                label={t("sync.idInvalidCleanupDelay")}
-                description={t("sync.idInvalidCleanupDelayHint")}
-                value={String(cleanupDelayHours)}
-                min={0}
-                max={8760}
-                onChange={(e) => {
-                  const value = parseInt(e.target.value, 10);
-                  if (!Number.isNaN(value) && value >= 0) {
-                    setCleanupDelayHours(value);
-                  }
-                }}
-              />
+              <HoverHint content={cleanupActionsHint}>
+                <Select
+                  label={t("sync.idInvalidCleanupAction")}
+                  selectedKeys={[cleanupAction]}
+                  onSelectionChange={(keys) => {
+                    const value = Array.from(keys)[0];
+                    if (
+                      value === "delete" ||
+                      value === "archive" ||
+                      value === "to_wanted"
+                    ) {
+                      setCleanupAction(value);
+                    }
+                  }}
+                >
+                  <SelectItem key="archive">
+                    {t("sync.idInvalidActionToRawDelete")}
+                  </SelectItem>
+                  <SelectItem key="to_wanted">
+                    {t("sync.migrateToWanted")}
+                  </SelectItem>
+                  <SelectItem key="delete">
+                    {t("sync.idInvalidActionDelete")}
+                  </SelectItem>
+                </Select>
+              </HoverHint>
+              <HoverHint content={t("sync.idInvalidCleanupDelayHint")}>
+                <Input
+                  type="number"
+                  label={t("sync.idInvalidCleanupDelay")}
+                  value={String(cleanupDelayHours)}
+                  min={0}
+                  max={8760}
+                  onChange={(e) => {
+                    const value = parseInt(e.target.value, 10);
+                    if (!Number.isNaN(value) && value >= 0) {
+                      setCleanupDelayHours(value);
+                    }
+                  }}
+                />
+              </HoverHint>
             </div>
           ) : null}
         </ModalBody>

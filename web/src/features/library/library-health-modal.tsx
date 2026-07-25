@@ -8,10 +8,11 @@ import {
   ModalHeader,
 } from "@heroui/react";
 import { AlertTriangleIcon, RefreshCwIcon } from "lucide-react";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
-const POLL_INTERVAL_MS = 15000;
+const HEALTHY_POLL_INTERVAL_MS = 60000;
+const UNHEALTHY_POLL_INTERVAL_MS = 10000;
 
 /**
  * Fullscreen, non-dismissable gate. Mounted once at the app root so every
@@ -23,26 +24,72 @@ export function LibraryHealthModal() {
   const { t } = useTranslation();
   const [health, setHealth] = useState<LibraryHealth | null>(null);
   const [checking, setChecking] = useState(false);
+  const inFlightRef = useRef<Promise<LibraryHealth | null> | null>(null);
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback((): Promise<LibraryHealth | null> => {
+    if (inFlightRef.current) return inFlightRef.current;
     setChecking(true);
-    const result = await getLibraryHealth();
-    setChecking(false);
-    if (result) setHealth(result);
+    const request = getLibraryHealth()
+      .then((result) => {
+        if (result) setHealth(result);
+        return result;
+      })
+      .finally(() => {
+        setChecking(false);
+        inFlightRef.current = null;
+      });
+    inFlightRef.current = request;
+    return request;
   }, []);
 
   useEffect(() => {
-    void refresh();
-    const interval = window.setInterval(() => {
-      void refresh();
-    }, POLL_INTERVAL_MS);
-    const onFocus = () => {
-      void refresh();
+    let stopped = false;
+    let timer: number | undefined;
+    let runToken = 0;
+
+    const schedule = (result: LibraryHealth | null) => {
+      if (stopped || document.visibilityState === "hidden") return;
+      const delay =
+        result?.status === "healthy"
+          ? HEALTHY_POLL_INTERVAL_MS
+          : UNHEALTHY_POLL_INTERVAL_MS;
+      timer = window.setTimeout(() => {
+        void run();
+      }, delay);
     };
-    window.addEventListener("focus", onFocus);
+
+    const run = async () => {
+      const token = ++runToken;
+      if (timer !== undefined) window.clearTimeout(timer);
+      timer = undefined;
+      if (document.visibilityState === "hidden") return;
+      const result = await refresh();
+      if (token !== runToken) return;
+      schedule(result);
+    };
+
+    const wake = () => {
+      if (document.visibilityState === "visible") void run();
+    };
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "hidden") {
+        runToken += 1;
+        if (timer !== undefined) window.clearTimeout(timer);
+        timer = undefined;
+        return;
+      }
+      wake();
+    };
+
+    void run();
+    window.addEventListener("focus", wake);
+    document.addEventListener("visibilitychange", onVisibilityChange);
     return () => {
-      window.clearInterval(interval);
-      window.removeEventListener("focus", onFocus);
+      stopped = true;
+      runToken += 1;
+      if (timer !== undefined) window.clearTimeout(timer);
+      window.removeEventListener("focus", wake);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
     };
   }, [refresh]);
 
@@ -64,7 +111,9 @@ export function LibraryHealthModal() {
           {t("libraryHealth.title")}
         </ModalHeader>
         <ModalBody className="gap-2 text-sm">
-          <p className="text-foreground">{t(`libraryHealth.status.${status}`)}</p>
+          <p className="text-foreground">
+            {t(`libraryHealth.status.${status}`)}
+          </p>
           {health?.reason ? (
             <p className="text-foreground-500 text-xs">{health.reason}</p>
           ) : null}
@@ -94,7 +143,9 @@ export function LibraryHealthModal() {
             color="danger"
             variant="flat"
             isLoading={checking}
-            startContent={checking ? undefined : <RefreshCwIcon className="h-4 w-4" />}
+            startContent={
+              checking ? undefined : <RefreshCwIcon className="h-4 w-4" />
+            }
             onPress={() => {
               void refresh();
             }}

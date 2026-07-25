@@ -30,20 +30,20 @@ ERROR_FOLDER = ".error"
 MOUNT_SENTINEL_NAME = ".yubal-mount"
 
 
-def _library_roots() -> tuple[Path, Path]:
-    """Resolve download/external roots under a single library mount.
+def _library_roots() -> tuple[Path, Path, Path]:
+    """Resolve download/external/wanted roots under a single library mount.
 
-    Default layout: ``/data/download`` + ``/data/external`` (one ``./data:/data``
-    bind so hardlinks work). Optional ``YUBAL_LIBRARY_ROOT`` overrides the base
-    for tests / non-Docker runs.
+    Default layout: ``/data/download`` + ``/data/external`` + ``/data/wanted``
+    (one ``./data:/data`` bind so hardlinks work). Optional
+    ``YUBAL_LIBRARY_ROOT`` overrides the base for tests / non-Docker runs.
     """
     lib = (os.environ.get("YUBAL_LIBRARY_ROOT") or "/data").strip() or "/data"
     base = Path(lib)
-    return base / "download", base / "external"
+    return base / "download", base / "external", base / "wanted"
 
 
-# Dual-root library under one mount (default: /data).
-DOWNLOAD_ROOT, EXTERNAL_ROOT = _library_roots()
+# Triple-root library under one mount (default: /data).
+DOWNLOAD_ROOT, EXTERNAL_ROOT, WANTED_ROOT = _library_roots()
 # Backward-compatible alias
 PRESELECT_EXTERNAL_ROOT = EXTERNAL_ROOT
 
@@ -58,13 +58,27 @@ EXTERNAL_DEFAULT_DIR = "default"
 
 STORAGE_DOWNLOAD = "download"
 STORAGE_EXTERNAL = "external"
+STORAGE_WANTED = "wanted"
 STORAGE_ROOTS: dict[str, Path] = {
     STORAGE_DOWNLOAD: DOWNLOAD_ROOT,
     STORAGE_EXTERNAL: EXTERNAL_ROOT,
+    STORAGE_WANTED: WANTED_ROOT,
 }
 
 DOWNLOAD_MOUNT_SENTINEL = DOWNLOAD_ROOT / MOUNT_SENTINEL_NAME
 EXTERNAL_MOUNT_SENTINEL = EXTERNAL_ROOT / MOUNT_SENTINEL_NAME
+WANTED_MOUNT_SENTINEL = WANTED_ROOT / MOUNT_SENTINEL_NAME
+
+
+def ensure_wanted_layout() -> Path:
+    """Create ``/data/wanted`` (and mount sentinel) if missing."""
+    WANTED_ROOT.mkdir(parents=True, exist_ok=True)
+    if not WANTED_MOUNT_SENTINEL.exists():
+        try:
+            WANTED_MOUNT_SENTINEL.write_text("wanted\n", encoding="utf-8")
+        except OSError:
+            pass
+    return WANTED_ROOT
 
 
 def inode_key(path: Path) -> tuple[int, int] | None:

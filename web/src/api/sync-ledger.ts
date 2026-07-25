@@ -1,4 +1,5 @@
 import { basePath } from "@/lib/base-path";
+import { sharedJsonGet } from "./shared-get";
 
 export type SyncLedgerEntry = {
   id: string;
@@ -27,10 +28,13 @@ export type SyncLedgerEntry = {
   sync_jitter_seconds?: number | null;
   offline_marking_enabled?: boolean | null;
   offline_cleanup_enabled?: boolean | null;
-  offline_cleanup_action?: "delete" | "archive" | null;
+  offline_cleanup_action?: "delete" | "archive" | "to_wanted" | null;
   offline_cleanup_delay_hours?: number | null;
   offline_count?: number | null;
+  id_invalid_count?: number | null;
   blocked_count?: number | null;
+  missing_count?: number | null;
+  cover_track_path?: string | null;
 };
 
 export type DirectPolicyUpdates = {
@@ -40,7 +44,7 @@ export type DirectPolicyUpdates = {
   sync_jitter_seconds?: number;
   offline_marking_enabled?: boolean;
   offline_cleanup_enabled?: boolean;
-  offline_cleanup_action?: "delete" | "archive";
+  offline_cleanup_action?: "delete" | "archive" | "to_wanted";
   offline_cleanup_delay_hours?: number;
 };
 
@@ -49,6 +53,7 @@ export type DirectDeleteMode =
   | "wipe_list"
   | "block"
   | "migrate_to_external"
+  | "migrate_to_wanted"
   | "clear_offline_delete"
   | "clear_offline_to_raw_delete";
 
@@ -57,15 +62,14 @@ export type DirectPlaylistDeleteMode =
   | "wipe_list"
   | "clear_offline_delete"
   | "clear_offline_to_raw_delete"
+  | "clear_offline_to_wanted"
   | "migrate_to_external";
 
 export async function listSyncLedger(): Promise<SyncLedgerEntry[]> {
-  const res = await fetch(`${basePath}/api/sync-ledger`, {
-    credentials: "include",
-  });
-  if (!res.ok) return [];
-  const data = (await res.json()) as { items: SyncLedgerEntry[] };
-  return data.items ?? [];
+  const result = await sharedJsonGet<{ items: SyncLedgerEntry[] }>(
+    `${basePath}/api/sync-ledger`,
+  );
+  return result.ok ? (result.data?.items ?? []) : [];
 }
 
 export async function updateDirect(
@@ -146,16 +150,30 @@ export type SyncTrackItem = {
   has_embedded_cover?: boolean;
   has_lyrics?: boolean;
   has_synced_lyrics?: boolean;
-  cover_source?: "apple" | "ytm" | "embedded" | string | null;
-  membership_status?: "active" | "offline" | "blocked" | string | null;
+  cover_source?: "apple" | "ytm" | "manual" | "embedded" | string | null;
+  membership_status?:
+    | "active"
+    | "offline"
+    | "id_invalid"
+    | "blocked"
+    | string
+    | null;
   /** External unmatched: critical tags (title+artist+album) present. */
   tags_complete?: boolean;
+  /** External: Wanted-source meta verification status. */
+  meta_status?: "pending" | "verified" | "rejected" | string | null;
+  meta_source?: string | null;
+  meta_source_id?: string | null;
+  meta_source_url?: string | null;
   /** External: junk row (readonly incomplete / rejected). */
   is_junk?: boolean;
   /** External junk grade: writable (rw) or readonly (ro). */
   junk_kind?: "rw" | "ro" | null;
   /** External matched track already has a Direct catalog location. */
   in_direct?: boolean;
+  /** Wanted rows carry their wishlist id and origin link. */
+  wanted_id?: string | null;
+  source_url?: string | null;
 };
 
 export type EnrichmentSummary = {
@@ -192,13 +210,10 @@ export async function enrichTrack(
 export async function listSyncTracks(
   saveFolder: string,
 ): Promise<SyncTrackItem[]> {
-  const res = await fetch(
+  const result = await sharedJsonGet<{ items?: SyncTrackItem[] }>(
     `${basePath}/api/sync-ledger/tracks?save_folder=${encodeURIComponent(saveFolder)}`,
-    { credentials: "include" },
   );
-  if (!res.ok) return [];
-  const data = (await res.json()) as { items?: SyncTrackItem[] };
-  return data.items ?? [];
+  return result.ok ? (result.data?.items ?? []) : [];
 }
 
 export async function deleteDirectTrack(
