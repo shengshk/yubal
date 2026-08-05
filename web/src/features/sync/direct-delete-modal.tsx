@@ -18,13 +18,13 @@ type Props = {
   onConfirm: (mode: DirectPlaylistDeleteMode) => Promise<boolean>;
 };
 
-const LIGHT: DirectPlaylistDeleteMode[] = ["keep_list"];
+const PRIMARY: DirectPlaylistDeleteMode[] = ["keep_list", "wipe_list"];
 const ID_INVALID: DirectPlaylistDeleteMode[] = [
   "clear_offline_delete",
   "clear_offline_to_raw_delete",
   "clear_offline_to_wanted",
 ];
-const HEAVY: DirectPlaylistDeleteMode[] = ["wipe_list", "migrate_to_external"];
+const TRANSFER: DirectPlaylistDeleteMode[] = ["migrate_to_external"];
 
 const DANGER: ReadonlySet<DirectPlaylistDeleteMode> = new Set([
   "wipe_list",
@@ -156,33 +156,33 @@ export function DirectDeleteModal({
 
               <div className="flex flex-col gap-2">
                 <p className="text-xs font-medium text-foreground-500">
-                  {t("sync.deleteSectionLight")}
+                  {t("sync.deletePrimaryTitle")}
                 </p>
                 <p className="text-foreground-400 text-xs -mt-1">
-                  {t("sync.deleteSectionLightHint")}
+                  {t("sync.deletePrimaryHint")}
                 </p>
-                {LIGHT.map(renderModeButton)}
+                {PRIMARY.map(renderModeButton)}
               </div>
 
-              <div className="flex flex-col gap-2 mt-2">
-                <p className="text-xs font-medium text-foreground-500">
-                  {t("sync.deleteSectionIdInvalid")}
-                </p>
-                <p className="text-foreground-400 text-xs -mt-1">
-                  {t("sync.deleteSectionIdInvalidHint")}
-                </p>
-                {ID_INVALID.map(renderModeButton)}
-              </div>
-
-              <div className="flex flex-col gap-2 mt-2">
-                <p className="text-xs font-medium text-foreground-500">
-                  {t("sync.deleteSectionHeavy")}
-                </p>
-                <p className="text-foreground-400 text-xs -mt-1">
-                  {t("sync.deleteSectionHeavyHint")}
-                </p>
-                {HEAVY.map(renderModeButton)}
-              </div>
+              <details className="border-default-200 rounded-lg border">
+                <summary className="hover:bg-default-100 cursor-pointer rounded-lg px-3 py-2.5 text-sm font-medium">
+                  {t("sync.moreProcessing")}
+                </summary>
+                <div className="flex flex-col gap-4 px-3 pb-3">
+                  <p className="text-foreground-400 text-xs">
+                    {t("sync.moreProcessingHint")}
+                  </p>
+                  <div className="flex flex-col gap-2">
+                    {TRANSFER.map(renderModeButton)}
+                  </div>
+                  <div className="flex flex-col gap-2">
+                    <p className="text-xs font-medium text-foreground-500">
+                      {t("sync.deleteSectionIdInvalid")}
+                    </p>
+                    {ID_INVALID.map(renderModeButton)}
+                  </div>
+                </div>
+              </details>
             </>
           ) : (
             <>

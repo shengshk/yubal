@@ -19,6 +19,8 @@ services:
       PGID: 1000
       YUBAL_TZ: Asia/Shanghai
       YUBAL_AUTH_LOGIN: "true"
+      # Mutable indexes/cooldowns stay on local config, not the media disk.
+      YUBAL_STATE_ROOT: /config/state
       # YUBAL_SCHEDULER_CRON: "0 * * * *"
       # Local Bot API (large file path upload). Omit to use official Telegram API.
       # 本地 Bot API（大文件按路径上传）。不设则走官方 API。
@@ -39,6 +41,9 @@ services:
       # https://my.telegram.org — replace placeholders; never commit real secrets
       TELEGRAM_API_ID: "YOUR_API_ID"
       TELEGRAM_API_HASH: "YOUR_API_HASH"
+      # Required for file:// path uploads from the shared /data mount.
+      # 使用共享 /data 路径发送文件时必须启用。
+      TELEGRAM_LOCAL: "1"
       # TELEGRAM_PROXY: "socks5://host:port"
     volumes:
       - ./tgapi:/var/lib/telegram-bot-api

@@ -29,8 +29,20 @@ AUDIO_FORMATS = frozenset({"opus", "mp3", "m4a"})
 PRESELECT_PLACE_MODES = frozenset({"link", "copy"})
 PRESELECT_MATCH_MODES = frozenset({"loose", "standard", "strict"})
 MATCH_STRICTNESS_MODES = frozenset({"strict", "relaxed"})
+EXTERNAL_NEW_PLAYLIST_MODES = frozenset({"pending", "readonly", "managed"})
 TRACK_SORT_KEYS = frozenset({"title", "artist", "album"})
 DEFAULT_INDEX_THRESHOLD = 50
+# Credentials and access-control values are not behavioral preferences.
+# Levels 1/2 of factory reset preserve these so the Web session, Telegram
+# control channel and optional metadata account remain usable.
+PREFERENCE_CREDENTIAL_KEYS = frozenset(
+    {
+        "telegram_bot_token",
+        "telegram_admin_ids",
+        "telegram_user_ids",
+        "lastfm_api_key",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -85,8 +97,12 @@ class Preferences:
     replaygain: bool = True
     scheduler_enabled: bool = True
     scheduler_cron: str = "0 * * * *"
+    external_inventory_schedule_enabled: bool = True
+    external_inventory_schedule_time: str = "03:00"
     job_timeout_seconds: int = 1800
     external_library_enabled: bool = False
+    # How folders first discovered under External/Raw are handled.
+    external_new_playlist_mode: str = "pending"
     preselect_enabled: bool = False
     wash_enabled: bool = False
     preselect_root: str = ""
@@ -161,8 +177,11 @@ def preferences_from_settings(settings: Any) -> Preferences:
         replaygain=bool(settings.replaygain),
         scheduler_enabled=bool(settings.scheduler_enabled),
         scheduler_cron=str(settings.scheduler_cron),
+        external_inventory_schedule_enabled=True,
+        external_inventory_schedule_time="03:00",
         job_timeout_seconds=max(60, job_timeout),
         external_library_enabled=False,
+        external_new_playlist_mode="pending",
         preselect_enabled=False,
         wash_enabled=False,
         preselect_root="",
@@ -385,6 +404,7 @@ def _parse_overrides(raw: dict[str, Any], defaults: Preferences) -> dict[str, An
         "download_ugc",
         "replaygain",
         "scheduler_enabled",
+        "external_inventory_schedule_enabled",
         "external_library_enabled",
         "preselect_enabled",
         "wash_enabled",
@@ -465,6 +485,26 @@ def _parse_overrides(raw: dict[str, Any], defaults: Preferences) -> dict[str, An
         else:
             logger.warning("Invalid scheduler_cron in preferences: %r", cron)
 
+    if "external_inventory_schedule_time" in raw:
+        value = str(raw["external_inventory_schedule_time"]).strip()
+        try:
+            hour_text, minute_text = value.split(":", 1)
+            valid_time = (
+                len(hour_text) == 2
+                and len(minute_text) == 2
+                and 0 <= int(hour_text) <= 23
+                and 0 <= int(minute_text) <= 59
+            )
+        except (TypeError, ValueError):
+            valid_time = False
+        if valid_time:
+            overrides["external_inventory_schedule_time"] = value
+        else:
+            logger.warning(
+                "Invalid external_inventory_schedule_time in preferences: %r",
+                value,
+            )
+
     if "job_timeout_seconds" in raw:
         try:
             timeout = int(raw["job_timeout_seconds"])
@@ -505,6 +545,16 @@ def _parse_overrides(raw: dict[str, Any], defaults: Preferences) -> dict[str, An
             logger.warning(
                 "Invalid match_strictness in preferences: %r",
                 raw["match_strictness"],
+            )
+
+    if "external_new_playlist_mode" in raw:
+        mode = str(raw["external_new_playlist_mode"]).lower().strip()
+        if mode in EXTERNAL_NEW_PLAYLIST_MODES:
+            overrides["external_new_playlist_mode"] = mode
+        else:
+            logger.warning(
+                "Invalid external_new_playlist_mode in preferences: %r",
+                raw["external_new_playlist_mode"],
             )
 
     if "cover_excellence_px" in raw:
@@ -660,6 +710,23 @@ class PreferencesStore:
                 except OSError as e:
                     logger.warning("Failed to remove preferences file: %s", e)
             return self._defaults
+
+    def reset_preferences(self) -> Preferences:
+        """Reset behavior/UI overrides while preserving credentials and access IDs."""
+        with self._lock:
+            self._overrides = {
+                key: value
+                for key, value in self._overrides.items()
+                if key in PREFERENCE_CREDENTIAL_KEYS
+            }
+            if self._overrides:
+                self._save_unlocked()
+            else:
+                try:
+                    self._path.unlink(missing_ok=True)
+                except OSError as exc:
+                    logger.warning("Failed to remove preferences file: %s", exc)
+            return replace(self._defaults, **self._overrides)
 
     def disk_status(self) -> DiskStatus:
         path = self._data_path

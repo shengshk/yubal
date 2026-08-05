@@ -143,25 +143,20 @@ class LibraryEnrichmentService:
         force: bool = False,
     ) -> EnrichmentSummary:
         summary = EnrichmentSummary()
-        grouped = self._catalog.list_all_by_video_id()
+        folder = (save_folder or "").strip().replace("\\", "/").rstrip("/")
+        candidate_limit = None if budget is None else max(500, int(budget) * 10)
+        grouped = self._catalog.list_enrichment_candidates(
+            save_folder=folder or None,
+            limit=candidate_limit,
+        )
         if not grouped:
             return summary
 
-        folder = (save_folder or "").strip().replace("\\", "/").rstrip("/")
         candidates: list[tuple[TrackRecord, Path, str, bool]] = []
         from yubal.services.scrape_state import ScrapeStateStore
 
         scrape_store = ScrapeStateStore(self._data_path)
         for rows in grouped.values():
-            if folder:
-                rows = [
-                    (loc, rec)
-                    for loc, rec in rows
-                    if (loc.save_folder or "").strip().replace("\\", "/").rstrip("/")
-                    == folder
-                ]
-                if not rows:
-                    continue
             record = rows[0][1]
             path = self._first_existing_path(rows)
             if path is None:
@@ -346,7 +341,7 @@ class LibraryEnrichmentService:
 
                 length = MediaFile(path).length
                 if length is not None and float(length) > 0:
-                    duration = max(1, int(round(float(length))))
+                    duration = max(1, round(float(length)))
             except Exception:
                 logger.debug(
                     "Could not read duration for enrich %s", path, exc_info=True

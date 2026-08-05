@@ -1,5 +1,7 @@
 """Subscription management endpoints."""
 
+import asyncio
+
 from typing import Literal
 from uuid import UUID
 
@@ -22,6 +24,7 @@ from yubal_api.db.subscription import (
 from yubal_api.db.subscription_membership import MembershipStatus
 from yubal_api.schemas.subscriptions import (
     SubscriptionCreate,
+    LikedSongRatingRequest,
     SubscriptionListResponse,
     SubscriptionResponse,
     SubscriptionTrackDisposeRequest,
@@ -85,11 +88,11 @@ def _to_response(subscription: Subscription) -> SubscriptionResponse:
 async def sync_all_subscriptions(
     scheduler: SchedulerDep,
 ) -> SyncResponse:
-    """Sync all enabled subscriptions."""
-    job_ids = scheduler.sync_all()
+    """Queue all enabled subscriptions and the shared library cycle."""
+    job_ids, steps = await scheduler.queue_manual_sync()
     return SyncResponse(
         job_ids=job_ids,
-        steps=scheduler.last_manual_sync_steps,
+        steps=steps,
     )
 
 
@@ -219,6 +222,30 @@ def list_subscription_tracks(
     return SubscriptionTrackListResponse(
         items=[SubscriptionTrackResponse.model_validate(i) for i in items]
     )
+
+
+@router.post("/{subscription_id}/tracks/{video_id}/rating", response_model=SyncResponse)
+async def rate_liked_song(
+    subscription_id: UUID,
+    video_id: str,
+    data: LikedSongRatingRequest,
+    service: SubscriptionServiceDep,
+    scheduler: SchedulerDep,
+) -> SyncResponse:
+    """Change YTM thumbs-up, then queue a Liked Music refresh to confirm it."""
+    try:
+        await asyncio.to_thread(
+            service.rate_liked_song,
+            subscription_id,
+            video_id,
+            liked=data.liked,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    job_id = scheduler.sync_subscription(subscription_id)
+    # The remote rating already succeeded. A currently running Liked Music
+    # job will observe it, so do not report a false failure to the UI.
+    return SyncResponse(job_ids=[job_id] if job_id is not None else [])
 
 
 @router.post(

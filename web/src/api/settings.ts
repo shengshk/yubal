@@ -4,6 +4,31 @@ import { sharedJsonGet } from "./shared-get";
 export type AudioFormat = "opus" | "mp3" | "m4a";
 export type TrackSortKey = "title" | "artist" | "album";
 export type MatchStrictness = "strict" | "relaxed";
+export type ExternalNewPlaylistMode = "pending" | "readonly" | "managed";
+export type FactoryResetMode = "preferences" | "invalid" | "full";
+
+export type FactoryResetPreview = {
+  mode: FactoryResetMode;
+  token: string;
+  expires_in_seconds: number;
+  list_entries: number;
+  files: number;
+  paths: number;
+  bytes: number;
+  backups: number;
+  clears_account: boolean;
+  clears_external_originals: boolean;
+};
+
+export type FactoryResetResult = {
+  mode: FactoryResetMode;
+  list_entries: number;
+  files: number;
+  paths: number;
+  bytes: number;
+  backups: number;
+  requires_setup: boolean;
+};
 
 export type AppSettings = {
   min_free_gb: number;
@@ -21,8 +46,11 @@ export type AppSettings = {
   replaygain: boolean;
   scheduler_enabled: boolean;
   scheduler_cron: string;
+  external_inventory_schedule_enabled: boolean;
+  external_inventory_schedule_time: string;
   job_timeout_seconds: number;
   external_library_enabled: boolean;
+  external_new_playlist_mode: ExternalNewPlaylistMode;
   preselect_enabled: boolean;
   wash_enabled: boolean;
   preselect_root: string;
@@ -85,8 +113,11 @@ export type SettingsUpdate = Partial<{
   replaygain: boolean;
   scheduler_enabled: boolean;
   scheduler_cron: string;
+  external_inventory_schedule_enabled: boolean;
+  external_inventory_schedule_time: string;
   job_timeout_seconds: number;
   external_library_enabled: boolean;
+  external_new_playlist_mode: ExternalNewPlaylistMode;
   preselect_enabled: boolean;
   wash_enabled: boolean;
   preselect_place_mode: "link" | "copy";
@@ -175,6 +206,53 @@ export async function resetSettings(): Promise<
     };
   }
   return (await res.json()) as AppSettings;
+}
+
+export async function previewFactoryReset(
+  mode: FactoryResetMode,
+): Promise<FactoryResetPreview | { error: string }> {
+  const res = await fetch(`${basePath}/api/settings/factory/preview`, {
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ mode }),
+  });
+  if (!res.ok) {
+    const body = (await res.json().catch(() => null)) as {
+      message?: string;
+      detail?: string;
+    } | null;
+    return {
+      error: body?.message ?? body?.detail ?? "Failed to preview reset",
+    };
+  }
+  return (await res.json()) as FactoryResetPreview;
+}
+
+export async function executeFactoryReset(
+  preview: FactoryResetPreview,
+  password = "",
+): Promise<FactoryResetResult | { error: string }> {
+  const res = await fetch(`${basePath}/api/settings/factory/execute`, {
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      mode: preview.mode,
+      token: preview.token,
+      password,
+    }),
+  });
+  if (!res.ok) {
+    const body = (await res.json().catch(() => null)) as {
+      message?: string;
+      detail?: string;
+    } | null;
+    return {
+      error: body?.message ?? body?.detail ?? "Failed to execute reset",
+    };
+  }
+  return (await res.json()) as FactoryResetResult;
 }
 
 export async function clearScrapeCooldowns(): Promise<

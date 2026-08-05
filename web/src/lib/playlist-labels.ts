@@ -25,14 +25,20 @@ export function externalPlaylistDisplayName(
 export function externalPlaylistPathHint(dirName: string): string {
   const pit = specialExternalPit(dirName);
   if (pit === "deleted") return "external/raw/delete";
-  if (pit === "archive") return "external/organized/default";
+  if (pit === "archive")
+    return "external/raw/default · external/organized/default";
   return `external/raw/${dirName} · external/organized/${dirName}`;
 }
 
-/** Fixed product order: recycle centre, archive, then normal playlists. */
-export function externalPlaylistPriority(dirName: string): number {
+/** Fixed product order: system → managed → read-only → pending setup. */
+export function externalPlaylistPriority(
+  dirName: string,
+  accessMode: "pending" | "readonly" | "managed" = "readonly",
+): number {
   const pit = specialExternalPit(dirName);
   if (pit === "deleted") return 0;
   if (pit === "archive") return 1;
-  return 2;
+  if (accessMode === "managed") return 2;
+  if (accessMode === "readonly") return 3;
+  return 4;
 }

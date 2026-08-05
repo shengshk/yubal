@@ -52,6 +52,14 @@ class JobExecutionStore(Protocol):
         """Get a job by id."""
         ...
 
+    def get_all(self) -> list[Job]:
+        """Get all queued and running jobs."""
+        ...
+
+    def cancel(self, job_id: str) -> bool:
+        """Mark a queued or running job as cancelled."""
+        ...
+
     def pop_next_pending(self) -> Job | None:
         """Get and activate the next pending job."""
         ...

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import shutil
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -12,11 +11,9 @@ from typing import TYPE_CHECKING
 from uuid import UUID
 
 from yubal import DownloadStatus, PhaseStats, SkipReason
-from yubal.services.track_index import rewrite_track_index_prefix
 from yubal.utils.library import (
     DIRECT_FOLDER,
     resolve_under_data,
-    sanitize_direct_folder,
 )
 
 from yubal_api.api.exceptions import FolderConflictError
@@ -28,7 +25,6 @@ from yubal_api.db.track_catalog_repository import (
     format_track_display,
 )
 from yubal_api.domain.job import ContentInfo, Job
-from yubal_api.services.exclusive_ops import run_exclusive
 from yubal_api.services.library_ops import (
     cleanup_after_audio_removed,
     delete_track_file,
@@ -173,6 +169,7 @@ class SyncLedgerService:
         self._job_executor = None
         self._subscription_folder_lookup = None
         self._post_job_finalize: Callable[[str, str], object] | None = None
+        self._media_changed: Callable[[], object] | None = None
         self._external: ExternalLibraryService | None = None
         self._wanted = None
 
@@ -234,6 +231,14 @@ class SyncLedgerService:
         """Run canonical folder enrichment after a successful job."""
         self._post_job_finalize = callback
 
+    def bind_media_changed(self, callback: Callable[[], object]) -> None:
+        """Mark the persisted library summary stale after a real media mutation."""
+        self._media_changed = callback
+
+    def _notify_media_changed(self) -> None:
+        if self._media_changed is not None:
+            self._media_changed()
+
     def reconcile_interrupted_jobs(self) -> int:
         """Resolve ledger rows left ``running`` by a crash/restart. Startup-only."""
         return self._repository.mark_stale_running_interrupted()
@@ -265,7 +270,8 @@ class SyncLedgerService:
             return self._preferences_store.effective().direct_folder
         return DIRECT_FOLDER
 
-    def list(self, *, reconcile: bool = True) -> list[SyncLedgerEntry]:
+    def list(self, *, reconcile: bool = False) -> list[SyncLedgerEntry]:
+        """Return persisted counters; disk reconciliation is an explicit action."""
         items = self._repository.list()
         if reconcile and self._data_path is not None:
             items = [self._reconcile_entry(e) for e in items]
@@ -430,8 +436,6 @@ class SyncLedgerService:
         folder = (save_folder or "").strip().replace("\\", "/")
         if not folder or folder.startswith("/") or ".." in folder.split("/"):
             raise ValueError("invalid save_folder")
-        root = resolve_under_data(self._data_path, folder)
-
         if self._track_catalog is not None:
             rows = self._track_catalog.list_for_save_folder(folder)
             if rows:
@@ -439,19 +443,12 @@ class SyncLedgerService:
                 missing_active = 0
                 cover_path: str | None = None
                 for location, _track in rows:
-                    path = root / location.relative_path
-                    exists = path.is_file()
-                    if exists:
+                    if location.membership_status != LocationMembershipStatus.OFFLINE:
                         present_ids.add(location.video_id)
                         if cover_path is None:
                             cover_path = f"{folder}/{location.relative_path}".replace(
                                 "\\", "/"
                             )
-                    elif location.membership_status not in (
-                        LocationMembershipStatus.OFFLINE,
-                        LocationMembershipStatus.BLOCKED,
-                    ):
-                        missing_active += 1
                 return FolderTrackSummary(
                     frozenset(present_ids),
                     missing_active,
@@ -647,9 +644,7 @@ class SyncLedgerService:
 
     def update_direct_folder(
         self,
-        new_folder: str | None = None,
         *,
-        confirm_folder_move: bool = False,
         enabled: bool | None = None,
         max_items: int | None = None,
         sync_jitter_seconds: int | None = None,
@@ -690,79 +685,9 @@ class SyncLedgerService:
                 0, min(8760, int(offline_cleanup_delay_hours))
             )
 
-        if new_folder is None or not str(new_folder).strip():
-            if prefs_updates:
-                self._preferences_store.update(**prefs_updates)
-            return self.ensure_direct_entry()
-
-        safe = sanitize_direct_folder(new_folder)
-        old = self._direct_folder()
-        if safe == old:
-            if prefs_updates:
-                self._preferences_store.update(**prefs_updates)
-            return self._finalize_direct_folder(safe)
-
-        entry = run_exclusive(
-            gate=self._gate,
-            job_executor=self._job_executor,
-            reason=f"move Download Center folder {old}→{safe}",
-            fn=lambda: self._move_direct_folder(old, safe, confirm=confirm_folder_move),
-        )
         if prefs_updates:
             self._preferences_store.update(**prefs_updates)
-            entry = self.ensure_direct_entry()
-        return entry
-
-    def _move_direct_folder(
-        self, old: str, safe: str, *, confirm: bool
-    ) -> SyncLedgerEntry:
-        assert self._data_path is not None and self._preferences_store is not None
-        old_path = resolve_under_data(self._data_path, old)
-        new_path = resolve_under_data(self._data_path, safe)
-        new_path.parent.mkdir(parents=True, exist_ok=True)
-        if old_path.exists() and old_path.resolve() != new_path.resolve():
-            if new_path.exists() and any(new_path.iterdir()):
-                if not confirm:
-                    raise FolderConflictError(
-                        f"Target folder already has files: {safe}. "
-                        "Confirm to merge into the existing folder.",
-                        save_folder=safe,
-                    )
-                for item in list(old_path.iterdir()):
-                    target = new_path / item.name
-                    if target.exists():
-                        continue
-                    shutil.move(str(item), str(target))
-                try:
-                    old_path.rmdir()
-                except OSError:
-                    pass
-            else:
-                if new_path.exists():
-                    try:
-                        new_path.rmdir()
-                    except OSError:
-                        pass
-                shutil.move(str(old_path), str(new_path))
-        rewrite_track_index_prefix(self._data_path, old, safe)
-        self._preferences_store.update(direct_folder=safe)
-        return self._finalize_direct_folder(safe)
-
-    def _finalize_direct_folder(self, safe: str) -> SyncLedgerEntry:
-        entry = self._repository.get_by_key(DIRECT_LEDGER_KEY)
-        if entry is None:
-            entry = SyncLedgerEntry(
-                key=DIRECT_LEDGER_KEY,
-                kind=LedgerKind.DIRECT,
-                save_folder=safe,
-                title=safe.split("/")[-1] or safe,
-                content_kind="playlist",
-            )
-        else:
-            entry.save_folder = safe
-            entry.title = safe.split("/")[-1] or safe
-        self._repository.upsert(entry)
-        return self.reconcile_direct(safe) or entry
+        return self.ensure_direct_entry()
 
     def delete_direct(
         self, *, confirm: bool = False, mode: str = "wipe_list"
@@ -800,6 +725,9 @@ class SyncLedgerService:
         if self._data_path is not None:
             path = resolve_under_data(self._data_path, folder)
             delete_tree_audio(path)
+            if list_folder_tracks(path):
+                # Do not erase the ledger/catalog if an unlink was denied.
+                raise OSError("some Download Center files could not be deleted")
             try:
                 if path.is_dir() and not any(path.iterdir()):
                     path.rmdir()
@@ -814,6 +742,7 @@ class SyncLedgerService:
         else:
             # keep_list: recount zeros on disk but preserve ledger + catalog
             self.reconcile_direct(folder)
+        self._notify_media_changed()
         return None
 
     def delete_direct_track(
@@ -861,6 +790,7 @@ class SyncLedgerService:
         entry = self.reconcile_direct(folder)
         if entry is None:
             entry = self.ensure_direct_entry()
+        self._notify_media_changed()
         return entry
 
     def _migrate_direct_track_to_wanted(self, relative_path: str) -> None:
@@ -900,6 +830,7 @@ class SyncLedgerService:
                     "Failed removing Download Center file after wanted migrate %s",
                     relative_path,
                 )
+                raise
         self._track_catalog.delete_location(folder, relative_path)
 
     def unblock_direct_track(self, video_id: str) -> SyncLedgerEntry:
@@ -935,6 +866,7 @@ class SyncLedgerService:
                     abs_path.unlink()
                 except OSError as e:
                     logger.warning("Could not delete %s: %s", abs_path, e)
+                    raise
                 lrc = abs_path.with_suffix(".lrc")
                 if lrc.is_file():
                     lrc.unlink(missing_ok=True)
@@ -942,6 +874,7 @@ class SyncLedgerService:
         entry = self.reconcile_direct(folder)
         if entry is None:
             entry = self.ensure_direct_entry()
+        self._notify_media_changed()
         return entry
 
     def clear_direct_offline(
@@ -986,12 +919,9 @@ class SyncLedgerService:
                     if abs_path is not None and abs_path.is_file():
                         # Drop Direct hardlink after wanted has its own link/copy
                         try:
-                            if abs_path.stat().st_nlink > 1:
-                                abs_path.unlink(missing_ok=True)
-                            else:
-                                abs_path.unlink(missing_ok=True)
+                            abs_path.unlink(missing_ok=True)
                         except OSError:
-                            pass
+                            raise
                         if stop_at is not None:
                             cleanup_after_audio_removed(abs_path.parent, stop_at)
                     self._track_catalog.delete_location(folder, loc.relative_path)
@@ -1007,6 +937,8 @@ class SyncLedgerService:
                     if abs_path is not None and abs_path.is_file():
                         dest = self._external.ingest_file_to_raw_delete(
                             abs_path,
+                            origin_kind="direct",
+                            origin_ref=folder,
                             title=rec.title,
                             artists=rec.artist,
                             album=rec.album or "",
@@ -1040,6 +972,8 @@ class SyncLedgerService:
                 self._track_catalog.delete_location(folder, loc.relative_path)
                 cleared += 1
         self.reconcile_direct(folder)
+        if cleared or moved:
+            self._notify_media_changed()
         return {"cleared": cleared, "moved": moved, "errors": errors}
 
     def migrate_direct_to_external(self) -> dict:
@@ -1175,6 +1109,8 @@ class SyncLedgerService:
                     if abs_path is not None and abs_path.is_file():
                         self._external.ingest_file_to_raw_delete(
                             abs_path,
+                            origin_kind="direct",
+                            origin_ref=folder,
                             title=rec.title,
                             artists=rec.artist,
                             album=rec.album or "",
@@ -1385,14 +1321,14 @@ class SyncLedgerService:
                     entry.total_count = existing.total_count
 
         saved = self._repository.upsert(entry)
-        # Reconcile against disk so external deletes don't leave inflated counts.
-        reconciled = self._reconcile_entry(saved)
         if success and self._post_job_finalize is not None and folder:
             try:
                 self._post_job_finalize(folder, kind.value)
             except Exception:
                 logger.exception("Post-job finalization failed for %s", folder)
-        return reconciled
+        if success:
+            self._notify_media_changed()
+        return saved
 
     def record_cloud_track_count(
         self,
@@ -1431,4 +1367,4 @@ class SyncLedgerService:
             skipped_other=existing.skipped_other if existing else 0,
         )
         saved = self._repository.upsert(entry)
-        return self._reconcile_entry(saved)
+        return saved

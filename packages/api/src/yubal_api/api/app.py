@@ -27,15 +27,15 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import HTMLResponse, Response
 from starlette.staticfiles import StaticFiles
 from starlette.types import Scope
-from yubal import cleanup_part_files
-from yubal.services.track_index import repair_track_index
-from yubal.utils.cleanup import cleanup_startup_temps
+from yubal.services.scrape_state import scrape_state_path
+from yubal.utils.cleanup import cleanup_download_staging
 from yubal.utils.library import (
-    DOWNLOAD_ROOT,
     EXTERNAL_ROOT,
     WANTED_ROOT,
     ensure_external_layout,
     ensure_wanted_layout,
+    runtime_state_path,
+    track_index_path,
 )
 
 from yubal_api.api.container import Services
@@ -88,6 +88,8 @@ from yubal_api.services.database_safety import (
     verify_sqlite_database,
 )
 from yubal_api.services.external_library_service import ExternalLibraryService
+from yubal_api.services.external_library_worker import ExternalLibraryWorker
+from yubal_api.services.factory_reset_service import FactoryResetService
 from yubal_api.services.job_event_bus import JobEventBus
 from yubal_api.services.job_executor import JobExecutor
 from yubal_api.services.job_store import JobStore
@@ -188,7 +190,10 @@ def run_migrations() -> None:
     command.upgrade(alembic_cfg, "head")
 
 
-def create_services(repository: SubscriptionRepository) -> Services:
+def create_services(
+    repository: SubscriptionRepository,
+    auth_manager: AuthManager,
+) -> Services:
     """Create all application services with proper dependency wiring.
 
     Args:
@@ -240,6 +245,7 @@ def create_services(repository: SubscriptionRepository) -> Services:
         track_catalog=track_catalog,
         data_path=settings.data,
         archive_folder=preferences_store.effective().direct_folder,
+        archive_folder_resolver=lambda: preferences_store.effective().direct_folder,
     )
     subscription_service.bind_membership(membership_service)
 
@@ -278,6 +284,20 @@ def create_services(repository: SubscriptionRepository) -> Services:
 
     operation_gate = OperationGate()
 
+    factory_reset = FactoryResetService(
+        engine=repository.engine,
+        preferences=preferences_store,
+        auth=auth_manager,
+        download_root=settings.data,
+        external_root=EXTERNAL_ROOT,
+        wanted_root=WANTED_ROOT,
+        cache_root=DOWNLOAD_CACHE_ROOT,
+        config_root=settings.config,
+        db_path=settings.db_path,
+        cookies_path=settings.cookies_file,
+        operation_gate=operation_gate,
+    )
+
     library_health = LibraryHealthService(settings.config / "library_health.json")
     library_health.bind_require_external(
         lambda: preferences_store.effective().external_library_enabled
@@ -301,6 +321,7 @@ def create_services(repository: SubscriptionRepository) -> Services:
         cookies_path=cookies_path,
         sync_ledger=sync_ledger_service,
         external_library=external_library_service,
+        catalog=track_catalog,
     )
     sync_ledger_service.bind_wanted_service(wanted_service)
     membership_service.bind_wanted_service(wanted_service)
@@ -319,6 +340,17 @@ def create_services(repository: SubscriptionRepository) -> Services:
         download_root=settings.data,
         external_root=EXTERNAL_ROOT,
         wanted_root=WANTED_ROOT,
+        state_path=settings.config / "state" / "library_summary.json",
+    )
+    # Services are created before the statistics ledger.  Bind this callback
+    # afterwards so media mutations only mark the persisted snapshot stale;
+    # they never trigger an expensive startup scan.
+    wanted_service.bind_media_changed(library_stats_service.mark_media_changed)
+    membership_service.bind_media_changed(library_stats_service.mark_media_changed)
+    subscription_service.bind_media_changed(library_stats_service.mark_media_changed)
+    sync_ledger_service.bind_media_changed(library_stats_service.mark_media_changed)
+    external_library_service.bind_media_changed(
+        library_stats_service.mark_media_changed
     )
 
     folder_presence = CatalogFolderPresence(track_catalog, settings.data)
@@ -347,10 +379,12 @@ def create_services(repository: SubscriptionRepository) -> Services:
         external_library_service=external_library_service,
         library_enrichment_service=library_enrichment_service,
         library_dedup_service=library_dedup_service,
+        library_stats_service=library_stats_service,
         preferences_store=preferences_store,
         sync_ledger_service=sync_ledger_service,
         wanted_service=wanted_service,
     )
+    sync_pipeline_service.bind_media_changed(library_stats_service.mark_media_changed)
     sync_ledger_service.bind_post_job_finalize(
         lambda folder, kind: sync_pipeline_service.sync_catalog_folder(
             folder,
@@ -380,6 +414,7 @@ def create_services(repository: SubscriptionRepository) -> Services:
         folder_presence=folder_presence,
     )
     wanted_service.bind_job_executor(job_executor)
+    factory_reset.bind_job_executor(job_executor)
 
     # Create scheduler
     scheduler_service = Scheduler(
@@ -429,6 +464,7 @@ def create_services(repository: SubscriptionRepository) -> Services:
         library_health=library_health,
         db_engine=repository.engine,
         wanted_service=wanted_service,
+        factory_reset=factory_reset,
     )
 
     return Services(
@@ -458,6 +494,7 @@ def create_services(repository: SubscriptionRepository) -> Services:
         telegram_bot=telegram_bot,
         playlist_info=playlist_info,
         wanted_service=wanted_service,
+        factory_reset=factory_reset,
     )
 
 
@@ -514,13 +551,38 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     await asyncio.to_thread(verify_sqlite_database, settings.db_path)
     logger.info("Database migrations complete")
 
+    # Move mutable indexes/cooldowns off the media mount before services load
+    # them. Each resolver is idempotent and preserves the old file unless the
+    # local-config copy completes successfully.
+    state_paths = await asyncio.to_thread(
+        lambda: (
+            track_index_path(settings.data),
+            scrape_state_path(settings.data),
+            scrape_state_path(EXTERNAL_ROOT),
+            scrape_state_path(WANTED_ROOT),
+            runtime_state_path(
+                WANTED_ROOT,
+                "last_sync.json",
+                legacy_path=WANTED_ROOT / ".last_sync.json",
+            ),
+            runtime_state_path(settings.data, "naming_artist_title_v1.done"),
+        )
+    )
+    migrated_state_count = sum(path.is_file() for path in state_paths)
+    if migrated_state_count:
+        logger.info(
+            "Runtime state ready under %s (%d file(s))",
+            settings.config / "state",
+            migrated_state_count,
+        )
+
     # Create database engine
     db_path = settings.db_path
     engine = create_db_engine(db_path)
 
     # Create services with database repository
     repository = SubscriptionRepository(engine)
-    services = create_services(repository)
+    services = create_services(repository, auth_manager)
     app.state.services = services
     logger.info("Services initialized")
 
@@ -551,11 +613,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 naming.errors,
             )
 
-    save_folders = [sub.save_folder or sub.name for sub in repository.list()]
-    repaired = repair_track_index(settings.data, save_folders=save_folders)
-    if repaired:
-        logger.info("Repaired %d stale track index entries on startup", repaired)
-
     # Jobs are in-memory: a restart mid-sync leaves ledger rows stuck at
     # "running". Resolve them to "interrupted" so the UI never mislabels a
     # previously-synced folder as "never run".
@@ -565,9 +622,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     # Leftover .part / abandoned Cache staging from crashed downloads.
     cache_root = DOWNLOAD_CACHE_ROOT if DOWNLOAD_CACHE_ROOT.is_dir() else None
-    temps = cleanup_startup_temps(DOWNLOAD_ROOT, cache_root)
-    if EXTERNAL_ROOT.is_dir() and EXTERNAL_ROOT.resolve() != DOWNLOAD_ROOT.resolve():
-        temps["part_files"] += cleanup_part_files(EXTERNAL_ROOT)
+    # Do not recursively sweep the media library during startup. Active jobs
+    # clean their own destination; only the dedicated cache staging is safe and
+    # bounded enough to clean here.
+    temps = {
+        "part_files": 0,
+        "staging_files": cleanup_download_staging(cache_root),
+    }
     if temps["part_files"] or temps["staging_files"]:
         logger.info(
             "Startup temp cleanup: part_files=%d staging_files=%d",
@@ -578,6 +639,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # Start scheduler
     services.scheduler.start()
 
+    external_library_worker = ExternalLibraryWorker(
+        pipeline=services.sync_pipeline_service,
+        external_service=services.external_library_service,
+        preferences=services.preferences_store,
+    )
+    external_library_worker.start()
+    app.state.external_library_worker = external_library_worker
+
     # Start Telegram bot when token is configured
     await services.telegram_bot.start()
 
@@ -585,6 +654,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     # Shutdown sequence
     await services.telegram_bot.stop()
+
+    worker = getattr(app.state, "external_library_worker", None)
+    if worker is not None:
+        worker.stop()
 
     # Stop scheduler first
     await services.scheduler.stop()
@@ -594,9 +667,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     # Suppress logging to prevent post-prompt messages
     suppress_logging()
-
-    # Clean up .part files from incomplete downloads (delegated to yubal)
-    cleanup_part_files(settings.data)
 
     # Clean temp directory
     if settings.temp.exists():

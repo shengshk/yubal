@@ -14,10 +14,15 @@ Layout under the download root (per-folder mode)::
 
 from __future__ import annotations
 
+import logging
 import os
+import shutil
+import threading
 from pathlib import Path
 
 from yubal.utils.filename import _limit_path_component, clean_filename
+
+logger = logging.getLogger(__name__)
 
 PLAYLISTS_FOLDER = "_playlists"
 DIRECT_FOLDER = "direct"
@@ -68,6 +73,71 @@ STORAGE_ROOTS: dict[str, Path] = {
 DOWNLOAD_MOUNT_SENTINEL = DOWNLOAD_ROOT / MOUNT_SENTINEL_NAME
 EXTERNAL_MOUNT_SENTINEL = EXTERNAL_ROOT / MOUNT_SENTINEL_NAME
 WANTED_MOUNT_SENTINEL = WANTED_ROOT / MOUNT_SENTINEL_NAME
+
+
+def library_state_dir(base_path: Path) -> Path:
+    """Return the runtime-state directory for a known library root.
+
+    Docker sets ``YUBAL_STATE_ROOT=/config/state`` so mutable indexes and
+    cooldown files stay on local application storage instead of the media
+    mount. Non-Docker and test callers keep the legacy colocated layout unless
+    they explicitly configure the environment variable.
+    """
+    configured = (os.environ.get("YUBAL_STATE_ROOT") or "").strip()
+    if not configured:
+        return base_path / TRACK_INDEX_DIR
+
+    try:
+        resolved = base_path.resolve()
+    except OSError:
+        resolved = base_path
+    for storage, root in STORAGE_ROOTS.items():
+        try:
+            root_resolved = root.resolve()
+        except OSError:
+            root_resolved = root
+        if resolved == root_resolved or root_resolved in resolved.parents:
+            return Path(configured) / storage
+
+    # Cache/preview and arbitrary CLI paths keep state beside their own data.
+    return base_path / TRACK_INDEX_DIR
+
+
+def runtime_state_path(
+    base_path: Path,
+    filename: str,
+    *,
+    legacy_path: Path | None = None,
+) -> Path:
+    """Resolve one runtime-state file and migrate its legacy media-side copy."""
+    target = library_state_dir(base_path) / filename
+    source = legacy_path or (base_path / TRACK_INDEX_DIR / filename)
+    if target == source or target.is_file() or not source.is_file():
+        return target
+
+    temp = target.with_name(
+        f".{target.name}.migrate-{os.getpid()}-{threading.get_ident()}"
+    )
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, temp)
+        temp.replace(target)
+        source.unlink()
+        if source.parent.name == TRACK_INDEX_DIR:
+            try:
+                source.parent.rmdir()
+            except OSError:
+                pass
+        logger.info("Migrated runtime state: %s -> %s", source, target)
+    except OSError as exc:
+        logger.warning("Could not migrate runtime state %s: %s", source, exc)
+    finally:
+        try:
+            temp.unlink(missing_ok=True)
+        except OSError:
+            pass
+    # Never discard usable legacy state when local config migration fails.
+    return target if target.is_file() else source
 
 
 def ensure_wanted_layout() -> Path:
@@ -125,6 +195,7 @@ def same_filesystem(a: Path, b: Path) -> bool:
             except OSError:
                 pass
 
+
 def resolve_storage_path(storage: str, relative: str) -> Path:
     """Resolve ``storage`` + relative path under a known library root."""
     root = STORAGE_ROOTS.get(storage)
@@ -167,9 +238,7 @@ def ensure_external_layout() -> None:
     EXTERNAL_ORGANIZED_ROOT.mkdir(parents=True, exist_ok=True)
     (EXTERNAL_RAW_ROOT / EXTERNAL_DELETE_DIR).mkdir(parents=True, exist_ok=True)
     (EXTERNAL_RAW_ROOT / EXTERNAL_DEFAULT_DIR).mkdir(parents=True, exist_ok=True)
-    (EXTERNAL_ORGANIZED_ROOT / EXTERNAL_DEFAULT_DIR).mkdir(
-        parents=True, exist_ok=True
-    )
+    (EXTERNAL_ORGANIZED_ROOT / EXTERNAL_DEFAULT_DIR).mkdir(parents=True, exist_ok=True)
 
 
 RESERVED_LIBRARY_FOLDERS = frozenset(
@@ -210,7 +279,9 @@ def folder_depth(relative: str) -> int:
     return len([p for p in relative.split("/") if p.strip()])
 
 
-def assert_folder_depth(relative: str, *, max_depth: int = MAX_SAVE_FOLDER_DEPTH) -> None:
+def assert_folder_depth(
+    relative: str, *, max_depth: int = MAX_SAVE_FOLDER_DEPTH
+) -> None:
     depth = folder_depth(relative)
     if depth > max_depth:
         raise ValueError(
@@ -320,7 +391,7 @@ def resolve_default_library_folder(
 
 def track_index_path(base_path: Path) -> Path:
     """Path to the video_id → relative-file index used for hardlink dedupe."""
-    return base_path / TRACK_INDEX_DIR / "track_index.json"
+    return runtime_state_path(base_path, "track_index.json")
 
 
 def resolve_under_data(data_path: Path, relative: str) -> Path:

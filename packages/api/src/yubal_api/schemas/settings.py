@@ -8,7 +8,9 @@ AudioFormat = Literal["opus", "mp3", "m4a"]
 PreselectPlaceMode = Literal["link", "copy"]
 PreselectMatchMode = Literal["loose", "standard", "strict"]
 MatchStrictness = Literal["strict", "relaxed"]
+ExternalNewPlaylistMode = Literal["pending", "readonly", "managed"]
 TrackSortKey = Literal["title", "artist", "album"]
+FactoryResetMode = Literal["preferences", "invalid", "full"]
 
 
 class SettingsResponse(BaseModel):
@@ -28,7 +30,7 @@ class SettingsResponse(BaseModel):
         ge=1,
         le=10000,
         description=(
-            "Show A–Z section index when a playlist has at least this many tracks."
+            "Show A-Z section index when a playlist has at least this many tracks."
         ),
     )
     track_sort_key: TrackSortKey = Field(
@@ -55,8 +57,14 @@ class SettingsResponse(BaseModel):
     replaygain: bool
     scheduler_enabled: bool
     scheduler_cron: str
+    external_inventory_schedule_enabled: bool = True
+    external_inventory_schedule_time: str = Field(
+        default="03:00",
+        pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$",
+    )
     job_timeout_seconds: int = Field(ge=60, description="Per-job timeout in seconds")
     external_library_enabled: bool = False
+    external_new_playlist_mode: ExternalNewPlaylistMode = "pending"
     preselect_enabled: bool = False
     wash_enabled: bool = False
     preselect_root: str = ""
@@ -106,9 +114,7 @@ class SettingsResponse(BaseModel):
         default=30,
         ge=1,
         le=365,
-        description=(
-            "Days a full-download cover comparison stays fresh (default 30)."
-        ),
+        description=("Days a full-download cover comparison stays fresh (default 30)."),
     )
     library_health_status: str | None = None
     library_health_reason: str | None = None
@@ -152,8 +158,14 @@ class SettingsUpdate(BaseModel):
     replaygain: bool | None = None
     scheduler_enabled: bool | None = None
     scheduler_cron: str | None = None
+    external_inventory_schedule_enabled: bool | None = None
+    external_inventory_schedule_time: str | None = Field(
+        default=None,
+        pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$",
+    )
     job_timeout_seconds: int | None = Field(default=None, ge=60, le=86400)
     external_library_enabled: bool | None = None
+    external_new_playlist_mode: ExternalNewPlaylistMode | None = None
     preselect_enabled: bool | None = None
     wash_enabled: bool | None = None
     preselect_place_mode: PreselectPlaceMode | None = None
@@ -178,3 +190,36 @@ class SettingsUpdate(BaseModel):
     wanted_source_discogs: bool | None = None
     wanted_source_lastfm: bool | None = None
     lastfm_api_key: str | None = None
+
+
+class FactoryResetPreviewRequest(BaseModel):
+    mode: FactoryResetMode
+
+
+class FactoryResetExecuteRequest(BaseModel):
+    mode: FactoryResetMode
+    token: str = Field(min_length=16, max_length=200)
+    password: str = Field(default="", max_length=500)
+
+
+class FactoryResetPreviewResponse(BaseModel):
+    mode: FactoryResetMode
+    token: str
+    expires_in_seconds: int
+    list_entries: int
+    files: int
+    paths: int
+    bytes: int
+    backups: int
+    clears_account: bool
+    clears_external_originals: bool
+
+
+class FactoryResetResultResponse(BaseModel):
+    mode: FactoryResetMode
+    list_entries: int
+    files: int
+    paths: int
+    bytes: int
+    backups: int
+    requires_setup: bool

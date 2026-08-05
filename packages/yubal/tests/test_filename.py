@@ -341,7 +341,7 @@ class TestBuildUnmatchedTrackPathAsciiMode:
             video_id="abc123",
             ascii_filenames=True,
         )
-        assert result == Path("/music/Unmatched/Bjork - Joga [abc123]")
+        assert result == Path("/music/unmatched/Bjork - Joga [abc123]")
 
 
 class TestBuildTrackPath:
@@ -741,7 +741,7 @@ class TestBuildUnmatchedTrackPath:
             Path("/music"), "Wiz Khalifa", "Mercury Retrograde", "-HJ0ZGkdlTk"
         )
         assert result == Path(
-            "/music/Unmatched/Wiz Khalifa - Mercury Retrograde [-HJ0ZGkdlTk]"
+            "/music/unmatched/Wiz Khalifa - Mercury Retrograde [-HJ0ZGkdlTk]"
         )
 
     # === Normal Inputs ===
@@ -754,7 +754,7 @@ class TestBuildUnmatchedTrackPath:
             title="Test Song",
             video_id="abc123",
         )
-        assert result == Path("/music/Unmatched/Test Artist - Test Song [abc123]")
+        assert result == Path("/music/unmatched/Test Artist - Test Song [abc123]")
 
     def test_build_path_preserves_unicode(self) -> None:
         """Should preserve unicode characters in path components."""
@@ -764,7 +764,7 @@ class TestBuildUnmatchedTrackPath:
             title="Jóga",
             video_id="xyz789",
         )
-        assert result == Path("/music/Unmatched/Björk - Jóga [xyz789]")
+        assert result == Path("/music/unmatched/Björk - Jóga [xyz789]")
 
     def test_limits_filename_and_preserves_video_id_suffix(self) -> None:
         """Should cap flat filenames while keeping the video ID."""
@@ -877,7 +877,7 @@ class TestBuildUnmatchedTrackPath:
     # === Path Structure Verification ===
 
     def test_path_structure(self) -> None:
-        """Should follow convention: base/Unmatched/Artist - Title [videoId]."""
+        """Should follow convention: base/unmatched/Artist - Title [videoId]."""
         result = build_unmatched_track_path(
             base=Path("/music"),
             artist="The Beatles",
@@ -886,7 +886,7 @@ class TestBuildUnmatchedTrackPath:
         )
         parts = result.parts
         assert parts[-3] == "music"
-        assert parts[-2] == "Unmatched"
+        assert parts[-2] == "unmatched"
         assert parts[-1] == "The Beatles - Here Comes The Sun [dQw4w9WgXcQ]"
 
     # === Return Type ===
@@ -910,7 +910,7 @@ class TestBuildUnofficialTrackPath:
         result = build_unofficial_track_path(
             Path("/music"), "Some User", "Cool Song", "abc123"
         )
-        assert result == Path("/music/Unofficial/Some User - Cool Song [abc123]")
+        assert result == Path("/music/unofficial/Some User - Cool Song [abc123]")
 
     def test_basic_path_construction(self) -> None:
         """Should build complete path with all components."""
@@ -920,10 +920,10 @@ class TestBuildUnofficialTrackPath:
             title="Test Song",
             video_id="xyz789",
         )
-        assert result == Path("/music/Unofficial/Test Artist - Test Song [xyz789]")
+        assert result == Path("/music/unofficial/Test Artist - Test Song [xyz789]")
 
     def test_path_structure(self) -> None:
-        """Should follow convention: base/Unofficial/Artist - Title [videoId]."""
+        """Should follow convention: base/unofficial/Artist - Title [videoId]."""
         result = build_unofficial_track_path(
             base=Path("/music"),
             artist="Some User",
@@ -932,7 +932,7 @@ class TestBuildUnofficialTrackPath:
         )
         parts = result.parts
         assert parts[-3] == "music"
-        assert parts[-2] == "Unofficial"
+        assert parts[-2] == "unofficial"
         assert parts[-1] == "Some User - Upload Title [dQw4w9WgXcQ]"
 
     def test_transliterates_components(self) -> None:
@@ -944,7 +944,7 @@ class TestBuildUnofficialTrackPath:
             video_id="abc123",
             ascii_filenames=True,
         )
-        assert result == Path("/music/Unofficial/Bjork - Joga [abc123]")
+        assert result == Path("/music/unofficial/Bjork - Joga [abc123]")
 
     def test_limits_filename_and_preserves_video_id_suffix(self) -> None:
         """Should cap unofficial filenames while keeping the video ID."""

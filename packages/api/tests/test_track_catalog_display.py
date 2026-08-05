@@ -15,4 +15,4 @@ def test_format_when_artists_same() -> None:
 
 
 def test_format_missing_artist() -> None:
-    assert format_track_display("", "群星", "歌") == "歌"
+    assert format_track_display("", "群星", "歌") == "群星 - 歌"

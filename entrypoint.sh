@@ -6,12 +6,14 @@ PGID=${PGID:-1000}
 
 # Hardcoded layout:
 #   /data/download  /data/external  /data/cache   ← media (./data:/data)
+#   /config/state                           ← mutable runtime indexes/state
 #   /config                                 ← settings/DB (./config:/config)
 # Optional SSD: bind host path over /data/cache (same app path).
 LIBRARY_ROOT=/data
 DATA_DIR=/data/download
 EXTERNAL_DIR=/data/external
 CONFIG_DIR=/config
+STATE_DIR=/config/state
 CACHE_DIR=/data/cache
 
 warn_chown() {
@@ -46,6 +48,7 @@ if [ "$(id -u)" = "0" ]; then
     mkdir -p \
         "$CONFIG_DIR/yubal" \
         "$CONFIG_DIR/ytdlp" \
+        "$STATE_DIR" \
         "$DATA_DIR" \
         "$EXTERNAL_DIR/raw" \
         "$EXTERNAL_DIR/organized" \
@@ -53,14 +56,15 @@ if [ "$(id -u)" = "0" ]; then
 
     chown "$PUID:$PGID" "$DATA_DIR" || warn_chown "$DATA_DIR"
     chown "$PUID:$PGID" "$EXTERNAL_DIR" || warn_chown "$EXTERNAL_DIR"
-    chown -R "$PUID:$PGID" "$EXTERNAL_DIR/raw" "$EXTERNAL_DIR/organized" || warn_chown "$EXTERNAL_DIR"
+    # Media can contain tens of thousands of files on SMB. Never recursively
+    # rewrite ownership during startup; share/file ACLs are managed by the host.
+    chown "$PUID:$PGID" "$EXTERNAL_DIR/raw" "$EXTERNAL_DIR/organized" || warn_chown "$EXTERNAL_DIR"
     chown "$PUID:$PGID" "$CACHE_DIR" || warn_chown "$CACHE_DIR"
     chown -R "$PUID:$PGID" "$CONFIG_DIR" || warn_chown "$CONFIG_DIR"
     ensure_writable "$DATA_DIR"
 
-    touch "$DATA_DIR/.yubal-mount" || warn_chown "$DATA_DIR/.yubal-mount"
-    touch "$EXTERNAL_DIR/.yubal-mount" || warn_chown "$EXTERNAL_DIR/.yubal-mount"
-    chown "$PUID:$PGID" "$DATA_DIR/.yubal-mount" "$EXTERNAL_DIR/.yubal-mount" 2>/dev/null || true
+    # Mount sentinels are host-owned evidence of the intended media mounts.
+    # Never recreate them here: doing so would make a missing mount look safe.
 
     exec gosu "$PUID:$PGID" "$@"
 fi
@@ -68,9 +72,9 @@ fi
 mkdir -p \
     "$CONFIG_DIR/yubal" \
     "$CONFIG_DIR/ytdlp" \
+    "$STATE_DIR" \
     "$DATA_DIR" \
     "$EXTERNAL_DIR/raw" \
     "$EXTERNAL_DIR/organized" \
     "$CACHE_DIR" 2>/dev/null || true
-touch "$DATA_DIR/.yubal-mount" "$EXTERNAL_DIR/.yubal-mount" 2>/dev/null || true
 exec "$@"

@@ -8,6 +8,7 @@ import shutil
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from collections.abc import Callable
 from uuid import UUID
 
 from yubal.models.track import TrackMetadata
@@ -34,6 +35,7 @@ from yubal_api.db.subscription_membership_repository import (
 from yubal_api.db.subscription_repository import SubscriptionRepository
 from yubal_api.db.track_catalog_repository import TrackCatalogRepository
 from yubal_api.services.library_ops import cleanup_after_audio_removed
+from yubal_api.services.subscription_service import is_liked_music_url
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +60,8 @@ class SubscriptionMembershipService:
         track_catalog: TrackCatalogRepository,
         data_path: Path,
         archive_folder: str = "direct",
+        archive_folder_resolver: Callable[[], str] | None = None,
+        media_changed: Callable[[], None] | None = None,
     ) -> None:
         self._membership = membership_repo
         self._snapshots = snapshot_repo
@@ -67,6 +71,8 @@ class SubscriptionMembershipService:
         # "Archive" relocates the file into the Direct library so it stays
         # visible and manageable there instead of a hidden folder.
         self._archive_folder = archive_folder.strip().replace("\\", "/").rstrip("/")
+        self._archive_folder_resolver = archive_folder_resolver
+        self._media_changed = media_changed
         self._index = TrackFileIndex(data_path)
         self._external = None
         self._wanted = None
@@ -76,6 +82,13 @@ class SubscriptionMembershipService:
 
     def bind_wanted_service(self, wanted: object) -> None:
         self._wanted = wanted
+
+    def bind_media_changed(self, callback: Callable[[], None]) -> None:
+        self._media_changed = callback
+
+    def _notify_media_changed(self) -> None:
+        if self._media_changed is not None:
+            self._media_changed()
 
     def rewrite_catalog_folder(self, old_folder: str, new_folder: str) -> int:
         return self._catalog.rewrite_save_folder(old_folder, new_folder)
@@ -149,8 +162,15 @@ class SubscriptionMembershipService:
             remote,
             unavailable_video_ids=set(unavailable_video_ids or []),
         )
-        self._apply_file_delta(subscription, delta)
-        if subscription.sync_mode == SubscriptionSyncMode.INCREMENTAL:
+        if is_liked_music_url(subscription.url):
+            self._reconcile_liked_heart_entries(subscription, delta)
+            self._archive_removed_liked_tracks(subscription, delta)
+        else:
+            self._apply_file_delta(subscription, delta)
+        if (
+            subscription.sync_mode == SubscriptionSyncMode.INCREMENTAL
+            and not is_liked_music_url(subscription.url)
+        ):
             if (
                 subscription.offline_cleanup_enabled
                 and int(subscription.offline_cleanup_delay_hours) == 0
@@ -175,6 +195,99 @@ class SubscriptionMembershipService:
                         action=self._id_invalid_cleanup_action(subscription),
                     )
         return delta
+
+    def _reconcile_liked_heart_entries(
+        self,
+        subscription: Subscription,
+        delta: MembershipDelta,
+    ) -> None:
+        """Mirror cloud Liked ID failures into the local-heart recovery queue."""
+        if self._wanted is None:
+            return
+        add_recovery = getattr(self._wanted, "add_from_liked_recovery", None)
+        confirm_like = getattr(self._wanted, "confirm_remote_like", None)
+        if callable(confirm_like):
+            for row in (*delta.added, *delta.restored):
+                confirm_like(row.video_id)
+        if not callable(add_recovery):
+            return
+        folder = subscription.save_folder or subscription.name
+        for row in delta.id_invalid:
+            location = self._catalog.get_location(row.catalog_video_id, folder)
+            source_path = (
+                resolve_under_data(self._data_path, f"{folder}/{location.relative_path}")
+                if location is not None
+                else None
+            )
+            track = self._catalog.get_track(row.catalog_video_id)
+            try:
+                add_recovery(
+                    title=row.title,
+                    artists=row.artist,
+                    album=(track.album if track else "") or "",
+                    source_video_id=row.video_id,
+                    source_path=(
+                        source_path
+                        if source_path is not None and source_path.is_file()
+                        else None
+                    ),
+                    thumbnail_url=getattr(track, "thumbnail_url", None)
+                    if track is not None
+                    else None,
+                )
+            except Exception:
+                logger.exception("Could not retain invalid Liked track %s", row.video_id)
+
+    def _archive_removed_liked_tracks(
+        self,
+        subscription: Subscription,
+        delta: MembershipDelta,
+    ) -> None:
+        """A confirmed YTM unlike removes Heart membership but keeps the file."""
+        folder = subscription.save_folder or subscription.name
+        offline_rows = {row.video_id: row for row in delta.offline}
+        # An earlier archive failure leaves the row OFFLINE. Revisit it on the
+        # next trusted Liked Music refresh instead of losing the retry path.
+        for row in self._membership.list_for_subscription(
+            subscription.id,
+            status=MembershipStatus.OFFLINE,
+        ):
+            offline_rows.setdefault(row.video_id, row)
+        for row in offline_rows.values():
+            # Keep the membership retryable until the file has actually moved.
+            result = self._dispose_catalog_file(
+                catalog_video_id=row.catalog_video_id,
+                save_folder=folder,
+                exclude_subscription_id=subscription.id,
+                action=OfflineCleanupAction.ARCHIVE,
+            )
+            if result.action in {
+                "hardlinked",
+                "moved",
+                "copied",
+                "already_present",
+                "kept",
+            }:
+                self._membership.delete_membership(subscription.id, row.video_id)
+            else:
+                logger.error(
+                    "Could not archive removed Liked track %s: %s",
+                    row.video_id,
+                    result.kept_reason or result.action,
+                )
+        for row in delta.removed:
+            result = self._dispose_catalog_file(
+                catalog_video_id=row.catalog_video_id,
+                save_folder=folder,
+                exclude_subscription_id=subscription.id,
+                action=OfflineCleanupAction.ARCHIVE,
+            )
+            if result.action not in {"hardlinked", "moved", "copied", "already_present"}:
+                logger.error(
+                    "Could not archive removed mirror Liked track %s: %s",
+                    row.video_id,
+                    result.kept_reason or result.action,
+                )
 
     def list_membership(
         self,
@@ -208,14 +321,22 @@ class SubscriptionMembershipService:
                     "to_wanted is only allowed for id_invalid memberships"
                 )
             return self._migrate_membership_to_wanted(subscription, row)
-
-        self._membership.delete_membership(subscription.id, video_id)
-        return self._dispose_catalog_file(
+        parsed_action = OfflineCleanupAction(action)
+        result = self._dispose_catalog_file(
             catalog_video_id=row.catalog_video_id,
             save_folder=subscription.save_folder or subscription.name,
             exclude_subscription_id=subscription.id,
-            action=OfflineCleanupAction(action),
+            action=parsed_action,
         )
+        if parsed_action != OfflineCleanupAction.ARCHIVE or result.action in {
+            "hardlinked",
+            "moved",
+            "copied",
+            "already_present",
+            "kept",
+        }:
+            self._membership.delete_membership(subscription.id, video_id)
+        return result
 
     def _migrate_membership_to_wanted(
         self,
@@ -248,7 +369,6 @@ class SubscriptionMembershipService:
             source_path=abs_path if abs_path is not None and abs_path.is_file() else None,
             thumbnail_url=getattr(track, "thumbnail_url", None) if track else None,
         )
-        self._membership.delete_membership(subscription.id, row.video_id)
         if location is not None:
             refs = self._membership.count_refs_in_folder(
                 row.catalog_video_id,
@@ -265,11 +385,17 @@ class SubscriptionMembershipService:
                         stop_at = resolve_under_data(self._data_path, folder)
                         cleanup_after_audio_removed(abs_path.parent, stop_at)
                     except OSError:
-                        logger.exception(
-                            "Failed removing source after wanted migrate %s",
-                            row.video_id,
+                        # The Wanted copy exists, but preserving membership and
+                        # catalog makes the source cleanup retryable.
+                        logger.exception("Failed removing source after wanted migrate %s", row.video_id)
+                        return FileActionResult(
+                            video_id=row.video_id,
+                            action="failed",
+                            path=str(abs_path),
+                            kept_reason="could not remove original source",
                         )
                 self._catalog.delete_location(folder, location.relative_path)
+        self._membership.delete_membership(subscription.id, row.video_id)
         return FileActionResult(
             video_id=row.video_id,
             action="to_wanted",
@@ -327,6 +453,8 @@ class SubscriptionMembershipService:
                     if abs_path is not None and abs_path.is_file():
                         dest = self._external.ingest_file_to_raw_delete(  # type: ignore[attr-defined]
                             abs_path,
+                            origin_kind="subscription",
+                            origin_ref=str(subscription.id),
                             title=title,
                             artists=artist,
                             album=(track.album if track else "") or "",
@@ -483,8 +611,9 @@ class SubscriptionMembershipService:
         direct_folder: str,
     ) -> list[FileActionResult]:
         """Remove all membership for a subscription and optionally dispose files."""
-        rows = self._membership.delete_for_subscription(subscription.id)
+        rows = self._membership.list_for_subscription(subscription.id)
         if file_action == "keep":
+            self._membership.delete_for_subscription(subscription.id)
             return [
                 FileActionResult(video_id=row.video_id, action="kept") for row in rows
             ]
@@ -493,24 +622,30 @@ class SubscriptionMembershipService:
         folder = subscription.save_folder or subscription.name
         for row in rows:
             if file_action == "move_to_direct":
-                results.append(
-                    self._relocate_catalog_file(
+                result = self._relocate_catalog_file(
                         catalog_video_id=row.catalog_video_id,
                         source_folder=folder,
                         dest_folder=direct_folder,
                         exclude_subscription_id=subscription.id,
                         origin="direct",
                     )
-                )
             elif file_action == "delete":
-                results.append(
-                    self._dispose_catalog_file(
+                result = self._dispose_catalog_file(
                         catalog_video_id=row.catalog_video_id,
                         save_folder=folder,
                         exclude_subscription_id=subscription.id,
                         action=OfflineCleanupAction.DELETE,
                     )
-                )
+            else:
+                raise ValueError(f"unsupported file action: {file_action}")
+            results.append(result)
+            if result.action in {
+                "moved", "hardlinked", "copied", "already_present",
+                "deleted", "missing", "noop", "kept",
+            }:
+                self._membership.delete_membership(subscription.id, row.video_id)
+        if any(result.action == "failed" for result in results):
+            raise RuntimeError("some subscription files could not be processed; retry deletion")
         return results
 
     def migrate_save_folder(
@@ -611,13 +746,21 @@ class SubscriptionMembershipService:
         """Apply a configured cleanup action to one membership row."""
         if action == OfflineCleanupAction.TO_WANTED:
             return self._migrate_membership_to_wanted(subscription, row)
-        self._membership.delete_membership(subscription.id, row.video_id)
-        return self._dispose_catalog_file(
+        result = self._dispose_catalog_file(
             catalog_video_id=row.catalog_video_id,
             save_folder=subscription.save_folder or subscription.name,
             exclude_subscription_id=subscription.id,
             action=action,
         )
+        if action != OfflineCleanupAction.ARCHIVE or result.action in {
+            "hardlinked",
+            "moved",
+            "copied",
+            "already_present",
+            "kept",
+        }:
+            self._membership.delete_membership(subscription.id, row.video_id)
+        return result
 
     def _backfill_local_members(
         self,
@@ -719,19 +862,18 @@ class SubscriptionMembershipService:
             f"{save_folder}/{location.relative_path}",
         )
         if action == OfflineCleanupAction.ARCHIVE:
+            archive_folder = self._archive_folder
+            if self._archive_folder_resolver is not None:
+                archive_folder = self._archive_folder_resolver().strip().replace("\\", "/").rstrip("/")
             archived = self._relocate_catalog_file(
                 catalog_video_id=catalog_video_id,
                 source_folder=save_folder,
-                dest_folder=self._archive_folder,
+                dest_folder=archive_folder,
                 exclude_subscription_id=exclude_subscription_id,
                 origin="direct",
                 keep_source_if_referenced=False,
             )
-            return FileActionResult(
-                video_id=catalog_video_id,
-                action="archived",
-                path=archived.path,
-            )
+            return archived
 
         deleted = False
         if abs_path.is_file():
@@ -740,11 +882,21 @@ class SubscriptionMembershipService:
                 deleted = True
             except OSError as e:
                 logger.warning("Could not delete %s: %s", abs_path, e)
+                # The catalog must continue pointing at a file that still
+                # exists.  Removing the membership is deferred by the caller.
+                return FileActionResult(
+                    video_id=catalog_video_id,
+                    action="failed",
+                    path=location.relative_path,
+                    kept_reason=str(e),
+                )
         lrc = abs_path.with_suffix(".lrc")
         if lrc.is_file():
             lrc.unlink(missing_ok=True)
         self._catalog.delete_location(save_folder, location.relative_path)
         cleanup_after_audio_removed(abs_path.parent, self._data_path)
+        if deleted:
+            self._notify_media_changed()
         return FileActionResult(
             video_id=catalog_video_id,
             action="deleted" if deleted else "missing",
@@ -806,7 +958,14 @@ class SubscriptionMembershipService:
                     action="already_present",
                     path=location.relative_path,
                 )
-        elif src.is_file():
+        elif not src.is_file():
+            return FileActionResult(
+                video_id=catalog_video_id,
+                action="missing",
+                path=location.relative_path,
+                kept_reason="source file missing",
+            )
+        else:
             try:
                 os.link(src, dest)
                 action = "hardlinked"
@@ -865,8 +1024,19 @@ class SubscriptionMembershipService:
                     src_lrc.unlink(missing_ok=True)
             except OSError as e:
                 logger.warning("Could not prune source %s: %s", src, e)
+                # The destination is now valid, but retain the source catalog
+                # row and membership so cleanup can safely retry later.
+                return FileActionResult(
+                    video_id=catalog_video_id,
+                    action="failed",
+                    path=location.relative_path,
+                    kept_reason=str(e),
+                )
             self._catalog.delete_location(source_folder, location.relative_path)
             cleanup_after_audio_removed(src.parent, self._data_path)
+
+        if action in {"hardlinked", "moved", "copied"}:
+            self._notify_media_changed()
 
         return FileActionResult(
             video_id=catalog_video_id,

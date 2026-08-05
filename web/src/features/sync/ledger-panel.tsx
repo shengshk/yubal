@@ -11,7 +11,7 @@ import { WantedCard } from "@/features/sync/wanted-card";
 import { externalPlaylistPriority } from "@/lib/playlist-labels";
 import { isLikedMusicUrl } from "@/lib/subscription-labels";
 import { layout } from "@/lib/ui-styles";
-import { Card, CardBody } from "@heroui/react";
+import { Button, Card, CardBody } from "@heroui/react";
 import { HeartIcon, InboxIcon, LibraryIcon, ThumbsUpIcon } from "lucide-react";
 import { useMemo, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
@@ -23,6 +23,7 @@ type Props = {
   subscriptions: Subscription[];
   jobs: Job[];
   isLoading?: boolean;
+  subscriptionsLoading?: boolean;
   onCancel?: (jobId: string) => void;
   onEdit?: (subscription: Subscription) => void;
   onSync?: (subscriptionId: string) => void;
@@ -36,9 +37,11 @@ type Props = {
   onExpandedKeyChange: (key: string | null) => void;
   externalPlaylists?: ExternalPlaylist[];
   showExternalSection?: boolean;
+  externalLoading?: boolean;
   onEditExternal?: (playlist: ExternalPlaylist) => void;
   onDeleteExternal?: (playlist: ExternalPlaylist) => void;
   onExternalChanged?: () => void;
+  onActivateExternalPending?: (mode: "readonly" | "managed") => void;
   wantedSummary?: WantedSummary | null;
   showWantedSection?: boolean;
 };
@@ -118,10 +121,21 @@ type Row = {
   subscription: Subscription | null;
 };
 
-function Section({ title, children }: { title: string; children: ReactNode }) {
+function Section({
+  title,
+  actions,
+  children,
+}: {
+  title: string;
+  actions?: ReactNode;
+  children: ReactNode;
+}) {
   return (
     <div className={`flex flex-col ${layout.sectionInner}`}>
-      <h2 className={layout.sectionTitle}>{title}</h2>
+      <div className="flex min-h-8 items-center justify-between gap-3">
+        <h2 className={layout.sectionTitle}>{title}</h2>
+        {actions}
+      </div>
       {children}
     </div>
   );
@@ -141,11 +155,11 @@ function SystemPlaylistPlaceholder({
   const path = kind === "wanted" ? "wanted/" : "download/liked";
   return (
     <Card shadow="sm" className="bg-content1 overflow-hidden">
-      <CardBody className="flex flex-row items-center gap-3 p-0">
+      <CardBody className="flex h-20 max-h-20 min-h-20 flex-row items-center gap-3 overflow-hidden p-0">
         <div className="bg-default-100 m-3 flex h-14 w-14 shrink-0 items-center justify-center rounded-md">
           <Icon className="text-foreground-400 h-6 w-6" />
         </div>
-        <div className="min-w-0 flex-1 py-3">
+        <div className="max-h-full min-w-0 flex-1 overflow-hidden py-2">
           <PlaylistTitleTooltip
             kind={kind}
             className="text-foreground block min-w-0 truncate text-sm font-medium"
@@ -169,6 +183,7 @@ export function LedgerPanel({
   subscriptions,
   jobs,
   isLoading,
+  subscriptionsLoading = false,
   onCancel,
   onEdit,
   onSync,
@@ -182,9 +197,11 @@ export function LedgerPanel({
   onExpandedKeyChange,
   externalPlaylists = [],
   showExternalSection = false,
+  externalLoading = false,
   onEditExternal,
   onDeleteExternal,
   onExternalChanged,
+  onActivateExternalPending,
   wantedSummary = null,
   showWantedSection = false,
 }: Props) {
@@ -261,13 +278,17 @@ export function LedgerPanel({
   const visibleExternalPlaylists = useMemo(
     () =>
       externalPlaylists
-        .filter((p) => (p.unmatched_count ?? 0) + (p.matched_count ?? 0) > 0)
         .map((playlist, index) => ({ playlist, index }))
         .sort(
           (a, b) =>
-            externalPlaylistPriority(a.playlist.dir_name) -
-              externalPlaylistPriority(b.playlist.dir_name) ||
-            a.index - b.index,
+            externalPlaylistPriority(
+              a.playlist.dir_name,
+              a.playlist.access_mode,
+            ) -
+              externalPlaylistPriority(
+                b.playlist.dir_name,
+                b.playlist.access_mode,
+              ) || a.index - b.index,
         )
         .map(({ playlist }) => playlist),
     [externalPlaylists],
@@ -308,16 +329,11 @@ export function LedgerPanel({
               tracksOpen={expandedKey === WANTED_EXPAND_KEY}
               onToggleTracks={() => toggleTracks(WANTED_EXPAND_KEY)}
               onCollapseTracks={collapseTracks}
+              likedSubscription={likedRow?.subscription}
+              likedEntry={likedRow?.entry}
+              onSyncLiked={onSync}
             />
-          ) : (
-            <SystemPlaylistPlaceholder
-              kind="wanted"
-              title={t("sync.wantedCardTitle")}
-              status={t("sync.systemPlaylistDisabled")}
-            />
-          )}
-
-          {likedRow?.subscription ? (
+          ) : likedRow?.subscription ? (
             <LedgerCard
               key={likedRow.entry.key}
               entry={likedRow.entry}
@@ -335,16 +351,18 @@ export function LedgerPanel({
             />
           ) : (
             <SystemPlaylistPlaceholder
-              kind="liked"
-              title={t("sync.likedCardTitle")}
-              status={t("sync.systemPlaylistNotConfigured")}
+              kind="wanted"
+              title={t("sync.favoriteCardTitle")}
+              status={t("sync.systemPlaylistDisabled")}
             />
           )}
         </div>
       </Section>
 
       <Section title={t("sync.sectionSubscriptions")}>
-        {subscriptionRows.length === 0 ? (
+        {subscriptionsLoading ? (
+          <Card shadow="sm" className="bg-content1 h-20 animate-pulse" />
+        ) : subscriptionRows.length === 0 ? (
           <EmptyState icon={InboxIcon} title={t("sync.emptySubscriptions")} />
         ) : (
           <div className={`flex flex-col ${layout.sectionInner}`}>
@@ -370,8 +388,42 @@ export function LedgerPanel({
       </Section>
 
       {showExternalSection ? (
-        <Section title={t("sync.sectionExternal")}>
-          {visibleExternalPlaylists.length === 0 ? (
+        <Section
+          title={t("sync.sectionExternal")}
+          actions={
+            externalPlaylists.some((p) => p.access_mode === "pending") ? (
+              <div className="flex shrink-0 items-center gap-2">
+                <Button
+                  size="sm"
+                  variant="flat"
+                  className="bg-default-100 text-foreground w-36 justify-center"
+                  onPress={() => onActivateExternalPending?.("readonly")}
+                >
+                  {t("sync.externalActivateReadonly")}
+                </Button>
+                <Button
+                  size="sm"
+                  variant="flat"
+                  className="bg-default-100 text-foreground w-36 justify-center"
+                  onPress={() => onActivateExternalPending?.("managed")}
+                >
+                  {t("sync.externalActivateManaged")}
+                </Button>
+              </div>
+            ) : undefined
+          }
+        >
+          {externalLoading ? (
+            <div className={`flex flex-col ${layout.sectionInner}`}>
+              {[0, 1].map((key) => (
+                <Card
+                  key={key}
+                  shadow="sm"
+                  className="bg-content1 h-20 animate-pulse"
+                />
+              ))}
+            </div>
+          ) : visibleExternalPlaylists.length === 0 ? (
             <EmptyState icon={LibraryIcon} title={t("sync.emptyExternal")} />
           ) : (
             <div className={`flex flex-col ${layout.sectionInner}`}>

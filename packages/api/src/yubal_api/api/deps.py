@@ -18,6 +18,7 @@ from fastapi import Depends
 
 from yubal_api.api.container import Services, get_services
 from yubal_api.services.external_library_service import ExternalLibraryService
+from yubal_api.services.factory_reset_service import FactoryResetService
 from yubal_api.services.job_event_bus import JobEventBus
 from yubal_api.services.job_executor import JobExecutor
 from yubal_api.services.job_store import JobStore
@@ -210,6 +211,15 @@ def _get_library_stats_service(services: ServicesDep) -> LibraryStatsService:
 
 LibraryStatsServiceDep = Annotated[
     LibraryStatsService, Depends(_get_library_stats_service)
+]
+
+
+def _get_factory_reset_service(services: ServicesDep) -> FactoryResetService:
+    return services.factory_reset
+
+
+FactoryResetServiceDep = Annotated[
+    FactoryResetService, Depends(_get_factory_reset_service)
 ]
 
 

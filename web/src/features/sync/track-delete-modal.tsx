@@ -135,7 +135,7 @@ export function TrackDeleteModal({
                     </span>
                   </span>
                 </Button>
-                {(isSub || isDirect) && (
+                {isSub && (
                   <Button
                     variant={mode === "block" ? "solid" : "flat"}
                     color={mode === "block" ? "danger" : "default"}
@@ -147,9 +147,7 @@ export function TrackDeleteModal({
                         {t("sync.deleteTrackBlock")}
                       </span>
                       <span className="text-foreground-400 text-xs">
-                        {isDirect
-                          ? t("sync.deleteTrackBlockHintDirect")
-                          : t("sync.deleteTrackBlockHint")}
+                        {t("sync.deleteTrackBlockHint")}
                       </span>
                     </span>
                   </Button>
@@ -167,47 +165,6 @@ export function TrackDeleteModal({
                       </span>
                       <span className="text-foreground-400 text-xs">
                         {t("sync.deleteTrackWipeListHint")}
-                      </span>
-                    </span>
-                  </Button>
-                )}
-                {isDirect && externalEnabled && (
-                  <Button
-                    variant={mode === "migrate_to_external" ? "solid" : "flat"}
-                    color={
-                      mode === "migrate_to_external" ? "primary" : "default"
-                    }
-                    className="justify-start h-auto py-3 whitespace-normal"
-                    onPress={() => setMode("migrate_to_external")}
-                  >
-                    <span className="text-left">
-                      <span className="block font-medium">
-                        {t("sync.migrateToExternal")}
-                      </span>
-                      <span className="text-foreground-400 text-xs">
-                        {t("sync.migrateToExternalHint")}
-                      </span>
-                    </span>
-                  </Button>
-                )}
-                {(isDirect || isSub) &&
-                  wantedEnabled &&
-                  offline &&
-                  allowMigrateToWanted && (
-                  <Button
-                    variant={mode === "migrate_to_wanted" ? "solid" : "flat"}
-                    color={
-                      mode === "migrate_to_wanted" ? "primary" : "default"
-                    }
-                    className="justify-start h-auto py-3 whitespace-normal"
-                    onPress={() => setMode("migrate_to_wanted")}
-                  >
-                    <span className="text-left">
-                      <span className="block font-medium">
-                        {t("sync.migrateToWanted")}
-                      </span>
-                      <span className="text-foreground-400 text-xs">
-                        {t("sync.migrateToWantedHint")}
                       </span>
                     </span>
                   </Button>
@@ -237,22 +194,106 @@ export function TrackDeleteModal({
                     </span>
                   </Button>
                 )}
-                {isExternalMatched && (
-                  <Button
-                    variant={mode === "add_to_direct" ? "solid" : "flat"}
-                    color={mode === "add_to_direct" ? "primary" : "default"}
-                    className="justify-start h-auto py-3 whitespace-normal"
-                    onPress={() => setMode("add_to_direct")}
-                  >
-                    <span className="text-left">
-                      <span className="block font-medium">
-                        {t("sync.addToDirect")}
-                      </span>
-                      <span className="text-foreground-400 text-xs">
-                        {t("sync.addToDirectHint")}
-                      </span>
-                    </span>
-                  </Button>
+                {(isDirect ||
+                  isExternalMatched ||
+                  ((isDirect || isSub) &&
+                    wantedEnabled &&
+                    offline &&
+                    allowMigrateToWanted)) && (
+                  <details className="border-default-200 rounded-lg border">
+                    <summary className="hover:bg-default-100 cursor-pointer rounded-lg px-3 py-2.5 text-sm font-medium">
+                      {t("sync.moreProcessing")}
+                    </summary>
+                    <div className="flex flex-col gap-2 p-2">
+                      {isDirect && (
+                        <Button
+                          variant={mode === "block" ? "solid" : "flat"}
+                          color={mode === "block" ? "danger" : "default"}
+                          className="h-auto justify-start py-3 whitespace-normal"
+                          onPress={() => setMode("block")}
+                        >
+                          <span className="text-left">
+                            <span className="block font-medium">
+                              {t("sync.deleteTrackBlock")}
+                            </span>
+                            <span className="text-foreground-400 text-xs">
+                              {t("sync.deleteTrackBlockHintDirect")}
+                            </span>
+                          </span>
+                        </Button>
+                      )}
+                      {isDirect && externalEnabled && (
+                        <Button
+                          variant={
+                            mode === "migrate_to_external" ? "solid" : "flat"
+                          }
+                          color={
+                            mode === "migrate_to_external"
+                              ? "primary"
+                              : "default"
+                          }
+                          className="h-auto justify-start py-3 whitespace-normal"
+                          onPress={() => setMode("migrate_to_external")}
+                        >
+                          <span className="text-left">
+                            <span className="block font-medium">
+                              {t("sync.migrateToExternal")}
+                            </span>
+                            <span className="text-foreground-400 text-xs">
+                              {t("sync.migrateToExternalHint")}
+                            </span>
+                          </span>
+                        </Button>
+                      )}
+                      {(isDirect || isSub) &&
+                        wantedEnabled &&
+                        offline &&
+                        allowMigrateToWanted && (
+                          <Button
+                            variant={
+                              mode === "migrate_to_wanted" ? "solid" : "flat"
+                            }
+                            color={
+                              mode === "migrate_to_wanted"
+                                ? "primary"
+                                : "default"
+                            }
+                            className="h-auto justify-start py-3 whitespace-normal"
+                            onPress={() => setMode("migrate_to_wanted")}
+                          >
+                            <span className="text-left">
+                              <span className="block font-medium">
+                                {t("sync.migrateToWanted")}
+                              </span>
+                              <span className="text-foreground-400 text-xs">
+                                {t("sync.migrateToWantedHint")}
+                              </span>
+                            </span>
+                          </Button>
+                        )}
+                      {isExternalMatched && (
+                        <Button
+                          variant={
+                            mode === "add_to_direct" ? "solid" : "flat"
+                          }
+                          color={
+                            mode === "add_to_direct" ? "primary" : "default"
+                          }
+                          className="h-auto justify-start py-3 whitespace-normal"
+                          onPress={() => setMode("add_to_direct")}
+                        >
+                          <span className="text-left">
+                            <span className="block font-medium">
+                              {t("sync.addToDirect")}
+                            </span>
+                            <span className="text-foreground-400 text-xs">
+                              {t("sync.addToDirectHint")}
+                            </span>
+                          </span>
+                        </Button>
+                      )}
+                    </div>
+                  </details>
                 )}
               </div>
             </>

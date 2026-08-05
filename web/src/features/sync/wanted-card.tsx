@@ -1,6 +1,12 @@
-import { albumCoverUrl, trackCoverUrl, wantedCoverUrl } from "@/api/library";
+import {
+  albumCoverUrl,
+  playlistCoverUrl,
+  trackCoverUrl,
+  wantedCoverUrl,
+} from "@/api/library";
 import { getSettings } from "@/api/settings";
-import type { SyncTrackItem } from "@/api/sync-ledger";
+import type { SyncLedgerEntry, SyncTrackItem } from "@/api/sync-ledger";
+import type { Subscription } from "@/api/subscriptions";
 import {
   deleteWantedPlaylist,
   deleteWantedTrack,
@@ -15,11 +21,16 @@ import { AudioSpectrum } from "@/features/sync/audio-spectrum";
 import { PlaybackTransport } from "@/features/sync/ledger-card";
 import { LedgerTrackList } from "@/features/sync/ledger-track-list";
 import { useLibraryAudio } from "@/features/sync/library-audio";
-import { PlaylistStatsLine } from "@/features/sync/playlist-stats-line";
 import { PlaylistTitleTooltip } from "@/features/sync/playlist-title-tooltip";
+import {
+  ownershipCounts,
+  UnifiedPlaylistStats,
+} from "@/features/sync/unified-playlist-stats";
 import {
   SYNC_ACTION_BTN,
   SYNC_CARD_ACTIONS,
+  SYNC_CARD_CONTENT,
+  SYNC_CARD_HEADER,
 } from "@/features/sync/track-columns";
 import { formatArtistTitle } from "@/features/sync/track-label";
 import { WantedEditModal } from "@/features/sync/wanted-edit-modal";
@@ -36,6 +47,7 @@ import {
   ModalHeader,
 } from "@heroui/react";
 import {
+  ExternalLinkIcon,
   HeartIcon,
   PauseIcon,
   PencilIcon,
@@ -51,6 +63,9 @@ type Props = {
   tracksOpen: boolean;
   onToggleTracks: () => void;
   onCollapseTracks: () => void;
+  likedSubscription?: Subscription | null;
+  likedEntry?: SyncLedgerEntry | null;
+  onSyncLiked?: (subscriptionId: string) => void;
 };
 
 const ACTION_BTN = SYNC_ACTION_BTN;
@@ -71,6 +86,9 @@ export function WantedCard({
   tracksOpen,
   onToggleTracks,
   onCollapseTracks,
+  likedSubscription = null,
+  likedEntry = null,
+  onSyncLiked,
 }: Props) {
   const { t } = useTranslation();
   const audio = useLibraryAudio();
@@ -129,9 +147,13 @@ export function WantedCard({
       push(trackCoverUrl(playingTrackKey));
       push(albumCoverUrl(playingTrackKey));
     }
+    if (likedSubscription) {
+      push(playlistCoverUrl(likedSubscription.save_folder));
+      push(likedSubscription.thumbnail_url);
+    }
     push(wantedCoverUrl(hasMatched));
     return list;
-  }, [playingTrackKey, hasMatched]);
+  }, [playingTrackKey, likedSubscription, hasMatched]);
 
   const coverKey = coverCandidates.join("|");
   useEffect(() => {
@@ -139,44 +161,99 @@ export function WantedCard({
   }, [coverKey]);
   const coverSrc = coverCandidates[coverIdx];
 
-  const statsItems = [
-    { label: t("sync.statWanted"), value: summary.total_count },
-    { label: t("sync.statLocal"), value: summary.matched_file_count },
-  ];
+  const likedCloud = likedEntry?.total_count ?? 0;
+  const likedLocal = likedEntry?.synced_count ?? 0;
+  const likedMissing = likedEntry?.missing_count ?? 0;
+  const likedBlocked = likedEntry?.blocked_count ?? 0;
+  const likedOffline = likedEntry?.offline_count ?? 0;
+  const likedInvalid = likedEntry?.id_invalid_count ?? 0;
+  const likedFailed = likedEntry?.failed_count ?? 0;
+  const recoveryCount = Math.max(summary.recovery_count, likedInvalid);
+  const likedOwnership = ownershipCounts(
+    likedLocal,
+    likedEntry?.hardlink_count ?? 0,
+    false,
+  );
+  const statsCounts = {
+    total: likedCloud + summary.total_count,
+    cloud: likedCloud,
+    local: likedLocal + summary.matched_file_count,
+    pending: likedMissing + summary.local_heart_count,
+    abnormal:
+      likedBlocked + likedOffline + recoveryCount + likedFailed,
+    exclusive: likedOwnership.exclusive + summary.exclusive_count,
+    shared: likedOwnership.shared + summary.shared_count,
+    hardlink: likedOwnership.hardlink + summary.hardlink_count,
+    pendingDetails: [
+      { label: t("sync.statMissing"), value: likedMissing },
+      {
+        label: t("sync.statLocalHeart"),
+        value: summary.local_heart_count,
+      },
+    ],
+    abnormalDetails: [
+      { label: t("sync.statBlocked"), value: likedBlocked },
+      {
+        label: t("sync.statNotInCloudPlaylist"),
+        value: likedOffline,
+      },
+      { label: t("sync.statIdInvalid"), value: recoveryCount },
+      { label: t("sync.resultFailed"), value: likedFailed },
+    ],
+  };
 
+  const usesLikedStatus = Boolean(likedSubscription && likedEntry);
   let scheduleStatus: string;
   if (syncing) {
-    scheduleStatus = t("sync.wantedStatusMatching");
+    scheduleStatus = t("sync.statusSyncing");
   } else if (!schedulerEnabled) {
     scheduleStatus = t("sync.statusGlobalStopped");
-  } else if (!summary.enabled || !summary.auto_match_enabled) {
+  } else if (usesLikedStatus && likedSubscription?.enabled === false) {
+    scheduleStatus = t("sync.statusStopped");
+  } else if (
+    !usesLikedStatus &&
+    (!summary.enabled || !summary.auto_match_enabled)
+  ) {
     scheduleStatus = t("sync.wantedStatusStopped");
   } else {
-    scheduleStatus = t("sync.wantedStatusWaiting");
+    scheduleStatus = t("sync.statusWaiting");
   }
 
+  const lastStatus = usesLikedStatus
+    ? likedEntry?.last_job_status
+    : summary.last_job_status;
+  const lastAt = usesLikedStatus
+    ? likedEntry?.last_synced_at
+    : summary.last_matched_at;
   let resultLabel = t("sync.resultUnknown");
-  if (summary.last_job_status === "completed") {
+  if (lastStatus === "completed") {
     resultLabel = t("sync.resultSuccess");
-  } else if (summary.last_job_status === "failed") {
+  } else if (lastStatus === "failed") {
     resultLabel = t("sync.resultFailed");
+  } else if (lastStatus === "interrupted") {
+    resultLabel = t("sync.resultInterrupted");
   }
 
-  const timeLabel = summary.last_matched_at
-    ? formatDateTime(summary.last_matched_at)
-    : t("time.never");
-  const neverRun = !summary.last_matched_at && !summary.last_job_status;
-  const historyLine = neverRun
-    ? t("sync.wantedNeverMatched")
-    : t("sync.wantedHistoryMatch", {
-        time: timeLabel,
-        result: resultLabel,
-      });
+  const timeLabel = lastAt ? formatDateTime(lastAt) : t("time.never");
+  const neverRun = !lastAt && !lastStatus;
+  const historyLine = usesLikedStatus
+    ? neverRun
+      ? t("sync.neverSynced")
+      : t("sync.historySync", {
+          time: timeLabel,
+          result: resultLabel,
+        })
+    : neverRun
+      ? t("sync.wantedNeverMatched")
+      : t("sync.wantedHistoryMatch", {
+          time: timeLabel,
+          result: resultLabel,
+        });
   const historyDisplay = `${scheduleStatus} · ${historyLine}`;
 
-  const title = t("sync.wantedCardTitle");
+  const title = t("sync.favoriteCardTitle");
   const headline = isPlayingHere ? audio.nowPlayingLabel || title : title;
-  const statsLine = <PlaylistStatsLine items={statsItems} />;
+  const statsLine = <UnifiedPlaylistStats counts={statsCounts} />;
   const subline = isPlayingHere ? (
     <>
       <span className="text-foreground">{title}</span>
@@ -204,21 +281,22 @@ export function WantedCard({
   };
 
   /** Same pass as the scheduler: local hardlink + YTM fulfill. */
-  const handleSync = async () => {
-    if (syncing) return;
+  const handleSync = async (): Promise<boolean> => {
+    if (syncing) return false;
     setSyncing(true);
     const result = await syncWanted();
     setSyncing(false);
     if ("error" in result) {
       showErrorToast(t("sync.syncWanted"), result.error);
       refresh();
-      return;
+      return false;
     }
     showSuccessToast(
       t("sync.syncWanted"),
       t("sync.syncWantedDone", { linked: result.linked }),
     );
     refresh();
+    return true;
   };
 
   const handleRowMatch = async (track: SyncTrackItem) => {
@@ -337,7 +415,7 @@ export function WantedCard({
   return (
     <div ref={rootRef}>
       <Card shadow="sm" className="bg-content1 overflow-hidden">
-        <CardBody className="relative flex flex-row items-center gap-3 overflow-hidden p-0">
+        <CardBody className={SYNC_CARD_HEADER}>
           {isPlayingHere ? <AudioSpectrum /> : null}
           {isPlayingHere ? (
             <div
@@ -412,16 +490,17 @@ export function WantedCard({
 
           <button
             type="button"
-            className="relative z-10 flex min-w-0 flex-1 cursor-pointer items-center gap-3 py-3 pr-0 text-left outline-none"
+            className={`${SYNC_CARD_CONTENT} cursor-pointer`}
             onClick={onToggleTracks}
             aria-expanded={tracksOpen}
             aria-label={t("sync.toggleTrackList")}
           >
-            <div className="min-w-0 flex-1">
+            <div className="max-h-full min-w-0 flex-1 overflow-hidden">
               <div className="flex min-w-0 flex-nowrap items-center gap-2">
                 <PlaylistTitleTooltip
-                  kind="wanted"
-                  className="text-foreground min-w-0 truncate text-sm font-medium"
+                  kind="favorite"
+                  saveFolder={likedSubscription?.save_folder}
+                  className="text-foreground block w-full min-w-0 truncate text-sm font-medium"
                 >
                   {headline}
                 </PlaylistTitleTooltip>
@@ -437,6 +516,22 @@ export function WantedCard({
                 folder={WANTED_FOLDER}
                 isPlayingHere={isPlayingHere}
               />
+            ) : null}
+            {likedSubscription ? (
+              <Button
+                as="a"
+                href={likedSubscription.url}
+                target="_blank"
+                rel="noopener noreferrer"
+                variant="light"
+                size="sm"
+                isIconOnly
+                className={`${ACTION_BTN} hover:text-primary`}
+                aria-label={t("sync.openInYtm")}
+                title={t("sync.openInYtm")}
+              >
+                <ExternalLinkIcon className="h-4 w-4" />
+              </Button>
             ) : null}
             <Button
               variant="light"
@@ -460,7 +555,15 @@ export function WantedCard({
               aria-label={t("sync.syncWanted")}
               title={t("sync.syncWanted")}
               onPress={() => {
-                void handleSync();
+                void (async () => {
+                  // A local heart must first be submitted to YTM.  Starting
+                  // Liked Music in parallel can snapshot the remote list too
+                  // early and delay the card update until a later cycle.
+                  const completed = await handleSync();
+                  if (completed && likedSubscription) {
+                    onSyncLiked?.(likedSubscription.id);
+                  }
+                })();
               }}
             >
               {!syncing ? <RefreshCwIcon className="h-4 w-4" /> : null}
@@ -483,16 +586,28 @@ export function WantedCard({
           </div>
         </CardBody>
 
-        <LedgerTrackList
-          saveFolder={WANTED_FOLDER}
-          open={tracksOpen}
-          mode="wanted"
-          wantedBusyId={rowBusyId}
-          onWantedDelete={openTrackDelete}
-          onWantedMatch={(track) => {
-            void handleRowMatch(track);
-          }}
-        />
+        {tracksOpen && likedSubscription ? (
+          <LedgerTrackList
+            saveFolder={likedSubscription.save_folder}
+            open
+            subscriptionId={likedSubscription.id}
+            likedSubscriptionId={likedSubscription.id}
+          />
+        ) : null}
+
+        {tracksOpen ? (
+          <LedgerTrackList
+            saveFolder={WANTED_FOLDER}
+            open
+            mode="wanted"
+            withTopBorder={false}
+            wantedBusyId={rowBusyId}
+            onWantedDelete={openTrackDelete}
+            onWantedMatch={(track) => {
+              void handleRowMatch(track);
+            }}
+          />
+        ) : null}
       </Card>
 
       <WantedEditModal

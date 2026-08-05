@@ -16,6 +16,17 @@ META_PENDING = "pending"
 META_VERIFIED = "verified"
 META_REJECTED = "rejected"
 
+EXTERNAL_ACCESS_PENDING = "pending"
+EXTERNAL_ACCESS_READONLY = "readonly"
+EXTERNAL_ACCESS_MANAGED = "managed"
+EXTERNAL_ACCESS_MODES = frozenset(
+    {
+        EXTERNAL_ACCESS_PENDING,
+        EXTERNAL_ACCESS_READONLY,
+        EXTERNAL_ACCESS_MANAGED,
+    }
+)
+
 
 class ExternalPlaylist(SQLModel, table=True):
     """One top-level directory under External/Raw (a user's existing playlist)."""
@@ -32,6 +43,18 @@ class ExternalPlaylist(SQLModel, table=True):
     )
     # False = read-only mount: no tag edits; missing critical tags skip match.
     allow_mutate: bool = Field(default=False)
+    # New folders are shown immediately but must be deliberately classified
+    # before any expensive scan/match pass starts.
+    access_mode: str = Field(default=EXTERNAL_ACCESS_PENDING, max_length=16)
+    # Access mode remains switchable until Yubal first changes original source
+    # content. Hardlinks and newly created sidecars do not count as mutations.
+    source_mutated_at: datetime | None = Field(default=None)
+    source_mutation_kind: str | None = Field(default=None, max_length=32)
+    # Lightweight filename-only inventory for pending folders.  This lets the
+    # UI show honest counts and a representative cover before tag scanning.
+    discovered_audio_count: int | None = Field(default=None)
+    discovered_cover_rel: str | None = Field(default=None, max_length=1200)
+    inventory_scanned_at: datetime | None = Field(default=None)
     show_raw: bool = Field(default=True)
     # Junk is a subset of unmatched; only meaningful when show_raw is True.
     show_junk: bool = Field(default=True)
@@ -50,6 +73,22 @@ class ExternalPlaylist(SQLModel, table=True):
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
+class ExternalFileInventory(SQLModel, table=True):
+    """Cheap filesystem inventory, deliberately separate from parsed tags."""
+
+    __tablename__ = "external_file_inventory"
+
+    rel_path: str = Field(primary_key=True, max_length=1200)
+    dir_name: str = Field(index=True, max_length=255)
+    mtime_ns: int = Field(default=0)
+    size: int = Field(default=0)
+    inode: int | None = Field(default=None)
+    # False means the path is known, but its audio tags still need indexing.
+    metadata_indexed: bool = Field(default=False, index=True)
+    first_seen_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    changed_at: datetime = Field(default_factory=lambda: datetime.now(UTC), index=True)
+
+
 class ExternalRawTrack(SQLModel, table=True):
     """One indexed audio file under External/Raw (path relative to Raw/)."""
 
@@ -57,6 +96,11 @@ class ExternalRawTrack(SQLModel, table=True):
 
     rel_path: str = Field(primary_key=True, max_length=1200)
     dir_name: str = Field(index=True, max_length=255)
+    # Immutable provenance.  A raw file may later be moved to Raw/Delete, but
+    # its permission must still be decided by this original source instead of
+    # by the system archive folder it currently lives in.
+    origin_kind: str = Field(default="", max_length=32)
+    origin_ref: str = Field(default="", max_length=128)
 
     mtime_ns: int = Field(default=0)
     size: int = Field(default=0)
@@ -89,6 +133,9 @@ class ExternalRawTrack(SQLModel, table=True):
     video_id: str | None = Field(default=None, max_length=32, index=True)
     match_status: str = Field(default=MATCH_UNMATCHED, max_length=16, index=True)
     match_confidence: float | None = Field(default=None)
+    # Null means this exact file/tag state has never completed a real YTM
+    # decision. Transport failures deliberately leave it null for later retry.
+    ytm_attempted_at: datetime | None = Field(default=None, index=True)
 
     match_fail_count: int = Field(default=0)
     scrape_fail_count: int = Field(default=0)
@@ -108,6 +155,8 @@ class ExternalRawTrack(SQLModel, table=True):
     # Fingerprint of local title|artists|album at verify time; tag edits invalidate.
     meta_fingerprint: str | None = Field(default=None, max_length=600)
     meta_verified_at: datetime | None = Field(default=None)
+    # Same contract as ytm_attempted_at for the metadata-verification lane.
+    meta_attempted_at: datetime | None = Field(default=None, index=True)
     meta_fail_count: int = Field(default=0)
     meta_next_eligible_at: datetime | None = Field(default=None)
 

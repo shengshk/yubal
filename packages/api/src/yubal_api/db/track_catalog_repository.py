@@ -5,10 +5,16 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import Path
 
-from sqlalchemy import Engine, or_
+from sqlalchemy import Engine, exists, func, or_
+from sqlalchemy.orm import aliased
 from sqlmodel import Session, col, select
-
-from yubal.utils.library import STORAGE_DOWNLOAD, STORAGE_ROOTS
+from yubal.utils.library import (
+    EXTERNAL_ROOT,
+    STORAGE_DOWNLOAD,
+    STORAGE_EXTERNAL,
+    STORAGE_ROOTS,
+    resolve_under_data,
+)
 
 from yubal_api.db.track_catalog import (
     LocationMembershipStatus,
@@ -41,9 +47,7 @@ class TrackCatalogRepository:
         with Session(self._engine) as session:
             return session.get(TrackRecord, video_id)
 
-    def list_locations_for_video(
-        self, video_id: str
-    ) -> list[TrackLocation]:
+    def list_locations_for_video(self, video_id: str) -> list[TrackLocation]:
         with Session(self._engine) as session:
             stmt = (
                 select(TrackLocation)
@@ -61,9 +65,7 @@ class TrackCatalogRepository:
         if not needle or limit <= 0:
             return []
         # Escape LIKE wildcards so user input is literal.
-        escaped = (
-            needle.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        )
+        escaped = needle.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         pattern = f"%{escaped}%"
         with Session(self._engine) as session:
             stmt = (
@@ -282,9 +284,7 @@ class TrackCatalogRepository:
             session.refresh(row)
             return row
 
-    def set_canonical(
-        self, video_id: str, *, storage: str, relative_path: str
-    ) -> None:
+    def set_canonical(self, video_id: str, *, storage: str, relative_path: str) -> None:
         """Record the single physical file other locations hardlink from."""
         rel = relative_path.strip().replace("\\", "/")
         with Session(self._engine) as session:
@@ -340,9 +340,7 @@ class TrackCatalogRepository:
             # Different origin already claimed — first wins.
             return False
 
-    def set_immutable_for_origin(
-        self, playlist_uid: str, *, immutable: bool
-    ) -> int:
+    def set_immutable_for_origin(self, playlist_uid: str, *, immutable: bool) -> int:
         """Flip immutable for every track stamped with this origin hukou."""
         changed = 0
         with Session(self._engine) as session:
@@ -439,6 +437,33 @@ class TrackCatalogRepository:
                 grouped.setdefault(loc.video_id, []).append((loc, rec))
             return grouped
 
+    def list_enrichment_candidates(
+        self,
+        *,
+        save_folder: str | None = None,
+        limit: int | None = None,
+    ) -> dict[str, list[tuple[TrackLocation, TrackRecord]]]:
+        """Return an oldest-first bounded catalog slice for asset enrichment."""
+        folder = (save_folder or "").strip().replace("\\", "/").rstrip("/")
+        with Session(self._engine) as session:
+            stmt = select(TrackLocation, TrackRecord).join(
+                TrackRecord,
+                col(TrackLocation.video_id) == col(TrackRecord.video_id),
+            )
+            if folder:
+                stmt = stmt.where(TrackLocation.save_folder == folder)
+            stmt = stmt.order_by(
+                col(TrackRecord.last_enriched_at).is_(None).desc(),
+                col(TrackRecord.last_enriched_at),
+                col(TrackLocation.video_id),
+            )
+            if limit is not None:
+                stmt = stmt.limit(max(1, int(limit)))
+            grouped: dict[str, list[tuple[TrackLocation, TrackRecord]]] = {}
+            for loc, rec in session.exec(stmt).all():
+                grouped.setdefault(loc.video_id, []).append((loc, rec))
+            return grouped
+
     def list_for_save_folder(
         self, save_folder: str, *, order_by_recent: bool = False
     ) -> list[tuple[TrackLocation, TrackRecord]]:
@@ -459,6 +484,71 @@ class TrackCatalogRepository:
                 .order_by(order)
             )
             return list(session.exec(stmt).all())
+
+    def folder_snapshot(
+        self,
+        save_folder: str,
+    ) -> tuple[int, int, int, int, str | None]:
+        """Return DB-only card counts without touching media files.
+
+        ``(total, active, offline, shared, representative_path)``. Shared is
+        inferred from another catalog folder carrying the same video ID; actual
+        inode consistency is repaired by write-time operations / manual audit.
+        """
+        folder = save_folder.strip().replace("\\", "/").rstrip("/")
+        outer = aliased(TrackLocation)
+        other = aliased(TrackLocation)
+        with Session(self._engine) as session:
+            total = int(
+                session.exec(
+                    select(func.count())
+                    .select_from(outer)
+                    .where(outer.save_folder == folder)
+                ).one()
+            )
+            offline = int(
+                session.exec(
+                    select(func.count())
+                    .select_from(outer)
+                    .where(
+                        outer.save_folder == folder,
+                        outer.membership_status == LocationMembershipStatus.OFFLINE,
+                    )
+                ).one()
+            )
+            shared = int(
+                session.exec(
+                    select(func.count(func.distinct(outer.video_id)))
+                    .select_from(outer)
+                    .where(
+                        outer.save_folder == folder,
+                        outer.membership_status != LocationMembershipStatus.OFFLINE,
+                        exists(
+                            select(other.id).where(
+                                other.video_id == outer.video_id,
+                                other.save_folder != folder,
+                            )
+                        ),
+                    )
+                ).one()
+            )
+            representative = session.exec(
+                select(TrackLocation.relative_path)
+                .join(
+                    TrackRecord,
+                    col(TrackLocation.video_id) == col(TrackRecord.video_id),
+                )
+                .where(
+                    TrackLocation.save_folder == folder,
+                    TrackLocation.membership_status != LocationMembershipStatus.OFFLINE,
+                )
+                .order_by(
+                    col(TrackRecord.has_embedded_cover).desc(),
+                    col(TrackLocation.updated_at).desc(),
+                )
+                .limit(1)
+            ).first()
+        return total, max(0, total - offline), offline, shared, representative
 
     def get_location(
         self,
@@ -499,7 +589,16 @@ class TrackCatalogRepository:
                 relative = str(
                     Path(location.save_folder) / Path(location.relative_path)
                 ).replace("\\", "/")
-                if (data_root / relative).is_file():
+                root = (
+                    EXTERNAL_ROOT
+                    if location.storage_root == STORAGE_EXTERNAL
+                    else data_root
+                )
+                try:
+                    path = resolve_under_data(root, relative)
+                except ValueError:
+                    continue
+                if path.is_file():
                     resolved[location.video_id] = relative
         return resolved
 
@@ -724,9 +823,11 @@ class TrackCatalogRepository:
         if parts[: len(folder_parts)] != folder_parts:
             # Path not under this save folder
             return
-        relative_path = str(Path(*parts[len(folder_parts) :])) if len(parts) > len(
-            folder_parts
-        ) else absolute_path.name
+        relative_path = (
+            str(Path(*parts[len(folder_parts) :]))
+            if len(parts) > len(folder_parts)
+            else absolute_path.name
+        )
 
         lrc = absolute_path.with_suffix(".lrc")
         lyrics_text: str | None = None

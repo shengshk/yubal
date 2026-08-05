@@ -20,6 +20,7 @@ from yubal.utils.library import (
     TRACK_INDEX_DIR,
     UNMATCHED_FOLDER,
     UNOFFICIAL_FOLDER,
+    track_index_path,
 )
 
 logger = logging.getLogger(__name__)
@@ -237,7 +238,9 @@ def migrate_per_folder_to_unified(data_path: Path) -> MigrationResult:
     )
     data_path = data_path.resolve()
 
-    top_dirs = [p for p in data_path.iterdir() if p.is_dir()] if data_path.is_dir() else []
+    top_dirs = (
+        [p for p in data_path.iterdir() if p.is_dir()] if data_path.is_dir() else []
+    )
 
     for folder in top_dirs:
         name = folder.name
@@ -324,7 +327,11 @@ def migrate_unified_to_per_folder(
                 # Already under a save folder — use path relative to that folder's parent artist tree
                 try:
                     # Prefer artist/album/file from filename structure under save folder
-                    rel = Path(*current.parts[-3:]) if len(current.parts) >= 3 else Path(current.name)
+                    rel = (
+                        Path(*current.parts[-3:])
+                        if len(current.parts) >= 3
+                        else Path(current.name)
+                    )
                 except Exception:
                     rel = Path(current.name)
 
@@ -437,7 +444,7 @@ def _rebuild_track_index(data_path: Path) -> None:
         if match:
             mapping[match.group(1)] = rel
 
-    path = data_path / TRACK_INDEX_DIR / "track_index.json"
+    path = track_index_path(data_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
     tmp.write_text(

@@ -4,11 +4,14 @@ import hashlib
 import logging
 from collections import OrderedDict
 from collections.abc import Mapping
+from json import JSONDecodeError
 from pathlib import Path
 from typing import Any, Protocol, cast
 
+from requests.exceptions import RequestException
 from ytmusicapi import YTMusic
 from ytmusicapi.auth.types import AuthType
+from ytmusicapi.models.content.enums import LikeStatus
 from ytmusicapi.exceptions import YTMusicError, YTMusicServerError, YTMusicUserError
 
 from yubal.config import APIConfig
@@ -69,6 +72,10 @@ class YTMusicProtocol(Protocol):
 
     def get_lyrics(self, browse_id: str) -> Mapping[str, Any] | None:
         """Fetch lyrics payload by browseId (timestamps when available)."""
+        ...
+
+    def rate_song(self, video_id: str, *, liked: bool) -> None:
+        """Set the authenticated account's thumbs-up state for one video."""
         ...
 
 
@@ -292,6 +299,27 @@ class YTMusicClient:
         )
         return Playlist.model_validate(data)
 
+    def rate_song(self, video_id: str, *, liked: bool) -> None:
+        """Like or un-like one YTM video using the authenticated account."""
+        video_id = (video_id or "").strip()
+        if not video_id or len(video_id) > 32:
+            raise ValueError("video_id is invalid")
+        if not self._is_authenticated():
+            raise AuthenticationRequiredError(
+                "Changing YTM likes requires valid authenticated cookies."
+            )
+        try:
+            self._ytm.rate_song(
+                video_id,
+                LikeStatus.LIKE if liked else LikeStatus.INDIFFERENT,
+            )
+        except (YTMusicServerError, YTMusicUserError) as exc:
+            logger.warning("YTM rating failed for %s: %s", video_id, exc)
+            raise UpstreamAPIError(f"Failed to change YTM like: {exc}") from exc
+        except YTMusicError as exc:
+            logger.warning("YTM rating error for %s: %s", video_id, exc)
+            raise UpstreamAPIError(f"Failed to change YTM like: {exc}") from exc
+
     def _normalize_playlist_track(self, track: dict[str, Any]) -> dict[str, Any]:
         """Normalize playlist track fields before model validation."""
         normalized = dict(track)
@@ -373,31 +401,44 @@ class YTMusicClient:
         if self._ytm_override is not None:
             try:
                 return _run(self._ytm)
-            except (YTMusicServerError, YTMusicUserError) as e:
+            except (YTMusicServerError, YTMusicUserError, RequestException, OSError) as e:
                 logger.warning("YTMusic API error for search '%s': %s", query, e)
                 raise UpstreamAPIError(f"Search failed: {e}") from e
             except YTMusicError as e:
                 logger.warning("YTMusic error for search '%s': %s", query, e)
                 raise UpstreamAPIError(f"Search failed: {e}") from e
+            except JSONDecodeError as e:
+                logger.warning(
+                    "YTMusic returned invalid search data for '%s': %s", query, e
+                )
+                raise UpstreamAPIError(f"Search failed: invalid response ({e})") from e
 
         last_error: Exception | None = None
         # Prefer cookieless for public song search when cookies exist.
-        sessions: list[YTMusic] = []
+        # Keep session creation inside the guarded request attempt: ytmusicapi
+        # may contact music.youtube.com while creating its visitor session.
+        # TLS EOFs at that point are transport failures, not local OS errors.
+        sessions: list[bool] = []
         if self._cookies_path and self._cookies_path.exists():
-            sessions.append(self._ytm_anon)
-            sessions.append(self._ytm)
+            sessions.extend((True, False))
         else:
-            sessions.append(self._ytm)
+            sessions.append(False)
 
-        for ytm in sessions:
+        for anonymous in sessions:
             try:
+                ytm = self._ytm_anon if anonymous else self._ytm
                 return _run(ytm)
-            except (YTMusicServerError, YTMusicUserError) as e:
+            except (YTMusicServerError, YTMusicUserError, RequestException, OSError) as e:
                 last_error = e
                 logger.warning("YTMusic API error for search '%s': %s", query, e)
             except YTMusicError as e:
                 last_error = e
                 logger.warning("YTMusic error for search '%s': %s", query, e)
+            except JSONDecodeError as e:
+                last_error = e
+                logger.warning(
+                    "YTMusic returned invalid search data for '%s': %s", query, e
+                )
 
         raise UpstreamAPIError(f"Search failed: {last_error}") from last_error
 

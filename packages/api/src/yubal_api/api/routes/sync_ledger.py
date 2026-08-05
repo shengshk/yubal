@@ -22,8 +22,6 @@ router = APIRouter(prefix="/sync-ledger", tags=["sync-ledger"])
 
 
 class DirectUpdateRequest(BaseModel):
-    save_folder: str | None = Field(default=None, min_length=1, max_length=400)
-    confirm_folder_move: bool = False
     enabled: bool | None = None
     max_items: int | None = Field(default=None, ge=1, le=10000)
     sync_jitter_seconds: int | None = Field(default=None, ge=0, le=600)
@@ -62,8 +60,8 @@ def list_sync_ledger(
     service: SyncLedgerServiceDep,
     membership: MembershipServiceDep,
 ) -> SyncLedgerListResponse:
-    """List durable sync ledger rows (reconciled against on-disk files)."""
-    items = service.list(reconcile=True)
+    """List durable sync ledger rows without scanning media folders."""
+    items = service.list(reconcile=False)
     responses: list[SyncLedgerResponse] = []
     for item in items:
         response = _direct_response(item, service)
@@ -173,10 +171,8 @@ def update_direct(
     service: SyncLedgerServiceDep,
     scheduler: SchedulerDep,
 ) -> SyncLedgerResponse:
-    """Update Direct folder and/or recover policy."""
+    """Update Download Center policy. Its system path is fixed."""
     entry = service.update_direct_folder(
-        data.save_folder,
-        confirm_folder_move=data.confirm_folder_move,
         enabled=data.enabled,
         max_items=data.max_items,
         sync_jitter_seconds=data.sync_jitter_seconds,
@@ -249,5 +245,7 @@ def delete_direct(
     """Delete Direct files / clear offline / migrate to external Default."""
     try:
         service.delete_direct(confirm=confirm, mode=mode)
+    except OSError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
     except RuntimeError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e

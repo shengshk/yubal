@@ -9,6 +9,7 @@ from sqlmodel import SQLModel
 
 # Import ALL models to register them with SQLModel.metadata
 from yubal_api.db.external_library import (  # noqa: F401
+    ExternalFileInventory,
     ExternalPlaylist,
     ExternalRawTrack,
 )

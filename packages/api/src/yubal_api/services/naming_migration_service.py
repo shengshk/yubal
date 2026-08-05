@@ -17,10 +17,9 @@ from yubal.utils.filename import build_track_path
 from yubal.utils.library import (
     AUDIO_SUFFIXES,
     STORAGE_DOWNLOAD,
-    STORAGE_EXTERNAL,
     STORAGE_ROOTS,
-    TRACK_INDEX_DIR,
     resolve_under_data,
+    runtime_state_path,
 )
 
 from yubal_api.db.track_catalog import TrackLocation, TrackRecord
@@ -44,7 +43,7 @@ class NamingMigrationResult:
 
 
 def _flag_path(download_root: Path) -> Path:
-    return download_root / TRACK_INDEX_DIR / FLAG_NAME
+    return runtime_state_path(download_root, FLAG_NAME)
 
 
 def _looks_legacy_stem(stem: str) -> bool:
@@ -169,9 +168,7 @@ class NamingConventionMigrator:
                 return False
 
         indexed = self._index.get(video_id)
-        was_indexed = (
-            indexed is not None and indexed.resolve() == src.resolve()
-        )
+        was_indexed = indexed is not None and indexed.resolve() == src.resolve()
         was_canonical = False
         if rec.canonical_rel:
             try:

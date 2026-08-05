@@ -1,3 +1,6 @@
+import { Button } from "@heroui/react";
+import type { ReactNode } from "react";
+
 /** Shared track-row grid: fixed index + actions so text columns align across rows.
  *  Narrow: Artist | Album
  *  Wide (md+): Title | Artist | Album | Album Artist
@@ -23,14 +26,54 @@ export const TRACK_CELL = "min-w-0 overflow-hidden truncate text-xs leading-none
 export const TRACK_CELL_WIDE = `${TRACK_CELL} hidden md:block`;
 
 export const TRACK_ACTIONS =
-  "relative z-20 flex h-full min-w-0 w-full items-center justify-end gap-0";
+  "relative z-20 grid h-full min-w-0 w-full grid-cols-6 items-center justify-items-center gap-0 overflow-hidden";
+
+/** One of the six fixed semantic action columns. */
+export const TRACK_ACTION_SLOT =
+  "flex h-7 w-7 items-center justify-center";
+
+export function TrackActionSlot({
+  children,
+  fallbackIcon,
+  fallbackLabel,
+}: {
+  children?: ReactNode;
+  fallbackIcon: ReactNode;
+  fallbackLabel: string;
+}) {
+  return (
+    <span className={TRACK_ACTION_SLOT}>
+      {children ?? (
+        <Button
+          variant="light"
+          size="sm"
+          isIconOnly
+          isDisabled
+          className={`${SYNC_ACTION_BTN} opacity-40`}
+          aria-label={fallbackLabel}
+          title={fallbackLabel}
+        >
+          {fallbackIcon}
+        </Button>
+      )}
+    </span>
+  );
+}
 
 /**
  * Playlist / search card header action strip.
  * `pr-3` matches `TRACK_ROW_GRID`’s right padding so icon centers align with rows.
  */
 export const SYNC_CARD_ACTIONS =
-  "relative z-10 flex shrink-0 flex-row items-center justify-end gap-0 py-2 pr-3";
+  "relative z-10 flex h-full max-h-20 shrink-0 flex-row items-center justify-end gap-0 overflow-hidden py-2 pr-3";
+
+/** Fixed-height playlist header. Content clips instead of growing the card. */
+export const SYNC_CARD_HEADER =
+  "relative flex h-20 min-h-20 max-h-20 flex-row items-center gap-3 overflow-hidden p-0";
+
+/** Compact content column inside the fixed playlist header. */
+export const SYNC_CARD_CONTENT =
+  "relative z-10 flex h-full min-h-0 min-w-0 flex-1 items-center overflow-hidden py-2 pr-0 text-left outline-none";
 
 /** Shared icon-button size for card + row actions. */
 export const SYNC_ACTION_BTN = "text-foreground-500 h-7 w-7 min-w-7";

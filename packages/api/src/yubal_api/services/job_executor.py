@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
@@ -9,7 +10,7 @@ from typing import Any
 from uuid import UUID
 
 from yubal import AudioCodec, CancelToken, cleanup_part_files
-from yubal.utils.library import sanitize_save_folder
+from yubal.utils.library import resolve_under_data, sanitize_save_folder
 
 from yubal_api.api.exceptions import SubscriptionNotFoundError
 from yubal_api.db.subscription_membership import SnapshotStatus
@@ -148,6 +149,10 @@ class JobExecutor:
             self._event_loop = None
         # Map job_id -> CancelToken for cancellation support
         self._cancel_tokens: dict[str, CancelToken] = {}
+
+    def has_active_jobs(self) -> bool:
+        """Return True while any download/sync job is still running."""
+        return any(not job.status.is_finished for job in self._job_store.get_all())
 
     def _prefs(self) -> Any:
         """Effective download preferences (UI overrides env boot defaults)."""
@@ -321,10 +326,40 @@ class JobExecutor:
         Returns:
             Number of jobs that were signalled for cancellation.
         """
+        jobs = self._job_store.get_all()
+        for job in jobs:
+            if not job.status.is_finished:
+                self._job_store.cancel(job.id)
         tokens = list(self._cancel_tokens.values())
         for token in tokens:
             token.cancel()
         return len(tokens)
+
+    def cancel_all_jobs_and_wait(self, timeout: float = 30.0) -> int:
+        """Cancel queued/running jobs and wait for active cleanup from a worker."""
+        cancelled = self.cancel_all_jobs()
+        loop = self._event_loop
+        tasks = [task for task in self._background_tasks if not task.done()]
+        if loop is None or loop.is_closed() or not tasks:
+            return cancelled
+        try:
+            if asyncio.get_running_loop() is loop:
+                return cancelled
+        except RuntimeError:
+            pass
+
+        async def wait_for_cleanup() -> int:
+            _done, pending = await asyncio.wait(tasks, timeout=timeout)
+            return len(pending)
+
+        future = asyncio.run_coroutine_threadsafe(wait_for_cleanup(), loop)
+        try:
+            pending = future.result(timeout=timeout + 1)
+        except FutureTimeoutError:
+            pending = len(tasks)
+        if pending:
+            raise TimeoutError(f"{pending} job(s) did not stop before maintenance")
+        return cancelled
 
     def _finalize_failed_ledger(self, job_id: str, library_folder: str | None) -> None:
         """Mark the ledger row failed after a timeout/exception.
@@ -629,7 +664,14 @@ class JobExecutor:
         finally:
             # Clean up .part files if job was cancelled
             if cancel_token.is_cancelled:
-                cleaned = cleanup_part_files(self._base_path)
+                cleaned = 0
+                if library_folder:
+                    try:
+                        cleaned += cleanup_part_files(
+                            resolve_under_data(self._base_path, library_folder)
+                        )
+                    except ValueError:
+                        pass
                 cache_path = self._effective_download_cache_path()
                 if cache_path is not None:
                     cleaned += cleanup_part_files(cache_path)

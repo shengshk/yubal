@@ -38,7 +38,6 @@ export type SyncLedgerEntry = {
 };
 
 export type DirectPolicyUpdates = {
-  save_folder?: string;
   enabled?: boolean;
   max_items?: number;
   sync_jitter_seconds?: number;
@@ -74,28 +73,16 @@ export async function listSyncLedger(): Promise<SyncLedgerEntry[]> {
 
 export async function updateDirect(
   updates: DirectPolicyUpdates,
-  confirmFolderMove = false,
 ): Promise<"ok" | "folder_conflict" | "error"> {
   const res = await fetch(`${basePath}/api/sync-ledger/direct`, {
     method: "PATCH",
     credentials: "include",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      ...updates,
-      confirm_folder_move: confirmFolderMove,
-    }),
+    body: JSON.stringify(updates),
   });
   if (res.status === 409) return "folder_conflict";
   if (!res.ok) return "error";
   return "ok";
-}
-
-/** @deprecated Use updateDirect */
-export async function updateDirectFolder(
-  saveFolder: string,
-  confirmFolderMove = false,
-): Promise<"ok" | "folder_conflict" | "error"> {
-  return updateDirect({ save_folder: saveFolder }, confirmFolderMove);
 }
 
 export async function deleteDirect(
@@ -171,6 +158,8 @@ export type SyncTrackItem = {
   junk_kind?: "rw" | "ro" | null;
   /** External matched track already has a Direct catalog location. */
   in_direct?: boolean;
+  /** External raw permission resolved from its immutable original source. */
+  can_mutate?: boolean;
   /** Wanted rows carry their wishlist id and origin link. */
   wanted_id?: string | null;
   source_url?: string | null;

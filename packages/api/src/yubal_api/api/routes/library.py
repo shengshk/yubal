@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import shutil
+from dataclasses import asdict
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Query
@@ -163,9 +164,7 @@ def _resolve_library_dir(data_path: Path, folder: str) -> Path:
         # Organized/<dir_name> on the External root (not under Download).
         if rel.startswith("External/"):
             rest = rel[len("External/") :]
-            if not (
-                rest.startswith("organized/") or rest.startswith("raw/")
-            ):
+            if not (rest.startswith("organized/") or rest.startswith("raw/")):
                 rest = f"organized/{rest}"
             abs_path = resolve_storage_path(STORAGE_EXTERNAL, rest)
         elif rel == "wanted":
@@ -230,13 +229,14 @@ class LibraryHealthResponse(BaseModel):
 
 
 class LibraryTrackSummaryResponse(BaseModel):
-    effective_count: int
-    identified_count: int
-    unidentified_count: int
-    verified_count: int
-    unverified_count: int
-    physical_count: int
-    hardlink_duplicate_count: int
+    effective_count: int | None = None
+    identified_count: int | None = None
+    unidentified_count: int | None = None
+    verified_count: int | None = None
+    unverified_count: int | None = None
+    physical_count: int | None = None
+    hardlink_duplicate_count: int | None = None
+    refreshing: bool = False
 
 
 class LibraryAuditResponse(BaseModel):
@@ -304,10 +304,15 @@ def audit_library(
 @router.get("/track-summary", response_model=LibraryTrackSummaryResponse)
 def library_track_summary(
     library_stats: LibraryStatsServiceDep,
+    refresh: bool = Query(default=False),
 ) -> LibraryTrackSummaryResponse:
-    """Count real audio files once per inode across the whole local library."""
-    return LibraryTrackSummaryResponse.model_validate(
-        library_stats.summary(), from_attributes=True
+    """Return the persisted summary; refresh only on an explicit request."""
+    summary, refreshing = library_stats.snapshot(refresh=refresh)
+    if summary is None:
+        return LibraryTrackSummaryResponse(refreshing=refreshing)
+    return LibraryTrackSummaryResponse(
+        **asdict(summary),
+        refreshing=refreshing,
     )
 
 
@@ -338,6 +343,31 @@ def stream_track_cover(
     flood the browser console with failed GET errors.
     """
     abs_path = _resolve_audio_file(settings.data, path)
+    cover = read_embedded_cover(abs_path)
+    if cover is None:
+        return Response(status_code=204)
+    data, mime = cover
+    return Response(content=data, media_type=mime)
+
+
+@router.get("/best-cover")
+def stream_best_cover(
+    settings: SettingsDep,
+    path: str = Query(min_length=1, max_length=800),
+) -> Response:
+    """Return the best local cover for one audio path in a single request."""
+    abs_path = _resolve_audio_file(settings.data, path)
+    cover_path = find_album_folder_cover(abs_path)
+    if cover_path is not None:
+        media = _IMAGE_MEDIA_TYPES.get(
+            cover_path.suffix.lower(), "application/octet-stream"
+        )
+        return FileResponse(
+            cover_path,
+            media_type=media,
+            filename=cover_path.name,
+            content_disposition_type="inline",
+        )
     cover = read_embedded_cover(abs_path)
     if cover is None:
         return Response(status_code=204)
@@ -438,15 +468,11 @@ def get_track_lyrics(
 
     sidecar = read_lyrics_sidecar(abs_path)
     if sidecar:
-        return TrackLyricsResponse(
-            available=True, content=sidecar, source="sidecar"
-        )
+        return TrackLyricsResponse(available=True, content=sidecar, source="sidecar")
 
     embedded = read_embedded_lyrics(abs_path)
     if embedded:
-        return TrackLyricsResponse(
-            available=True, content=embedded, source="embedded"
-        )
+        return TrackLyricsResponse(available=True, content=embedded, source="embedded")
 
     return TrackLyricsResponse(available=False, content=None, source=None)
 
@@ -631,9 +657,7 @@ def rename_folder(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    abs_old = _assert_manageable(
-        old_rel, data_path=settings.data, locked=locked
-    )
+    abs_old = _assert_manageable(old_rel, data_path=settings.data, locked=locked)
 
     segment = clean_filename(data.new_name.strip())
     segment = _limit_path_component(segment.strip()) if segment else ""

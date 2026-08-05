@@ -16,6 +16,8 @@ export type ExternalDeleteMode =
   | "add_matched_to_direct"
   | "add_meta_verified_to_wanted"
   | "delete_unmatched"
+  | "archive_meta_rejected"
+  | "delete_meta_rejected"
   | "delete_all"
   | "clear_offline_delete"
   | "clear_offline_to_raw_delete";
@@ -23,11 +25,18 @@ export type ExternalDeleteMode =
 export type ExternalPlaylist = {
   dir_name: string;
   allow_mutate: boolean;
+  access_mode: "pending" | "readonly" | "managed";
+  access_mode_locked: boolean;
+  source_mutated_at?: string | null;
+  source_mutation_kind?: string | null;
   show_raw: boolean;
   show_junk: boolean;
+  inventory_scanned: boolean;
   unmatched_count: number;
   matched_count: number;
   meta_verified_count: number;
+  meta_rejected_count: number;
+  meta_rejected_mutable_count: number;
   cloud: number;
   local: number;
   offline: number;
@@ -51,6 +60,7 @@ export type ExternalPlaylist = {
 
 export type ExternalPlaylistUpdate = Partial<{
   allow_mutate: boolean;
+  access_mode: "pending" | "readonly" | "managed";
   show_raw: boolean;
   show_junk: boolean;
   enabled: boolean;
@@ -89,6 +99,15 @@ export type ExternalTrack = {
   meta_source?: string | null;
   meta_source_id?: string | null;
   meta_source_url?: string | null;
+  /** Permission is derived from the original source, not the display playlist. */
+  can_mutate?: boolean;
+};
+
+export type ExternalTrackPage = {
+  total: number;
+  offset: number;
+  next_offset: number | null;
+  items: ExternalTrack[];
 };
 
 export type ExternalScanResult = {
@@ -153,6 +172,7 @@ export type ExternalSyncResult = {
   enriched: number;
   upgraded: number;
   asset_errors: number;
+  queued?: boolean;
 };
 
 export type ExternalDeleteResult = {
@@ -161,6 +181,7 @@ export type ExternalDeleteResult = {
   deleted_raw: number;
   moved: number;
   reset_matches: number;
+  skipped_readonly: number;
   errors: number;
 };
 
@@ -202,6 +223,19 @@ export async function updateExternalPlaylist(
   return (await res.json()) as ExternalPlaylist;
 }
 
+export async function activatePendingExternalPlaylists(
+  accessMode: "readonly" | "managed",
+): Promise<{ activated: number } | { error: string }> {
+  const res = await fetch(`${basePath}/api/external/activate-pending`, {
+    method: "PATCH",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ access_mode: accessMode }),
+  });
+  if (!res.ok) return errorFromResponse(res);
+  return (await res.json()) as { activated: number };
+}
+
 export async function listExternalPlaylistTracks(
   dirName: string,
 ): Promise<ExternalTrack[]> {
@@ -211,6 +245,23 @@ export async function listExternalPlaylistTracks(
   if (!result.ok || !result.data) return [];
   const data = result.data;
   return Array.isArray(data) ? data : (data.items ?? []);
+}
+
+export async function listExternalPlaylistTracksPage(
+  dirName: string,
+  options: { offset?: number; limit?: number; refresh?: boolean } = {},
+): Promise<ExternalTrackPage> {
+  const params = new URLSearchParams({
+    offset: String(options.offset ?? 0),
+    limit: String(options.limit ?? 100),
+  });
+  if (options.refresh) params.set("refresh", "true");
+  const result = await sharedJsonGet<ExternalTrackPage>(
+    `${basePath}/api/external/playlists/${encodeURIComponent(dirName)}/tracks/page?${params}`,
+  );
+  return result.ok && result.data
+    ? result.data
+    : { total: 0, offset: 0, next_offset: null, items: [] };
 }
 
 export async function scanExternal(): Promise<
@@ -255,12 +306,10 @@ export async function syncExternalPlaylist(
 export async function deleteExternalPlaylist(
   dirName: string,
   mode: ExternalDeleteMode,
-  directFolder = "direct",
 ): Promise<ExternalDeleteResult | { error: string }> {
   const params = new URLSearchParams({
     confirm: "true",
     mode,
-    direct_folder: directFolder,
   });
   const res = await fetch(
     `${basePath}/api/external/playlists/${encodeURIComponent(dirName)}?${params}`,

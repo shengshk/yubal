@@ -70,7 +70,7 @@ Container layout:
 │   ├── raw/           # external originals and scan input
 │   └── organized/     # verified / matched organized library
 └── cache/             # download scratch (SSD optional)
-/config/               # settings, SQLite DB, backups, cookies
+/config/               # settings, SQLite DB, backups, cookies, runtime state
 ```
 
 > **Hardlinks:** `download`, `wanted`, and `external` must share one filesystem. Prefer `./data:/data`. Split mounts are OK only on the same partition.
@@ -155,6 +155,7 @@ See [`compose.example.yaml`](compose.example.yaml) for the full `yubal` + option
 | `YUBAL_TG_API_URL` | Local Telegram Bot API (e.g. `http://tgapi:8081`) | empty = official API |
 | `YUBAL_DATA` | Download library path | `/data/download` |
 | `YUBAL_CONFIG` | Config directory | `/config` |
+| `YUBAL_STATE_ROOT` | Mutable indexes and scrape cooldown state | `/config/state` |
 | `YUBAL_LIBRARY_ROOT` | Shared media-library root | `/data` |
 
 More options: `packages/api/src/yubal_api/settings.py`. Many prefs are also editable in the Web **Settings** drawer.
@@ -237,7 +238,7 @@ This software is provided **as-is**, for **personal archiving and self-hosted li
 │   ├── raw/           # 外部原文件与扫描入口
 │   └── organized/     # 验证 / 匹配后的整理曲库
 └── cache/             # 下载暂存（可挂 SSD）
-/config/               # 设置、SQLite 数据库、备份、cookies
+/config/               # 设置、SQLite 数据库、备份、cookies、运行状态
 ```
 
 > **硬链接：** `download`、`wanted` 与 `external` 须同一文件系统。推荐 `./data:/data`；拆挂勿跨盘。
@@ -322,6 +323,7 @@ docker compose -f compose.yaml up -d
 | `YUBAL_TG_API_URL` | 本地 Telegram Bot API | 空=官方 API |
 | `YUBAL_DATA` | 下载库路径 | `/data/download` |
 | `YUBAL_CONFIG` | 配置目录 | `/config` |
+| `YUBAL_STATE_ROOT` | 可变索引与刮削冷却状态 | `/config/state` |
 | `YUBAL_LIBRARY_ROOT` | 媒体曲库公共根 | `/data` |
 
 更多见 `packages/api/src/yubal_api/settings.py`；多数也可在 Web「设置」中调整。
@@ -404,7 +406,7 @@ docker compose -f compose.yaml up -d
 │   ├── raw/           # 外部原檔與掃描入口
 │   └── organized/     # 驗證 / 匹配後的整理曲庫
 └── cache/             # 下載暫存（可掛 SSD）
-/config/               # 設定、SQLite 資料庫、備份、cookies
+/config/               # 設定、SQLite 資料庫、備份、cookies、執行狀態
 ```
 
 > **硬連結：** `download`、`wanted` 與 `external` 須同一檔案系統。建議 `./data:/data`；拆掛勿跨碟。
@@ -489,6 +491,7 @@ docker compose -f compose.yaml up -d
 | `YUBAL_TG_API_URL` | 本地 Telegram Bot API | 空=官方 API |
 | `YUBAL_DATA` | 下載庫路徑 | `/data/download` |
 | `YUBAL_CONFIG` | 設定目錄 | `/config` |
+| `YUBAL_STATE_ROOT` | 可變索引與刮削冷卻狀態 | `/config/state` |
 | `YUBAL_LIBRARY_ROOT` | 媒體曲庫共用根 | `/data` |
 
 更多見 `packages/api/src/yubal_api/settings.py`；多數也可在 Web「設定」調整。

@@ -4,10 +4,13 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from sqlalchemy import Engine, delete
+from sqlalchemy import Engine, delete, func
 from sqlmodel import Session, col, select
 
 from yubal_api.db.external_library import (
+    EXTERNAL_ACCESS_MANAGED,
+    EXTERNAL_ACCESS_MODES,
+    EXTERNAL_ACCESS_PENDING,
     MATCH_MATCHED,
     MATCH_PENDING,
     MATCH_REJECTED,
@@ -15,6 +18,7 @@ from yubal_api.db.external_library import (
     META_PENDING,
     META_REJECTED,
     META_VERIFIED,
+    ExternalFileInventory,
     ExternalPlaylist,
     ExternalRawTrack,
 )
@@ -55,12 +59,28 @@ class ExternalLibraryRepository:
 
     # -- Playlists (Raw/<dir_name>) --
 
-    def upsert_playlist(self, dir_name: str) -> ExternalPlaylist:
+    def upsert_playlist(
+        self,
+        dir_name: str,
+        *,
+        access_mode: str = EXTERNAL_ACCESS_PENDING,
+        enabled: bool = False,
+    ) -> ExternalPlaylist:
         with Session(self._engine) as session:
             existing = session.get(ExternalPlaylist, dir_name)
             if existing is not None:
                 return existing
-            row = ExternalPlaylist(dir_name=dir_name)
+            mode = (
+                access_mode
+                if access_mode in EXTERNAL_ACCESS_MODES
+                else EXTERNAL_ACCESS_PENDING
+            )
+            row = ExternalPlaylist(
+                dir_name=dir_name,
+                access_mode=mode,
+                allow_mutate=mode == EXTERNAL_ACCESS_MANAGED,
+                enabled=enabled,
+            )
             session.add(row)
             session.commit()
             session.refresh(row)
@@ -70,6 +90,26 @@ class ExternalLibraryRepository:
         with Session(self._engine) as session:
             return session.get(ExternalPlaylist, dir_name)
 
+    def find_strict_metadata_rows(
+        self,
+        *,
+        title_norm: str,
+        artist_norm: str,
+        album_norm: str,
+        limit: int = 20,
+    ) -> list[ExternalRawTrack]:
+        """Find local-match candidates from indexed tags, never from a disk walk."""
+        with Session(self._engine) as session:
+            stmt = select(ExternalRawTrack).where(
+                ExternalRawTrack.title_norm == title_norm,
+                ExternalRawTrack.artist_norm == artist_norm,
+            )
+            if album_norm:
+                stmt = stmt.where(ExternalRawTrack.album_norm == album_norm)
+            else:
+                stmt = stmt.where(ExternalRawTrack.album_norm == "")
+            return list(session.exec(stmt.limit(max(1, min(limit, 100)))).all())
+
     def get_playlist_by_uid(self, playlist_uid: str) -> ExternalPlaylist | None:
         with Session(self._engine) as session:
             stmt = select(ExternalPlaylist).where(
@@ -77,16 +117,77 @@ class ExternalLibraryRepository:
             )
             return session.exec(stmt).first()
 
+    def mark_source_mutated(
+        self,
+        playlist_uid: str,
+        *,
+        mutation_kind: str,
+    ) -> ExternalPlaylist | None:
+        """Permanently lock one playlist after its original source is changed."""
+        with Session(self._engine) as session:
+            stmt = select(ExternalPlaylist).where(
+                ExternalPlaylist.playlist_uid == playlist_uid
+            )
+            row = session.exec(stmt).first()
+            if row is None:
+                return None
+            if row.source_mutated_at is None:
+                row.source_mutated_at = datetime.now(UTC)
+                row.source_mutation_kind = mutation_kind[:32]
+                session.add(row)
+                session.commit()
+                session.refresh(row)
+            return row
+
     def list_playlists(self) -> list[ExternalPlaylist]:
         with Session(self._engine) as session:
             stmt = select(ExternalPlaylist).order_by(col(ExternalPlaylist.dir_name))
             return list(session.exec(stmt).all())
+
+    def record_inventory(
+        self,
+        dir_name: str,
+        *,
+        audio_count: int,
+        cover_rel: str | None,
+    ) -> ExternalPlaylist | None:
+        """Persist a filename-only inventory without activating the playlist."""
+        with Session(self._engine) as session:
+            row = session.get(ExternalPlaylist, dir_name)
+            if row is None:
+                return None
+            row.discovered_audio_count = max(0, int(audio_count))
+            row.discovered_cover_rel = cover_rel
+            row.inventory_scanned_at = datetime.now(UTC)
+            session.add(row)
+            session.commit()
+            session.refresh(row)
+            return row
+
+    def record_inventory_representative(
+        self,
+        dir_name: str,
+        *,
+        cover_rel: str,
+    ) -> ExternalPlaylist | None:
+        """Publish the first audio path before the full SMB count completes."""
+        with Session(self._engine) as session:
+            row = session.get(ExternalPlaylist, dir_name)
+            if row is None:
+                return None
+            if not row.discovered_cover_rel:
+                row.discovered_cover_rel = cover_rel
+                session.add(row)
+                session.commit()
+                session.refresh(row)
+            return row
 
     def update_playlist_settings(
         self,
         dir_name: str,
         *,
         allow_mutate: bool | None = None,
+        access_mode: str | None = None,
         show_raw: bool | None = None,
         show_junk: bool | None = None,
         enabled: bool | None = None,
@@ -101,8 +202,16 @@ class ExternalLibraryRepository:
             row = session.get(ExternalPlaylist, dir_name)
             if row is None:
                 return None
-            if allow_mutate is not None:
+            if access_mode is not None:
+                if access_mode not in EXTERNAL_ACCESS_MODES:
+                    raise ValueError(f"invalid external access mode: {access_mode}")
+                row.access_mode = access_mode
+                row.allow_mutate = access_mode == EXTERNAL_ACCESS_MANAGED
+            elif allow_mutate is not None:
                 row.allow_mutate = allow_mutate
+                row.access_mode = (
+                    EXTERNAL_ACCESS_MANAGED if allow_mutate else "readonly"
+                )
             if show_raw is not None:
                 row.show_raw = show_raw
             if show_junk is not None:
@@ -112,6 +221,8 @@ class ExternalLibraryRepository:
                 row.show_junk = False
             if enabled is not None:
                 row.enabled = enabled
+            if row.access_mode == EXTERNAL_ACCESS_PENDING:
+                row.enabled = False
             if max_items is not None:
                 row.max_items = max(1, min(10000, int(max_items)))
             if sync_jitter_seconds is not None:
@@ -155,14 +266,19 @@ class ExternalLibraryRepository:
     def count_unmatched_for_dir(self, dir_name: str) -> int:
         """Count YTM-unmatched rows that are *not* meta-verified (pure X bucket)."""
         with Session(self._engine) as session:
-            stmt = select(ExternalRawTrack.rel_path).where(
-                ExternalRawTrack.dir_name == dir_name,
-                col(ExternalRawTrack.match_status).in_(
-                    [MATCH_UNMATCHED, MATCH_PENDING, MATCH_REJECTED]
-                ),
-                col(ExternalRawTrack.meta_status) != META_VERIFIED,
+            return int(
+                session.exec(
+                    select(func.count())
+                    .select_from(ExternalRawTrack)
+                    .where(
+                        ExternalRawTrack.dir_name == dir_name,
+                        col(ExternalRawTrack.match_status).in_(
+                            [MATCH_UNMATCHED, MATCH_PENDING, MATCH_REJECTED]
+                        ),
+                        col(ExternalRawTrack.meta_status) != META_VERIFIED,
+                    )
+                ).one()
             )
-            return len(list(session.exec(stmt).all()))
 
     def delete_playlists_not_in(
         self,
@@ -187,6 +303,209 @@ class ExternalLibraryRepository:
 
     # -- Raw tracks --
 
+    def list_inventory_path_stats(
+        self,
+        *,
+        dir_name: str | None = None,
+    ) -> dict[str, tuple[int, int, int | None]]:
+        """Map inventory path to its cheap filesystem fingerprint."""
+        with Session(self._engine) as session:
+            stmt = select(
+                ExternalFileInventory.rel_path,
+                ExternalFileInventory.mtime_ns,
+                ExternalFileInventory.size,
+                ExternalFileInventory.inode,
+            )
+            if dir_name is not None:
+                stmt = stmt.where(ExternalFileInventory.dir_name == dir_name)
+            rows = session.exec(stmt).all()
+            return {
+                r[0]: (
+                    int(r[1]),
+                    int(r[2]),
+                    int(r[3]) if r[3] is not None else None,
+                )
+                for r in rows
+            }
+
+    def list_inventory_inodes(self) -> list[tuple[str, int | None]]:
+        """Return the last-good Raw path/inode ledger for library totals."""
+        with Session(self._engine) as session:
+            rows = session.exec(
+                select(
+                    ExternalFileInventory.rel_path,
+                    ExternalFileInventory.inode,
+                )
+            ).all()
+            return [
+                (str(rel_path), int(inode) if inode is not None else None)
+                for rel_path, inode in rows
+            ]
+
+    def inventory_cover_path(self, dir_name: str) -> str | None:
+        """Return an existing Raw candidate, preferring embedded artwork."""
+        with Session(self._engine) as session:
+            covered = session.exec(
+                select(ExternalFileInventory.rel_path)
+                .join(
+                    ExternalRawTrack,
+                    col(ExternalRawTrack.rel_path)
+                    == col(ExternalFileInventory.rel_path),
+                )
+                .where(
+                    ExternalFileInventory.dir_name == dir_name,
+                    col(ExternalRawTrack.has_cover).is_(True),
+                )
+                .order_by(col(ExternalFileInventory.rel_path))
+                .limit(1)
+            ).first()
+            return str(covered) if covered else None
+
+    def first_inventory_path(self, dir_name: str) -> str | None:
+        """Return one currently inventoried Raw path for an unindexed folder."""
+        with Session(self._engine) as session:
+            path = session.exec(
+                select(ExternalFileInventory.rel_path)
+                .where(ExternalFileInventory.dir_name == dir_name)
+                .order_by(col(ExternalFileInventory.rel_path))
+                .limit(1)
+            ).first()
+            return str(path) if path else None
+
+    def upsert_inventory_batch(
+        self,
+        entries: list[tuple[str, str, int, int, int | None]],
+    ) -> tuple[int, int]:
+        """Persist path/stat discovery without opening audio metadata."""
+        if not entries:
+            return 0, 0
+        added = updated = 0
+        now = datetime.now(UTC)
+        with Session(self._engine) as session:
+            for rel_path, dir_name, mtime_ns, size, inode in entries:
+                row = session.get(ExternalFileInventory, rel_path)
+                if row is None:
+                    session.add(
+                        ExternalFileInventory(
+                            rel_path=rel_path,
+                            dir_name=dir_name,
+                            mtime_ns=mtime_ns,
+                            size=size,
+                            inode=inode,
+                            metadata_indexed=False,
+                            first_seen_at=now,
+                            changed_at=now,
+                        )
+                    )
+                    added += 1
+                    continue
+                content_changed = row.mtime_ns != mtime_ns or row.size != size
+                inode_changed = row.inode != inode
+                if not content_changed and not inode_changed:
+                    continue
+                row.dir_name = dir_name
+                row.mtime_ns = mtime_ns
+                row.size = size
+                row.inode = inode
+                if content_changed:
+                    row.metadata_indexed = False
+                row.changed_at = now
+                session.add(row)
+                updated += 1
+            if added or updated:
+                session.commit()
+        return added, updated
+
+    def list_pending_inventory(
+        self,
+        *,
+        limit: int,
+        dir_name: str | None = None,
+        dir_names: set[str] | None = None,
+    ) -> list[ExternalFileInventory]:
+        """Return a fair mix of recent changes and oldest stock."""
+        if limit <= 0:
+            return []
+        with Session(self._engine) as session:
+            base = select(ExternalFileInventory).where(
+                ExternalFileInventory.metadata_indexed == False  # noqa: E712
+            )
+            if dir_name is not None:
+                base = base.where(ExternalFileInventory.dir_name == dir_name)
+            elif dir_names is not None:
+                if not dir_names:
+                    return []
+                base = base.where(col(ExternalFileInventory.dir_name).in_(dir_names))
+
+            recent_limit = max(1, limit // 4)
+            recent = list(
+                session.exec(
+                    base.order_by(col(ExternalFileInventory.changed_at).desc()).limit(
+                        recent_limit
+                    )
+                ).all()
+            )
+            selected = {row.rel_path for row in recent}
+            stock = list(
+                session.exec(
+                    base.order_by(
+                        col(ExternalFileInventory.changed_at),
+                        col(ExternalFileInventory.rel_path),
+                    ).limit(limit + len(selected))
+                ).all()
+            )
+            result = list(recent)
+            result.extend(row for row in stock if row.rel_path not in selected)
+            return result[:limit]
+
+    def mark_inventory_indexed(self, rel_path: str, *, mtime_ns: int) -> bool:
+        """Complete metadata indexing only if the file did not change meanwhile."""
+        with Session(self._engine) as session:
+            row = session.get(ExternalFileInventory, rel_path)
+            if row is None or int(row.mtime_ns) != int(mtime_ns):
+                return False
+            row.metadata_indexed = True
+            session.add(row)
+            session.commit()
+            return True
+
+    def delete_inventory_paths(self, paths: list[str]) -> int:
+        if not paths:
+            return 0
+        with Session(self._engine) as session:
+            stmt = delete(ExternalFileInventory).where(
+                col(ExternalFileInventory.rel_path).in_(paths)
+            )
+            result = session.execute(stmt)
+            session.commit()
+            return int(result.rowcount or 0)
+
+    def delete_inventory_for_dir(self, dir_name: str) -> int:
+        with Session(self._engine) as session:
+            stmt = delete(ExternalFileInventory).where(
+                ExternalFileInventory.dir_name == dir_name
+            )
+            result = session.execute(stmt)
+            session.commit()
+            return int(result.rowcount or 0)
+
+    def delete_paths_for_dir(self, dir_name: str) -> int:
+        with Session(self._engine) as session:
+            stmt = delete(ExternalRawTrack).where(ExternalRawTrack.dir_name == dir_name)
+            result = session.execute(stmt)
+            session.commit()
+            return int(result.rowcount or 0)
+
+    def count_inventory_for_dir(self, dir_name: str) -> int:
+        with Session(self._engine) as session:
+            return int(
+                session.exec(
+                    select(func.count())
+                    .select_from(ExternalFileInventory)
+                    .where(ExternalFileInventory.dir_name == dir_name)
+                ).one()
+            )
+
     def count(self) -> int:
         with Session(self._engine) as session:
             rows = session.exec(select(ExternalRawTrack.rel_path)).all()
@@ -194,10 +513,13 @@ class ExternalLibraryRepository:
 
     def count_for_dir(self, dir_name: str) -> int:
         with Session(self._engine) as session:
-            stmt = select(ExternalRawTrack.rel_path).where(
-                ExternalRawTrack.dir_name == dir_name
+            return int(
+                session.exec(
+                    select(func.count())
+                    .select_from(ExternalRawTrack)
+                    .where(ExternalRawTrack.dir_name == dir_name)
+                ).one()
             )
-            return len(list(session.exec(stmt).all()))
 
     def list_path_stats(self) -> dict[str, tuple[int, int]]:
         """Map rel_path → (mtime_ns, size)."""
@@ -215,6 +537,15 @@ class ExternalLibraryRepository:
         with Session(self._engine) as session:
             return session.get(ExternalRawTrack, rel_path)
 
+    def list_missing_provenance(self) -> list[ExternalRawTrack]:
+        """Rows which violate the raw-file provenance invariant."""
+        with Session(self._engine) as session:
+            stmt = select(ExternalRawTrack).where(
+                (ExternalRawTrack.origin_kind == "")
+                | (ExternalRawTrack.origin_ref == "")
+            )
+            return list(session.exec(stmt).all())
+
     def upsert(self, row: ExternalRawTrack) -> None:
         with Session(self._engine) as session:
             existing = session.get(ExternalRawTrack, row.rel_path)
@@ -223,8 +554,38 @@ class ExternalLibraryRepository:
                 row.updated_at = now
                 session.add(row)
             else:
+                identity_changed = (
+                    existing.mtime_ns != row.mtime_ns
+                    or existing.size != row.size
+                    or existing.title_norm != row.title_norm
+                    or existing.artist_norm != row.artist_norm
+                    or existing.album_norm != row.album_norm
+                )
                 for field in _UPSERT_FIELDS:
                     setattr(existing, field, getattr(row, field))
+                if identity_changed:
+                    # A changed file/tag fingerprint is a new decision input.
+                    # Preserve a confirmed YTM identity, but re-open every
+                    # unresolved YTM decision and all metadata verification.
+                    if existing.match_status != MATCH_MATCHED:
+                        existing.match_status = MATCH_UNMATCHED
+                        existing.match_confidence = None
+                        existing.match_fail_count = 0
+                        existing.match_next_eligible_at = None
+                        existing.ytm_attempted_at = None
+                    existing.meta_status = META_PENDING
+                    existing.meta_source = None
+                    existing.meta_source_id = None
+                    existing.meta_source_url = None
+                    existing.meta_title = None
+                    existing.meta_artists = None
+                    existing.meta_album = None
+                    existing.meta_thumbnail_url = None
+                    existing.meta_fingerprint = None
+                    existing.meta_verified_at = None
+                    existing.meta_attempted_at = None
+                    existing.meta_fail_count = 0
+                    existing.meta_next_eligible_at = None
                 existing.updated_at = now
                 session.add(existing)
             session.commit()
@@ -253,6 +614,29 @@ class ExternalLibraryRepository:
                 stmt = stmt.limit(limit)
             return list(session.exec(stmt).all())
 
+    def list_meta_rejected_for_dir(self, dir_name: str) -> list[ExternalRawTrack]:
+        with Session(self._engine) as session:
+            stmt = select(ExternalRawTrack).where(
+                ExternalRawTrack.dir_name == dir_name,
+                ExternalRawTrack.meta_status == META_REJECTED,
+                ExternalRawTrack.match_status != MATCH_MATCHED,
+            )
+            return list(session.exec(stmt).all())
+
+    def count_meta_rejected_for_dir(self, dir_name: str) -> int:
+        with Session(self._engine) as session:
+            return int(
+                session.exec(
+                    select(func.count())
+                    .select_from(ExternalRawTrack)
+                    .where(
+                        ExternalRawTrack.dir_name == dir_name,
+                        ExternalRawTrack.meta_status == META_REJECTED,
+                        ExternalRawTrack.match_status != MATCH_MATCHED,
+                    )
+                ).one()
+            )
+
     def list_matched(self, dir_name: str | None = None) -> list[ExternalRawTrack]:
         with Session(self._engine) as session:
             stmt = select(ExternalRawTrack).where(
@@ -263,10 +647,11 @@ class ExternalLibraryRepository:
             return list(session.exec(stmt).all())
 
     def list_enabled_dir_names(self) -> set[str]:
-        """Return ``dir_name`` values for playlists with ``enabled=True``."""
+        """Return activated playlists that participate in automatic scans."""
         with Session(self._engine) as session:
             stmt = select(ExternalPlaylist.dir_name).where(
-                ExternalPlaylist.enabled == True  # noqa: E712
+                ExternalPlaylist.enabled == True,  # noqa: E712
+                ExternalPlaylist.access_mode != EXTERNAL_ACCESS_PENDING,
             )
             return set(session.exec(stmt).all())
 
@@ -293,6 +678,9 @@ class ExternalLibraryRepository:
                 if row.match_next_eligible_at is not None or row.match_fail_count:
                     row.match_next_eligible_at = None
                     row.match_fail_count = 0
+                    dirty = True
+                if row.ytm_attempted_at is not None:
+                    row.ytm_attempted_at = None
                     dirty = True
                 if include_rejected and row.match_status == MATCH_REJECTED:
                     row.match_status = MATCH_UNMATCHED
@@ -326,13 +714,11 @@ class ExternalLibraryRepository:
         enabled-only sets from ``list_enabled_dir_names``).
         """
         with Session(self._engine) as session:
-            stmt = (
-                select(ExternalRawTrack)
-                .where(
-                    col(ExternalRawTrack.match_status).in_(
-                        [MATCH_UNMATCHED, MATCH_PENDING]
-                    )
-                )
+            stmt = select(ExternalRawTrack).where(
+                col(ExternalRawTrack.match_status).in_(
+                    [MATCH_UNMATCHED, MATCH_PENDING]
+                ),
+                col(ExternalRawTrack.ytm_attempted_at).is_(None),
             )
             if not ignore_backoff:
                 stmt = stmt.where(
@@ -345,7 +731,61 @@ class ExternalLibraryRepository:
                 if not dir_names:
                     return []
                 stmt = stmt.where(col(ExternalRawTrack.dir_name).in_(dir_names))
-            stmt = stmt.order_by(col(ExternalRawTrack.updated_at)).limit(limit)
+            # Reserve a small lane for newly indexed/changed files while most
+            # capacity continues draining historical stock.
+            recent_limit = max(1, limit // 4)
+            recent = list(
+                session.exec(
+                    stmt.order_by(col(ExternalRawTrack.updated_at).desc()).limit(
+                        recent_limit
+                    )
+                ).all()
+            )
+            selected = {row.rel_path for row in recent}
+            stock = list(
+                session.exec(
+                    stmt.order_by(
+                        col(ExternalRawTrack.updated_at),
+                        col(ExternalRawTrack.rel_path),
+                    ).limit(limit + len(selected))
+                ).all()
+            )
+            result = list(recent)
+            result.extend(row for row in stock if row.rel_path not in selected)
+            return result[:limit]
+
+    def list_meta_verifiable(
+        self,
+        dir_name: str,
+        *,
+        now: datetime,
+        limit: int,
+        force: bool = False,
+    ) -> list[ExternalRawTrack]:
+        """Rows eligible for a metadata verification attempt."""
+        with Session(self._engine) as session:
+            stmt = select(ExternalRawTrack).where(
+                ExternalRawTrack.dir_name == dir_name,
+                ExternalRawTrack.match_status != MATCH_MATCHED,
+                ExternalRawTrack.title != "",
+                ExternalRawTrack.artists != "",
+                ExternalRawTrack.album != "",
+            )
+            if not force:
+                stmt = stmt.where(
+                    col(ExternalRawTrack.meta_status) != META_VERIFIED,
+                    (col(ExternalRawTrack.meta_next_eligible_at).is_(None))
+                    | (ExternalRawTrack.meta_next_eligible_at <= now),
+                    col(ExternalRawTrack.meta_attempted_at).is_(None)
+                    | (
+                        (ExternalRawTrack.meta_status == META_REJECTED)
+                        & (ExternalRawTrack.meta_next_eligible_at <= now)
+                    ),
+                )
+            stmt = stmt.order_by(
+                col(ExternalRawTrack.updated_at),
+                col(ExternalRawTrack.rel_path),
+            ).limit(limit)
             return list(session.exec(stmt).all())
 
     def record_meta_verified(
@@ -375,6 +815,7 @@ class ExternalLibraryRepository:
             row.meta_thumbnail_url = thumbnail_url
             row.meta_fingerprint = fingerprint[:600]
             row.meta_verified_at = datetime.now(UTC)
+            row.meta_attempted_at = row.meta_verified_at
             row.meta_fail_count = 0
             row.meta_next_eligible_at = None
             row.updated_at = datetime.now(UTC)
@@ -402,6 +843,7 @@ class ExternalLibraryRepository:
             row.meta_thumbnail_url = None
             row.meta_fingerprint = fingerprint[:600]
             row.meta_verified_at = None
+            row.meta_attempted_at = datetime.now(UTC)
             row.meta_fail_count = int(row.meta_fail_count or 0) + 1
             row.meta_next_eligible_at = next_eligible_at
             row.updated_at = datetime.now(UTC)
@@ -422,6 +864,7 @@ class ExternalLibraryRepository:
             # Keep pending (or prior verified invalidation state); only delay retry.
             if row.meta_status == META_REJECTED:
                 row.meta_status = META_PENDING
+            row.meta_fail_count = int(row.meta_fail_count or 0) + 1
             row.meta_next_eligible_at = next_eligible_at
             row.updated_at = datetime.now(UTC)
             session.add(row)
@@ -443,6 +886,8 @@ class ExternalLibraryRepository:
             row.meta_thumbnail_url = None
             row.meta_fingerprint = None
             row.meta_verified_at = None
+            row.meta_attempted_at = None
+            row.meta_fail_count = 0
             row.meta_next_eligible_at = None
             row.updated_at = datetime.now(UTC)
             session.add(row)
@@ -450,12 +895,17 @@ class ExternalLibraryRepository:
 
     def count_meta_verified_unmatched(self, dir_name: str) -> int:
         with Session(self._engine) as session:
-            stmt = select(ExternalRawTrack).where(
-                ExternalRawTrack.dir_name == dir_name,
-                ExternalRawTrack.meta_status == META_VERIFIED,
-                col(ExternalRawTrack.match_status) != MATCH_MATCHED,
+            return int(
+                session.exec(
+                    select(func.count())
+                    .select_from(ExternalRawTrack)
+                    .where(
+                        ExternalRawTrack.dir_name == dir_name,
+                        ExternalRawTrack.meta_status == META_VERIFIED,
+                        col(ExternalRawTrack.match_status) != MATCH_MATCHED,
+                    )
+                ).one()
             )
-            return len(list(session.exec(stmt).all()))
 
     def list_meta_verified_unmatched(self, dir_name: str) -> list[ExternalRawTrack]:
         with Session(self._engine) as session:
@@ -484,6 +934,7 @@ class ExternalLibraryRepository:
             row.video_id = video_id
             row.match_status = MATCH_MATCHED
             row.match_confidence = confidence
+            row.ytm_attempted_at = datetime.now(UTC)
             row.match_fail_count = 0
             row.match_next_eligible_at = None
             row.updated_at = datetime.now(UTC)
@@ -504,6 +955,7 @@ class ExternalLibraryRepository:
             row.match_fail_count += 1
             row.match_status = MATCH_REJECTED if rejected else MATCH_PENDING
             row.match_next_eligible_at = next_eligible_at
+            row.ytm_attempted_at = datetime.now(UTC)
             row.updated_at = datetime.now(UTC)
             session.add(row)
             session.commit()
@@ -519,11 +971,60 @@ class ExternalLibraryRepository:
             row.match_next_eligible_at = None
             row.video_id = None
             row.match_confidence = None
+            row.ytm_attempted_at = None
             row.updated_at = datetime.now(UTC)
             session.add(row)
             session.commit()
             session.refresh(row)
             return row
+
+    def pending_processing_count(self, dir_name: str, *, now: datetime) -> int:
+        """Count work eligible for the configured playlist's media scan."""
+        with Session(self._engine) as session:
+            inventory = int(
+                session.exec(
+                    select(func.count())
+                    .select_from(ExternalFileInventory)
+                    .where(
+                        ExternalFileInventory.dir_name == dir_name,
+                        ExternalFileInventory.metadata_indexed == False,  # noqa: E712
+                    )
+                ).one()
+            )
+            ytm = int(
+                session.exec(
+                    select(func.count())
+                    .select_from(ExternalRawTrack)
+                    .where(
+                        ExternalRawTrack.dir_name == dir_name,
+                        ExternalRawTrack.match_status != MATCH_MATCHED,
+                        col(ExternalRawTrack.ytm_attempted_at).is_(None),
+                        (
+                            col(ExternalRawTrack.match_next_eligible_at).is_(None)
+                            | (ExternalRawTrack.match_next_eligible_at <= now)
+                        ),
+                    )
+                ).one()
+            )
+            meta = int(
+                session.exec(
+                    select(func.count())
+                    .select_from(ExternalRawTrack)
+                    .where(
+                        ExternalRawTrack.dir_name == dir_name,
+                        ExternalRawTrack.match_status != MATCH_MATCHED,
+                        col(ExternalRawTrack.meta_attempted_at).is_(None),
+                        ExternalRawTrack.title != "",
+                        ExternalRawTrack.artists != "",
+                        ExternalRawTrack.album != "",
+                        (
+                            col(ExternalRawTrack.meta_next_eligible_at).is_(None)
+                            | (ExternalRawTrack.meta_next_eligible_at <= now)
+                        ),
+                    )
+                ).one()
+            )
+        return inventory + ytm + meta
 
     def refresh_all_norms(self) -> int:
         """Recompute norm keys from stored tags (no file I/O). Returns rows changed."""

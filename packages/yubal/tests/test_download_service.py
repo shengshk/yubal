@@ -255,8 +255,8 @@ class TestDownloadService:
         service.download_track(sample_track)
 
         _, output_path = mock_downloader.downloads[0]
-        # Check path structure: base/Direct/Artist/YEAR - Album/Artist - Title
-        assert "Direct" in str(output_path)
+        # Check path structure: base/direct/Artist/YEAR - Album/Artist - Title
+        assert "direct" in str(output_path)
         assert "Test Artist" in str(output_path)
         assert "2024 - Test Album" in str(output_path)
         assert "Test Artist - Test Song" in str(output_path)
@@ -422,7 +422,7 @@ class TestDownloadService:
 
         assert result.status == DownloadStatus.SUCCESS
         _, output_path = mock_downloader.downloads[0]
-        assert "Unmatched" in str(output_path)
+        assert "unmatched" in str(output_path)
         assert "Wiz Khalifa - Mercury Retrograde [omv123]" in str(output_path)
 
     def test_download_unofficial_track_routes_to_unofficial_folder(
@@ -430,7 +430,7 @@ class TestDownloadService:
         download_config: DownloadConfig,
         tmp_path: Path,
     ) -> None:
-        """Should route unofficial (UGC) tracks to Unofficial/ folder."""
+        """Should route unofficial (UGC) tracks to unofficial/ folder."""
         track = TrackMetadata(
             source_video_id="ugc123",
             omv_video_id=None,
@@ -449,7 +449,7 @@ class TestDownloadService:
 
         assert result.status == DownloadStatus.SUCCESS
         _, output_path = mock_downloader.downloads[0]
-        assert "Unofficial" in str(output_path)
+        assert "unofficial" in str(output_path)
         assert "Some User - User Upload [ugc123]" in str(output_path)
 
     def test_track_metadata_match_result_defaults_to_matched(
@@ -641,7 +641,7 @@ class TestDownloadConfig:
         """Should have sensible defaults."""
         config = DownloadConfig(base_path=tmp_path)
 
-        assert config.codec == AudioCodec.OPUS
+        assert config.codec == AudioCodec.MP3
         assert config.quality == 0
         assert config.quiet is True
 

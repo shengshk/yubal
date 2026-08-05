@@ -133,3 +133,23 @@ def test_sync_all_records_each_pipeline_step(mock_settings: MagicMock) -> None:
     assert scheduler.last_manual_sync_steps[1]["status"] == "queued"
     assert scheduler.last_manual_sync_steps[1]["count"] == 1
     assert scheduler.last_manual_sync_steps[2]["status"] == "queued"
+
+
+@pytest.mark.asyncio
+async def test_manual_sync_returns_after_directory_registration(
+    mock_settings: MagicMock,
+) -> None:
+    """The API path must not wait for the complete library cycle."""
+    scheduler = Scheduler(MagicMock(), MagicMock(), mock_settings)
+    scheduler._mark_external_playlists_queued = MagicMock(return_value=3)
+    scheduler.run_unified_sync = MagicMock(return_value=[])
+
+    job_ids, steps = await scheduler.queue_manual_sync()
+
+    assert job_ids == []
+    assert steps[3] == {"key": "external", "status": "queued", "count": 3}
+    task = scheduler._manual_sync_task
+    assert task is not None
+    await task
+    scheduler._mark_external_playlists_queued.assert_called_once_with()
+    scheduler.run_unified_sync.assert_called_once_with(source="sync_all")

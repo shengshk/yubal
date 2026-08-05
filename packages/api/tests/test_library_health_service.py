@@ -39,3 +39,11 @@ def test_stable_health_poll_persists_only_once(
     assert service.check().ok
     assert service.check().ok
     assert writes == 1
+
+
+def test_scoped_delete_guard_uses_playlist_baseline() -> None:
+    assert LibraryHealthService.allow_scoped_index_deletes(42, 42)
+    assert LibraryHealthService.allow_scoped_index_deletes(42, 80)
+    assert not LibraryHealthService.allow_scoped_index_deletes(42, 100)
+    assert not LibraryHealthService.allow_scoped_index_deletes(0, 42)
+    assert LibraryHealthService.allow_scoped_index_deletes(0, 5)

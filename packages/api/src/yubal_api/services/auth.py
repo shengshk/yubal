@@ -146,7 +146,11 @@ class AuthManager:
                 setup_expires_at=expires,
             )
 
-        username = self._session_username(cookie_value) if self.valid_session(cookie_value) else ""
+        username = (
+            self._session_username(cookie_value)
+            if self.valid_session(cookie_value)
+            else ""
+        )
         return AuthStatus(
             enabled=True,
             authenticated=bool(username),
@@ -177,7 +181,11 @@ class AuthManager:
         password_hash = bcrypt.hashpw(
             password.encode("utf-8"), bcrypt.gensalt()
         ).decode("utf-8")
-        secret = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii").rstrip("=")
+        secret = (
+            base64.urlsafe_b64encode(secrets.token_bytes(32))
+            .decode("ascii")
+            .rstrip("=")
+        )
 
         with self._lock:
             if self._username:
@@ -218,6 +226,35 @@ class AuthManager:
 
         cookie = self.make_session_cookie(stored_user, remember=remember)
         return True, "", cookie
+
+    def verify_password(self, password: str) -> bool:
+        """Verify the current account password without creating a session."""
+        if not self._enabled:
+            return True
+        with self._lock:
+            stored_hash = self._password_hash
+        if not stored_hash or not password:
+            return False
+        try:
+            return bcrypt.checkpw(
+                password.encode("utf-8"),
+                stored_hash.encode("utf-8"),
+            )
+        except ValueError:
+            return False
+
+    def reset_for_setup(self) -> None:
+        """Forget the current account and reopen the registration window."""
+        with self._lock:
+            try:
+                self._auth_file.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning("Failed to remove auth file: %s", exc)
+                raise
+            self._username = ""
+            self._password_hash = ""
+            self._secret = b""
+            self._setup_deadline = datetime.now(UTC) + SETUP_WINDOW
 
     def valid_session(self, cookie_value: str | None) -> bool:
         return bool(self._session_username(cookie_value))

@@ -39,6 +39,7 @@ def test_playlist_scope_uses_domain_flow_then_verified_enrichment() -> None:
     assert result.matched == 1
     assert result.enriched == 1
     assert result.upgraded == 1
+    external.sync_playlists_from_disk.assert_called_once_with()
     external.sync_playlist.assert_called_once_with(
         "TEST",
         service._library_health,

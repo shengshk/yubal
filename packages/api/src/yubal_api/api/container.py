@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from fastapi import Request
 
 from yubal_api.services.external_library_service import ExternalLibraryService
+from yubal_api.services.factory_reset_service import FactoryResetService
 from yubal_api.services.job_event_bus import JobEventBus
 from yubal_api.services.job_executor import JobExecutor
 from yubal_api.services.job_store import JobStore
@@ -75,6 +76,7 @@ class Services:
     telegram_bot: TelegramBotService
     playlist_info: PlaylistInfoService
     wanted_service: WantedService
+    factory_reset: FactoryResetService
 
     def close(self) -> None:
         """Clean up resources. Called at application shutdown."""

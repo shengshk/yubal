@@ -251,10 +251,15 @@ class TrackRetagService:
             "track_number",
         }
         wants_tag_edit = any(k in fields for k in tag_keys)
-        if record.immutable and wants_tag_edit:
+        mutates_assets = (
+            "lyrics" in fields
+            or bool(fields.get("refresh_cover"))
+            or "cover_url" in fields
+        )
+        if record.immutable and (wants_tag_edit or mutates_assets):
             raise TrackImmutableError(
                 f"Track {video_id} is sourced from a read-only External "
-                "playlist and cannot be retagged"
+                "playlist and cannot be modified"
             )
 
         locations = self._catalog.list_locations_for_video(video_id)
@@ -276,7 +281,8 @@ class TrackRetagService:
         warnings: list[str] = []
 
         planned: list[tuple[TrackLocation, Path, Path, str, str]] = []
-        tag_source: Path | None = None
+        tag_sources: list[Path] = []
+        seen_tag_sources: set[Path] = set()
 
         for loc in locations:
             folder = loc.save_folder.strip().replace("\\", "/").rstrip("/")
@@ -293,8 +299,10 @@ class TrackRetagService:
             if not src.is_file():
                 warnings.append(f"missing file: {folder}/{old_rel}")
                 continue
-            if tag_source is None:
-                tag_source = src
+            source_key = src.resolve()
+            if source_key not in seen_tag_sources:
+                seen_tag_sources.add(source_key)
+                tag_sources.append(src)
             suffix = src.suffix.lower()
             if suffix not in AUDIO_SUFFIXES:
                 suffix = src.suffix
@@ -326,7 +334,7 @@ class TrackRetagService:
                 )
             planned.append((loc, src, dest, old_rel, new_rel))
 
-        if tag_source is None:
+        if not tag_sources:
             raise FileNotFoundError(f"no on-disk file for: {video_id}")
 
         cover_bytes: bytes | None = None
@@ -343,32 +351,55 @@ class TrackRetagService:
         try:
             if record.immutable or not wants_tag_edit:
                 # Assets-only: embed cover / lyrics without rewriting text tags.
-                if cover_bytes:
-                    from mediafile import Image, MediaFile
+                for tag_source in tag_sources:
+                    if cover_bytes:
+                        from mediafile import Image, MediaFile
 
-                    audio = MediaFile(tag_source)
-                    audio.images = [Image(data=cover_bytes)]
-                    audio.save()
-                if apply_lyrics and new_lyrics:
-                    write_embedded_lyrics(tag_source, new_lyrics)
+                        audio = MediaFile(tag_source)
+                        audio.images = [Image(data=cover_bytes)]
+                        audio.save()
+                    if apply_lyrics and new_lyrics:
+                        write_embedded_lyrics(tag_source, new_lyrics)
             else:
-                self._tagger.apply_metadata_tags(
-                    tag_source,
-                    track_meta,
-                    cover=cover_bytes,
-                    lyrics=lyrics_for_tag,
-                )
+                # A YTM record can have separate physical copies (cross-device
+                # fallback cannot hardlink).  Retag every distinct inode, not
+                # just the first catalog location.
+                for tag_source in tag_sources:
+                    self._tagger.apply_metadata_tags(
+                        tag_source,
+                        track_meta,
+                        cover=cover_bytes,
+                        lyrics=lyrics_for_tag,
+                    )
         except Exception as e:
             logger.exception("Failed to tag %s during retag: %s", video_id, e)
             raise
 
         location_updates: list[TrackLocationUpdate] = []
         final_paths: list[Path] = []
+        moved_audio: list[tuple[Path, Path]] = []
         for loc, src, dest, old_rel, new_rel in planned:
             folder = loc.save_folder.strip().replace("\\", "/").rstrip("/")
             if src.resolve() != dest.resolve():
                 dest.parent.mkdir(parents=True, exist_ok=True)
-                os.rename(src, dest)
+                try:
+                    os.rename(src, dest)
+                except OSError:
+                    # Catalog writes happen after this loop. Restore earlier
+                    # physical moves as well, so a later collision cannot
+                    # leave the DB pointing at paths that no longer exist.
+                    for original, moved in reversed(moved_audio):
+                        try:
+                            if moved.is_file() and not original.exists():
+                                os.rename(moved, original)
+                        except OSError:
+                            logger.exception(
+                                "Could not roll back retag move %s -> %s",
+                                moved,
+                                original,
+                            )
+                    raise
+                moved_audio.append((src, dest))
                 src_lrc = src.with_suffix(".lrc")
                 dest_lrc = dest.with_suffix(".lrc")
                 if src_lrc.is_file():
@@ -395,6 +426,11 @@ class TrackRetagService:
                     )
                 )
             final_paths.append(dest if dest.is_file() else src)
+
+        # Do not advance catalog paths one by one during physical renames.
+        # If a later rename fails, the DB remains at the old, truthful paths.
+        for loc, _src, _dest, _old_rel, new_rel in planned:
+            folder = loc.save_folder.strip().replace("\\", "/").rstrip("/")
             self._catalog.upsert_location(
                 video_id=video_id,
                 save_folder=folder,
@@ -452,7 +488,7 @@ class TrackRetagService:
         )
 
         index = TrackFileIndex(self._data_path)
-        final_path = tag_source
+        final_path = tag_sources[0]
         for path in final_paths:
             if path.is_file():
                 final_path = path

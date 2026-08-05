@@ -12,7 +12,7 @@ from yubal_api.api.deps import (
     ExternalLibraryServiceDep,
     LibraryHealthServiceDep,
     PreferencesStoreDep,
-    SyncPipelineServiceDep,
+    SchedulerDep,
 )
 from yubal_api.services.external_library_service import (
     DeletePlaylistResult,
@@ -40,11 +40,18 @@ def _ensure_external_enabled(prefs: PreferencesStore) -> None:
 class ExternalPlaylistResponse(BaseModel):
     dir_name: str
     allow_mutate: bool
+    access_mode: Literal["pending", "readonly", "managed"] = "pending"
+    access_mode_locked: bool = False
+    source_mutated_at: datetime | None = None
+    source_mutation_kind: str | None = None
     show_raw: bool
     show_junk: bool
+    inventory_scanned: bool = False
     unmatched_count: int
     matched_count: int
     meta_verified_count: int = 0
+    meta_rejected_count: int = 0
+    meta_rejected_mutable_count: int = 0
     cloud: int
     local: int
     offline: int
@@ -65,6 +72,7 @@ class ExternalPlaylistResponse(BaseModel):
 
 class PlaylistSettingsUpdate(BaseModel):
     allow_mutate: bool | None = Field(default=None)
+    access_mode: Literal["pending", "readonly", "managed"] | None = None
     show_raw: bool | None = Field(default=None)
     show_junk: bool | None = Field(default=None)
     enabled: bool | None = Field(default=None)
@@ -76,6 +84,14 @@ class PlaylistSettingsUpdate(BaseModel):
         default=None, pattern="^(delete|archive)$"
     )
     offline_cleanup_delay_hours: int | None = Field(default=None, ge=0, le=8760)
+
+
+class PendingPlaylistActivationRequest(BaseModel):
+    access_mode: Literal["readonly", "managed"]
+
+
+class PendingPlaylistActivationResponse(BaseModel):
+    activated: int
 
 
 class ScanResponse(BaseModel):
@@ -121,6 +137,7 @@ class SyncPlaylistResponse(BaseModel):
     enriched: int = 0
     upgraded: int = 0
     asset_errors: int = 0
+    queued: bool = False
 
 
 class DeletePlaylistResponse(BaseModel):
@@ -129,6 +146,7 @@ class DeletePlaylistResponse(BaseModel):
     deleted_raw: int
     moved: int
     reset_matches: int
+    skipped_readonly: int = 0
     errors: int
 
 
@@ -216,17 +234,32 @@ class ExternalTrackResponse(BaseModel):
     meta_source: str | None = None
     meta_source_id: str | None = None
     meta_source_url: str | None = None
+    can_mutate: bool = False
+
+
+class ExternalTrackListResponse(BaseModel):
+    total: int
+    offset: int
+    next_offset: int | None
+    items: list[ExternalTrackResponse]
 
 
 def _to_playlist_response(v: ExternalPlaylistView) -> ExternalPlaylistResponse:
     return ExternalPlaylistResponse(
         dir_name=v.dir_name,
         allow_mutate=v.allow_mutate,
+        access_mode=v.access_mode,  # type: ignore[arg-type]
+        access_mode_locked=v.access_mode_locked,
+        source_mutated_at=v.source_mutated_at,
+        source_mutation_kind=v.source_mutation_kind,
         show_raw=v.show_raw,
         show_junk=v.show_junk,
+        inventory_scanned=v.inventory_scanned,
         unmatched_count=v.unmatched_count,
         matched_count=v.matched_count,
         meta_verified_count=v.meta_verified_count,
+        meta_rejected_count=v.meta_rejected_count,
+        meta_rejected_mutable_count=v.meta_rejected_mutable_count,
         cloud=v.cloud,
         local=v.local,
         offline=v.offline,
@@ -290,6 +323,7 @@ def _to_delete_playlist_response(r: DeletePlaylistResult) -> DeletePlaylistRespo
         deleted_raw=r.deleted_raw,
         moved=r.moved,
         reset_matches=r.reset_matches,
+        skipped_readonly=r.skipped_readonly,
         errors=r.errors,
     )
 
@@ -318,6 +352,7 @@ def _to_track_response(v: PlaylistTrackView) -> ExternalTrackResponse:
         meta_source=v.meta_source,
         meta_source_id=v.meta_source_id,
         meta_source_url=v.meta_source_url,
+        can_mutate=v.can_mutate,
     )
 
 
@@ -328,21 +363,27 @@ def list_playlists(
 ) -> list[ExternalPlaylistResponse]:
     if not prefs.effective().external_library_enabled:
         return []
+    # Keep the UI directory list in sync with External/Raw without walking
+    # the audio tree. Full indexing and matching remain explicit sync work.
+    service.sync_playlists_from_disk()
     return [_to_playlist_response(v) for v in service.list_playlists()]
 
 
 @router.patch("/playlists/{dir_name}", response_model=ExternalPlaylistResponse)
-def update_playlist_settings(
+async def update_playlist_settings(
     dir_name: str,
     body: PlaylistSettingsUpdate,
     service: ExternalLibraryServiceDep,
     prefs: PreferencesStoreDep,
+    scheduler: SchedulerDep,
 ) -> ExternalPlaylistResponse:
     _ensure_external_enabled(prefs)
+    previous = service.get_playlist_view(dir_name)
     try:
         playlist = service.update_playlist_settings(
             dir_name,
             allow_mutate=body.allow_mutate,
+            access_mode=body.access_mode,
             show_raw=body.show_raw,
             show_junk=body.show_junk,
             enabled=body.enabled,
@@ -360,7 +401,53 @@ def update_playlist_settings(
     view = service.get_playlist_view(dir_name)
     if view is None:
         raise HTTPException(status_code=404, detail=f"playlist not found: {dir_name}")
+    if (
+        body.enabled is not None
+        or body.sync_jitter_seconds is not None
+        or body.access_mode is not None
+    ):
+        scheduler.invalidate_external_plan(dir_name)
+    if (
+        previous is not None
+        and previous.access_mode == "pending"
+        and view.access_mode != "pending"
+    ):
+        await scheduler.queue_external_playlist_sync(
+            dir_name,
+            enrich=False,
+            raw_match=True,
+            verify_meta=True,
+            junk_match=False,
+            scan_first=True,
+            drain=True,
+        )
     return _to_playlist_response(view)
+
+
+@router.patch(
+    "/activate-pending",
+    response_model=PendingPlaylistActivationResponse,
+)
+async def activate_pending_playlists(
+    body: PendingPlaylistActivationRequest,
+    service: ExternalLibraryServiceDep,
+    prefs: PreferencesStoreDep,
+    scheduler: SchedulerDep,
+) -> PendingPlaylistActivationResponse:
+    """Classify every newly discovered external folder in one action."""
+    _ensure_external_enabled(prefs)
+    names = service.activate_pending_playlist_names(body.access_mode)
+    for dir_name in names:
+        await scheduler.queue_external_playlist_sync(
+            dir_name,
+            enrich=False,
+            raw_match=True,
+            verify_meta=True,
+            junk_match=False,
+            scan_first=True,
+            drain=True,
+        )
+    return PendingPlaylistActivationResponse(activated=len(names))
 
 
 @router.get("/playlists/{dir_name}/tracks", response_model=list[ExternalTrackResponse])
@@ -377,10 +464,43 @@ def list_playlist_tracks(
     ]
 
 
+@router.get(
+    "/playlists/{dir_name}/tracks/page",
+    response_model=ExternalTrackListResponse,
+)
+def list_playlist_tracks_page(
+    dir_name: str,
+    service: ExternalLibraryServiceDep,
+    prefs: PreferencesStoreDep,
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=100, ge=20, le=200),
+    show_raw: bool | None = None,
+    refresh: bool = False,
+) -> ExternalTrackListResponse:
+    """Return one stable external-track page for large playlist expansion."""
+    _ensure_external_enabled(prefs)
+    if refresh:
+        service.invalidate_track_page_cache(dir_name)
+    total, rows = service.list_playlist_tracks_page(
+        dir_name,
+        offset=offset,
+        limit=limit,
+        sort_key=prefs.effective().track_sort_key,
+        show_raw=show_raw,
+    )
+    next_offset = offset + len(rows)
+    return ExternalTrackListResponse(
+        total=total,
+        offset=offset,
+        next_offset=next_offset if rows and next_offset < total else None,
+        items=[_to_track_response(row) for row in rows],
+    )
+
+
 @router.post("/playlists/{dir_name}/sync", response_model=SyncPlaylistResponse)
 async def sync_playlist(
     dir_name: str,
-    pipeline: SyncPipelineServiceDep,
+    scheduler: SchedulerDep,
     prefs: PreferencesStoreDep,
     body: SyncPlaylistRequest | None = None,
 ) -> SyncPlaylistResponse:
@@ -394,10 +514,8 @@ async def sync_playlist(
             ),
         )
     try:
-        result = await asyncio.to_thread(
-            pipeline.sync_external_playlist,
+        queued = await scheduler.queue_external_playlist_sync(
             dir_name,
-            trigger="playlist",
             enrich=req.enrich,
             raw_match=req.raw_match,
             verify_meta=req.verify_meta,
@@ -405,9 +523,23 @@ async def sync_playlist(
         )
     except ValueError as e:
         detail = str(e)
-        code = 400 if "at least one of" in detail else 404
+        code = (
+            409
+            if "access mode is pending" in detail
+            else 400
+            if "at least one of" in detail
+            else 404
+        )
         raise HTTPException(status_code=code, detail=detail) from e
-    return _to_sync_playlist_response(result)
+    return SyncPlaylistResponse(
+        matched=0,
+        recovered=0,
+        checked=0,
+        errors=0,
+        deferred=0,
+        rejected=0,
+        queued=queued,
+    )
 
 
 @router.delete("/playlists/{dir_name}", response_model=DeletePlaylistResponse)
@@ -422,23 +554,27 @@ async def delete_playlist(
             "^(forget_matched|"
             "delete_matched|move_matched_to_direct|add_matched_to_direct|"
             "add_meta_verified_to_wanted|"
-            "delete_unmatched|delete_all|"
+            "delete_unmatched|archive_meta_rejected|delete_meta_rejected|delete_all|"
             "clear_offline_delete|clear_offline_to_raw_delete)$"
         ),
     ),
-    direct_folder: str = Query(default="direct"),
 ) -> DeletePlaylistResponse:
     _ensure_external_enabled(prefs)
     if not confirm:
         raise HTTPException(status_code=400, detail="confirm=true required")
     try:
         result = await asyncio.to_thread(
-            service.delete_playlist, dir_name, mode, direct_folder=direct_folder
+            service.delete_playlist,
+            dir_name,
+            mode,
+            direct_folder=prefs.effective().direct_folder,
         )
     except ValueError as e:
         detail = str(e)
         code = 400 if "read-only" in detail or "unknown delete" in detail else 404
         raise HTTPException(status_code=code, detail=detail) from e
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
     except RuntimeError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     return _to_delete_playlist_response(result)
@@ -446,16 +582,31 @@ async def delete_playlist(
 
 @router.post("/scan", response_model=ScanResponse)
 async def scan_external(
-    service: ExternalLibraryServiceDep,
     health: LibraryHealthServiceDep,
     prefs: PreferencesStoreDep,
+    scheduler: SchedulerDep,
+    service: ExternalLibraryServiceDep,
 ) -> ScanResponse:
-    """Scan External/Raw for new/changed/removed files (raises 503 if unhealthy)."""
+    """Reconcile files, then process every new/changed configured item."""
     _ensure_external_enabled(prefs)
     try:
-        result = await asyncio.to_thread(service.scan_raw, health)
+        result = await asyncio.to_thread(
+            scheduler.reconcile_external_inventory,
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
+    if result is None:
+        raise HTTPException(status_code=503, detail="External library is unavailable")
+    for dir_name in service.configured_playlist_names():
+        await scheduler.queue_external_playlist_sync(
+            dir_name,
+            enrich=False,
+            raw_match=True,
+            verify_meta=True,
+            junk_match=False,
+            scan_first=False,
+            drain=True,
+        )
     return _to_scan_response(result)
 
 

@@ -82,6 +82,7 @@ class SubscriptionService:
         self._gate = None
         self._job_executor = None
         self._membership = None
+        self._media_changed = None
 
     def bind_maintenance(self, gate: Any, job_executor: Any) -> None:
         """Wire OperationGate + JobExecutor for exclusive save-folder moves."""
@@ -91,6 +92,13 @@ class SubscriptionService:
     def bind_membership(self, membership_service: Any) -> None:
         """Wire membership reconciler for reference-safe file operations."""
         self._membership = membership_service
+
+    def bind_media_changed(self, callback: Any) -> None:
+        self._media_changed = callback
+
+    def _notify_media_changed(self) -> None:
+        if callable(self._media_changed):
+            self._media_changed()
 
     def list(
         self,
@@ -194,7 +202,6 @@ class SubscriptionService:
                         subscription_id,
                         old_folder,
                         new_folder,
-                        confirm=confirm_folder_move,
                     ),
                 )
 
@@ -230,29 +237,37 @@ class SubscriptionService:
             raise SubscriptionNotFoundError(subscription.id)
         return updated
 
+    def rate_liked_song(
+        self,
+        subscription_id: UUID,
+        video_id: str,
+        *,
+        liked: bool,
+    ) -> Subscription:
+        """Change an account Like, restricted to the special Liked Music list."""
+        subscription = self.get(subscription_id)
+        if not is_liked_music_url(subscription.url):
+            raise SubscriptionConflictError(
+                "Only the Liked Music subscription can change YTM likes.",
+                subscription_id=subscription_id,
+            )
+        self.prepare_for_sync(subscription)
+        self._playlist_info.rate_song(video_id, liked=liked)
+        return subscription
+
     def _migrate_save_folder(
         self,
         subscription_id: UUID,
         old_folder: str,
         new_folder: str,
-        *,
-        confirm: bool,
     ) -> None:
         if self._data_path is None:
             return
-
-        rewrite_track_index_prefix(self._data_path, old_folder, new_folder)
 
         old_path = self._data_path / old_folder
         new_path = self._data_path / new_folder
         new_path.parent.mkdir(parents=True, exist_ok=True)
 
-        sub = self.get(subscription_id)
-        members = (
-            self._membership.list_membership(subscription_id)
-            if self._membership is not None
-            else []
-        )
         others_on_old = [
             other
             for other in self.list()
@@ -266,75 +281,30 @@ class SubscriptionService:
             and (other.save_folder or other.name) == new_folder
         ]
 
-        # Shared folders (source or destination) must use membership moves.
-        if members and (others_on_old or others_on_new or _dir_has_entries(new_path)):
-            if others_on_new and not confirm and _dir_has_entries(new_path):
-                raise FolderConflictError(
-                    f"Target folder already has files: {new_folder}. "
-                    "Confirm to merge membership into the existing folder.",
-                    save_folder=new_folder,
-                    subscription_id=subscription_id,
-                )
-            if self._membership is not None:
-                moved = self._membership.migrate_save_folder(
-                    sub, old_folder, new_folder
-                )
-                logger.info(
-                    "Migrated %d membership files: %s -> %s",
-                    moved,
-                    old_folder,
-                    new_folder,
-                )
-            return
-
-        if not old_path.exists():
-            return
-
-        if not _dir_has_entries(new_path):
-            if new_path.exists() and new_path.is_dir():
-                try:
-                    new_path.rmdir()
-                except OSError:
-                    pass
-            new_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(old_path), str(new_path))
-            if self._membership is not None:
-                self._membership.rewrite_catalog_folder(old_folder, new_folder)
-            logger.info("Renamed save folder: %s -> %s", old_folder, new_folder)
-            return
-
-        if not confirm:
+        # Subscription paths are the only editable paths, but they remain
+        # exclusive.  No shared-folder split and no merge mode: the target
+        # must be empty so a rename has one unambiguous physical outcome.
+        if others_on_old or others_on_new:
             raise FolderConflictError(
-                f"Target folder already has files: {new_folder}. "
-                "Confirm to merge into the existing folder.",
+                "Subscription folders must be exclusive; choose an unused folder.",
                 save_folder=new_folder,
                 subscription_id=subscription_id,
             )
-
-        if self._membership is not None and members:
-            moved = self._membership.migrate_save_folder(sub, old_folder, new_folder)
-            logger.info(
-                "Merged %d membership files: %s -> %s",
-                moved,
-                old_folder,
-                new_folder,
+        if _dir_has_entries(new_path):
+            raise FolderConflictError(
+                f"Target folder must be empty: {new_folder}.",
+                save_folder=new_folder,
+                subscription_id=subscription_id,
             )
-            return
-
-        # Legacy fallback before the first trusted sync has populated membership.
-        for item in old_path.iterdir():
-            target = new_path / item.name
-            if item.is_dir():
-                continue
-            if target.exists():
-                logger.info("Keeping existing file during folder merge: %s", target)
-                continue
-            shutil.move(str(item), str(target))
-        try:
-            old_path.rmdir()
-        except OSError:
-            logger.warning("Could not remove old save folder (not empty): %s", old_path)
-        logger.info("Merged save folder: %s -> %s", old_folder, new_folder)
+        if old_path.exists():
+            if new_path.exists():
+                new_path.rmdir()
+            shutil.move(str(old_path), str(new_path))
+        if self._membership is not None:
+            self._membership.rewrite_catalog_folder(old_folder, new_folder)
+        rewrite_track_index_prefix(self._data_path, old_folder, new_folder)
+        self._notify_media_changed()
+        logger.info("Renamed save folder: %s -> %s", old_folder, new_folder)
 
     def count(
         self,

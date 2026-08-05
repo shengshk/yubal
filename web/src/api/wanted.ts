@@ -10,6 +10,8 @@ export type WantedPlaylistDeleteMode = "wipe_list" | "to_raw_delete";
 
 export type WantedSummary = {
   total_count: number;
+  local_heart_count: number;
+  recovery_count: number;
   matched_file_count: number;
   unmatched_count: number;
   exclusive_count: number;

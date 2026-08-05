@@ -198,9 +198,9 @@ class TestCronExpression:
         assert errors[0]["loc"] == ("scheduler_cron",)
 
     def test_default_cron_expression(self) -> None:
-        """Should use daily at midnight as default."""
+        """Should use hourly sync as default."""
         settings = _create_settings()
-        assert settings.scheduler_cron == "0 0 * * *"
+        assert settings.scheduler_cron == "0 * * * *"
 
 
 class TestBasePath:

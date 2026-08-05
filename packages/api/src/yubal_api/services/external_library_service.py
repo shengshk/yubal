@@ -20,12 +20,14 @@ import re
 import shutil
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from yubal.client import YTMusicClient, YTMusicProtocol
 from yubal.config import APIConfig
+from yubal.exceptions import UpstreamAPIError
 from yubal.lib.matching import (
     extract_base_title,
     has_version_marker,
@@ -62,6 +64,9 @@ from yubal.utils.normalize_text import (
 )
 
 from yubal_api.db.external_library import (
+    EXTERNAL_ACCESS_MANAGED,
+    EXTERNAL_ACCESS_MODES,
+    EXTERNAL_ACCESS_PENDING,
     MATCH_MATCHED,
     MATCH_REJECTED,
     MATCH_UNMATCHED,
@@ -74,6 +79,7 @@ from yubal_api.db.external_library_repository import ExternalLibraryRepository
 from yubal_api.db.track_catalog import (
     LocationMembershipStatus,
     TrackLocation,
+    TrackRecord,
 )
 from yubal_api.db.track_catalog_repository import TrackCatalogRepository
 from yubal_api.services.library_health_service import LibraryHealthService
@@ -92,6 +98,11 @@ _MATCH_ARTIST_THRESHOLD = 62.0
 # ``match_backoff_cap_days`` (default 7). Cap comes from preferences.
 _BACKOFF_STEP_SECONDS = 86400
 _DEFAULT_BACKOFF_CAP_DAYS = 7
+
+# Background matching can issue several YTM searches for one local file. Keep
+# all automatic matching on this service instance to a conservative shared pace.
+_YTM_AUTO_MATCH_MIN_INTERVAL_SECONDS = 1.0
+_INVENTORY_WRITE_BATCH = 500
 
 
 @dataclass
@@ -178,7 +189,11 @@ def _search_title(title: str) -> str:
     raw = (title or "").strip()
     if not raw:
         return ""
-    cleaned = re.sub(r"\s*[\(（\[【][^）\)\]】]*[\)）\]】]\s*", " ", raw)
+    cleaned = re.sub(
+        r"\s*[\(（\[【][^）\)\]】]*[\)）\]】]\s*",  # noqa: RUF001
+        " ",
+        raw,
+    )
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     if cleaned:
         return cleaned
@@ -208,6 +223,7 @@ class DeletePlaylistResult:
     deleted_raw: int = 0
     moved: int = 0
     reset_matches: int = 0
+    skipped_readonly: int = 0
     errors: int = 0
 
 
@@ -242,17 +258,25 @@ class PlaylistTrackView:
     meta_source: str | None = None
     meta_source_id: str | None = None
     meta_source_url: str | None = None
+    can_mutate: bool = False
 
 
 @dataclass
 class ExternalPlaylistView:
     dir_name: str
     allow_mutate: bool
+    access_mode: str
+    access_mode_locked: bool
+    source_mutated_at: datetime | None
+    source_mutation_kind: str | None
     show_raw: bool
     show_junk: bool
+    inventory_scanned: bool
     unmatched_count: int
     matched_count: int
     meta_verified_count: int
+    meta_rejected_count: int
+    meta_rejected_mutable_count: int
     cloud: int
     local: int
     offline: int
@@ -319,7 +343,14 @@ def _is_strictly_better(a_key: tuple, b_key: tuple) -> bool:
     return a_key[:4] > b_key[:4]
 
 
-def _read_raw_tags(path: Path, rel_path: str, dir_name: str) -> ExternalRawTrack | None:
+def _read_raw_tags(
+    path: Path,
+    rel_path: str,
+    dir_name: str,
+    *,
+    origin_kind: str = "",
+    origin_ref: str = "",
+) -> ExternalRawTrack | None:
     """Probe one audio file's tags into an ExternalRawTrack row."""
     try:
         from mediafile import MediaFile
@@ -405,6 +436,8 @@ def _read_raw_tags(path: Path, rel_path: str, dir_name: str) -> ExternalRawTrack
     return ExternalRawTrack(
         rel_path=rel_path,
         dir_name=dir_name,
+        origin_kind=origin_kind,
+        origin_ref=origin_ref,
         mtime_ns=getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)),
         size=st.st_size,
         inode=getattr(st, "st_ino", None),
@@ -457,7 +490,23 @@ class ExternalLibraryService:
         self._track_index = track_index or TrackFileIndex(DOWNLOAD_ROOT)
         self._enrichment = enrichment
         self._wanted: object | None = None
-        self._lock = threading.Lock()
+        self._media_changed: Callable[[], None] | None = None
+        # Discovery, legacy reconciliation and Raw mutations can be reached
+        # from both the list API and a sync job.  Reentrancy is required
+        # because scan_raw performs discovery under the same operation lock.
+        self._lock = threading.RLock()
+        self._inventory_lock = threading.Lock()
+        self._inventory_worker_running = False
+        self._track_page_cache: dict[
+            tuple[str, bool | None, str], tuple[float, list[PlaylistTrackView]]
+        ] = {}
+        self._ytm_auto_match_lock = threading.Lock()
+        self._ytm_auto_match_next_at = 0.0
+        # Injected clients are test/manual adapters; the production client is
+        # always throttled. This also keeps existing deterministic tests fast.
+        self._ytm_auto_match_interval = (
+            0.0 if ytmusic_client is not None else _YTM_AUTO_MATCH_MIN_INTERVAL_SECONDS
+        )
 
     def bind_enrichment(self, enrichment: object | None) -> None:
         """Optional LibraryEnrichmentService for per-playlist enrich during sync."""
@@ -467,18 +516,58 @@ class ExternalLibraryService:
         """Optional WantedService for migrating meta-verified unmatched rows."""
         self._wanted = wanted
 
+    def bind_media_changed(self, callback: Callable[[], None] | None) -> None:
+        """Mark global statistics stale after a background inventory completes."""
+        self._media_changed = callback
+
     def clear_match_cooldowns(self, *, include_rejected: bool = False) -> int:
         """Clear match backoff (and optionally requeue rejected junk)."""
         return self._repository.clear_match_cooldowns(include_rejected=include_rejected)
 
+    def find_strict_raw_path(
+        self,
+        *,
+        title_norm: str,
+        artist_norm: str,
+        album_norm: str,
+    ) -> Path | None:
+        """Resolve a strict Raw candidate from the persistent metadata index."""
+        for row in self._repository.find_strict_metadata_rows(
+            title_norm=title_norm,
+            artist_norm=artist_norm,
+            album_norm=album_norm,
+        ):
+            path = EXTERNAL_RAW_ROOT / row.rel_path
+            if path.is_file():
+                return path
+        return None
+
+    def _wait_for_ytm_auto_match_slot(self) -> None:
+        """Reserve one globally paced YTM search slot for background matching."""
+        if self._ytm_auto_match_interval <= 0:
+            return
+        with self._ytm_auto_match_lock:
+            now = time.monotonic()
+            wait = max(0.0, self._ytm_auto_match_next_at - now)
+            self._ytm_auto_match_next_at = max(now, self._ytm_auto_match_next_at) + (
+                self._ytm_auto_match_interval
+            )
+        if wait:
+            time.sleep(wait)
+
     # -- Playlists --
 
-    def sync_playlists_from_disk(self) -> list[str]:
+    def sync_playlists_from_disk(self, *, maintenance: bool = False) -> list[str]:
         """Upsert one ExternalPlaylist per top-level directory under Raw/.
 
         Playlist rows whose folders disappeared are cancelled (户口注销): tracks
         stamped with that playlist_uid are liberated (writable, no origin).
         """
+        with self._lock:
+            return self._sync_playlists_from_disk(maintenance=maintenance)
+
+    def _sync_playlists_from_disk(self, *, maintenance: bool = False) -> list[str]:
+        """Locked implementation of playlist discovery and legacy repair."""
         ensure_external_layout()
         root = EXTERNAL_RAW_ROOT
         if not root.is_dir():
@@ -491,13 +580,32 @@ class ExternalLibraryService:
             )
         except OSError:
             return []
+        default_mode = str(
+            getattr(
+                self._preferences.effective(),
+                "external_new_playlist_mode",
+                EXTERNAL_ACCESS_PENDING,
+            )
+        )
+        if default_mode not in EXTERNAL_ACCESS_MODES:
+            default_mode = EXTERNAL_ACCESS_PENDING
         for dir_name in dirs:
-            self._repository.upsert_playlist(dir_name)
+            is_system = dir_name in (EXTERNAL_DEFAULT_DIR, EXTERNAL_DELETE_DIR)
+            mode = EXTERNAL_ACCESS_MANAGED if is_system else default_mode
+            self._repository.upsert_playlist(
+                dir_name,
+                access_mode=mode,
+                enabled=mode != EXTERNAL_ACCESS_PENDING,
+            )
+        if maintenance:
+            self._reconcile_legacy_recycle_organized(set(dirs))
         removed = self._repository.delete_playlists_not_in(
             set(dirs),
             protected={EXTERNAL_DEFAULT_DIR, EXTERNAL_DELETE_DIR},
         )
-        for _dir_name, playlist_uid in removed:
+        for removed_dir_name, playlist_uid in removed:
+            self._repository.delete_inventory_for_dir(removed_dir_name)
+            self._repository.delete_paths_for_dir(removed_dir_name)
             liberated = self._catalog.liberate_origin(playlist_uid)
             if liberated:
                 logger.info(
@@ -505,7 +613,295 @@ class ExternalLibraryService:
                     liberated,
                     playlist_uid,
                 )
+        self._schedule_playlist_inventories()
         return dirs
+
+    def _legacy_recycle_origin(
+        self,
+        location: TrackLocation,
+        record: TrackRecord,
+        active_dirs: set[str],
+    ) -> tuple[str, str]:
+        """Resolve durable provenance for an old Organized/Delete location."""
+        if record.origin_playlist_uid:
+            source = self._repository.get_playlist_by_uid(record.origin_playlist_uid)
+            if source is not None and source.dir_name in active_dirs:
+                return "external", record.origin_playlist_uid
+
+        origin = (location.origin or "").lower()
+        if "wanted" in origin:
+            return "wanted", record.video_id
+        if "subscription" in origin or "sublist" in origin:
+            return "subscription", record.video_id
+        if "direct" in origin or origin in {"download", "search"}:
+            return "direct", record.video_id
+        # A joined catalog row is still attributable even when an old version
+        # did not preserve its original product lane.
+        return "system", f"catalog:{record.video_id}"
+
+    def _reconcile_legacy_recycle_organized(
+        self,
+        active_dirs: set[str],
+    ) -> None:
+        """Collapse legacy Organized/Delete into canonical Raw/Delete.
+
+        Tracked files retain explicit provenance and become unmatched recycle
+        items. Untracked files are invalid development residue and are removed.
+        A failed move leaves remaining files untouched for a later retry.
+        """
+        root = EXTERNAL_ORGANIZED_ROOT / EXTERNAL_DELETE_DIR
+        if not root.is_dir():
+            return
+
+        save_folder = organized_save_folder(EXTERNAL_DELETE_DIR)
+        tracked = {
+            loc.relative_path.replace("\\", "/"): (loc, rec)
+            for loc, rec in self._catalog.list_for_save_folder(save_folder)
+        }
+        moved = deleted = stale = errors = 0
+
+        for dirpath, _dirnames, filenames in os.walk(root):
+            for name in filenames:
+                path = Path(dirpath) / name
+                if path.suffix.lower() not in AUDIO_SUFFIXES:
+                    continue
+                try:
+                    relative = str(path.relative_to(root)).replace("\\", "/")
+                except ValueError:
+                    continue
+                loc_record = tracked.pop(relative, None)
+                if loc_record is None:
+                    try:
+                        path.unlink()
+                        path.with_suffix(".lrc").unlink(missing_ok=True)
+                        deleted += 1
+                    except OSError:
+                        errors += 1
+                        logger.warning(
+                            "Could not delete unattributed Organized/Delete file %s",
+                            path,
+                        )
+                    continue
+
+                location, record = loc_record
+                origin_kind, origin_ref = self._legacy_recycle_origin(
+                    location,
+                    record,
+                    active_dirs,
+                )
+                try:
+                    destination = self.ingest_file_to_raw_delete(
+                        path,
+                        origin_kind=origin_kind,
+                        origin_ref=origin_ref,
+                        title=record.title,
+                        artists=record.artist,
+                        album=record.album,
+                        album_artist=record.album_artist,
+                        year=record.year,
+                        track_number=record.track_number,
+                    )
+                    if destination is None:
+                        errors += 1
+                        continue
+                    self._catalog.delete_location(save_folder, relative)
+                    moved += 1
+                except OSError:
+                    errors += 1
+                    logger.warning(
+                        "Could not migrate Organized/Delete file %s",
+                        path,
+                        exc_info=True,
+                    )
+
+        # Catalog rows whose old files no longer exist must not keep the
+        # recycle-center card pointing at Organized/Delete.
+        for relative, (_location, _record) in tracked.items():
+            self._catalog.delete_location(save_folder, relative)
+            stale += 1
+
+        if errors == 0:
+            # Remove orphan covers, sidecars and now-empty directories only
+            # after every audio migration/deletion succeeded.
+            for dirpath, dirnames, filenames in os.walk(root, topdown=False):
+                directory = Path(dirpath)
+                for name in filenames:
+                    try:
+                        (directory / name).unlink()
+                    except OSError:
+                        logger.warning(
+                            "Could not remove legacy recycle sidecar %s",
+                            directory / name,
+                        )
+                for name in dirnames:
+                    try:
+                        (directory / name).rmdir()
+                    except OSError:
+                        pass
+            try:
+                root.rmdir()
+            except OSError:
+                pass
+
+        if moved or deleted or stale or errors:
+            logger.info(
+                "Reconciled Organized/Delete: moved=%d deleted=%d stale=%d errors=%d",
+                moved,
+                deleted,
+                stale,
+                errors,
+            )
+
+    def _inventory_candidates(self) -> list[str]:
+        return [
+            row.dir_name
+            for row in self._repository.list_playlists()
+            if row.dir_name not in (EXTERNAL_DEFAULT_DIR, EXTERNAL_DELETE_DIR)
+            and row.inventory_scanned_at is None
+        ]
+
+    def _schedule_playlist_inventories(self) -> None:
+        """Inventory unscanned folders after cards have already been returned."""
+        with self._inventory_lock:
+            if self._inventory_worker_running:
+                return
+            if not self._inventory_candidates():
+                return
+            self._inventory_worker_running = True
+        threading.Thread(
+            target=self._playlist_inventory_worker,
+            name="external-playlist-inventory",
+            daemon=True,
+        ).start()
+
+    def _playlist_inventory_worker(self) -> None:
+        """Inventory folders one at a time to avoid hammering SMB."""
+        try:
+            while True:
+                candidates = self._inventory_candidates()
+                if not candidates:
+                    return
+                with self._lock:
+                    if not self._inventory_playlist_folder(candidates[0]):
+                        return
+        finally:
+            with self._inventory_lock:
+                self._inventory_worker_running = False
+
+    def _inventory_playlist_folder(self, dir_name: str) -> bool:
+        """Persist a cheap path/stat inventory without reading audio tags."""
+        root = EXTERNAL_RAW_ROOT / dir_name
+        count = 0
+        representative: str | None = None
+        batch: list[tuple[str, str, int, int, int | None]] = []
+        try:
+            if root.is_dir():
+                for dirpath, dirnames, filenames in os.walk(root):
+                    dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
+                    for name in sorted(filenames):
+                        if name.startswith(".") or Path(name).suffix.lower() not in (
+                            AUDIO_SUFFIXES
+                        ):
+                            continue
+                        path = Path(dirpath) / name
+                        count += 1
+                        try:
+                            st = path.stat()
+                        except OSError:
+                            continue
+                        rel_path = str(path.relative_to(EXTERNAL_RAW_ROOT)).replace(
+                            "\\", "/"
+                        )
+                        batch.append(
+                            (
+                                rel_path,
+                                dir_name,
+                                getattr(
+                                    st,
+                                    "st_mtime_ns",
+                                    int(st.st_mtime * 1e9),
+                                ),
+                                int(st.st_size),
+                                getattr(st, "st_ino", None),
+                            )
+                        )
+                        if len(batch) >= _INVENTORY_WRITE_BATCH:
+                            self._repository.upsert_inventory_batch(batch)
+                            batch.clear()
+                        if representative is None:
+                            representative = rel_path
+                            self._repository.record_inventory_representative(
+                                dir_name,
+                                cover_rel=representative,
+                            )
+            if batch:
+                self._repository.upsert_inventory_batch(batch)
+            self._repository.record_inventory(
+                dir_name,
+                audio_count=count,
+                cover_rel=representative,
+            )
+            if self._media_changed is not None:
+                self._media_changed()
+            return True
+        except OSError:
+            logger.warning("External inventory failed for %s", dir_name)
+            return False
+
+    # Compatibility for focused tests and older internal callers.
+    def _inventory_pending_folder(self, dir_name: str) -> bool:
+        return self._inventory_playlist_folder(dir_name)
+
+    def _purge_unattributed_archive_files(self) -> None:
+        """Delete legacy/manual archive files that have no trustworthy source.
+
+        Raw/Delete is only a Yubal-managed destination.  Keeping a file there
+        without provenance would make its permission ambiguous, so it is
+        invalid data rather than a read-only fallback.
+        """
+        archive_root = EXTERNAL_RAW_ROOT / EXTERNAL_DELETE_DIR
+        if not archive_root.is_dir():
+            return
+        for dirpath, _dirnames, filenames in os.walk(archive_root):
+            for name in filenames:
+                path = Path(dirpath) / name
+                if path.suffix.lower() not in AUDIO_SUFFIXES:
+                    continue
+                try:
+                    rel_path = str(
+                        path.resolve().relative_to(EXTERNAL_RAW_ROOT.resolve())
+                    )
+                except ValueError:
+                    continue
+                row = self._repository.get(rel_path)
+                if row is not None and row.origin_kind and row.origin_ref:
+                    continue
+                logger.warning(
+                    "Preserving unattributed archive file for manual recovery: %s",
+                    path,
+                )
+
+    def _raw_row_is_mutable(self, row: ExternalRawTrack) -> bool:
+        """Resolve permission from immutable source provenance, never its folder."""
+        if row.origin_kind == "external":
+            source = self._repository.get_playlist_by_uid(row.origin_ref)
+            return bool(source and source.allow_mutate)
+        # Download / subscription / system archive sources are application-owned.
+        return row.origin_kind in {
+            "direct",
+            "manual",
+            "subscription",
+            "system",
+            "wanted",
+        }
+
+    def _playlist_origin(self, dir_name: str) -> tuple[str, str]:
+        if dir_name == EXTERNAL_DEFAULT_DIR:
+            return ("manual", "archive")
+        playlist = self._repository.get_playlist(dir_name)
+        if playlist is None:
+            raise ValueError(f"playlist not found: {dir_name}")
+        return ("external", playlist.playlist_uid)
 
     def list_playlists(self) -> list[ExternalPlaylistView]:
         return [
@@ -546,50 +942,80 @@ class ExternalLibraryService:
         return True
 
     def _build_playlist_view(self, playlist: ExternalPlaylist) -> ExternalPlaylistView:
-        from yubal_api.services.library_hardlink import is_cross_folder_hardlink
-
         save_folder = organized_save_folder(playlist.dir_name)
-        locations = self._catalog.list_for_save_folder(save_folder)
-        matched_count = len(locations)
+        (
+            matched_count,
+            local,
+            offline,
+            hardlink,
+            representative,
+        ) = self._catalog.folder_snapshot(save_folder)
         unmatched_count = self._repository.count_unmatched_for_dir(playlist.dir_name)
+        indexed_raw_count = self._repository.count_for_dir(playlist.dir_name)
+        inventory_count = self._repository.count_inventory_for_dir(playlist.dir_name)
+        # Paths discovered but not yet tag-indexed are honest pending items,
+        # not invisible zeroes. They naturally move into the existing buckets
+        # as the background stock queue advances.
+        unmatched_count += max(0, inventory_count - indexed_raw_count)
+        inventory_scanned = playlist.inventory_scanned_at is not None
+        if playlist.discovered_audio_count is not None and (
+            playlist.access_mode == EXTERNAL_ACCESS_PENDING or indexed_raw_count == 0
+        ):
+            unmatched_count = int(playlist.discovered_audio_count)
         meta_verified_count = self._repository.count_meta_verified_unmatched(
             playlist.dir_name
         )
-
-        cloud = offline = local = hardlink = 0
-        cover_track_path: str | None = None
-        inode_cache: dict[str, list[tuple[str, tuple[int, int]]]] = {}
-        for loc, _rec in locations:
-            if loc.membership_status == LocationMembershipStatus.OFFLINE:
-                offline += 1
-            else:
-                cloud += 1
-            abs_path = _location_abs_path(loc)
-            if not abs_path.is_file():
-                continue
-            local += 1
-            if cover_track_path is None:
-                cover_track_path = (
-                    f"External/{loc.save_folder}/{loc.relative_path}".replace("\\", "/")
+        meta_rejected_count = self._repository.count_meta_rejected_for_dir(
+            playlist.dir_name
+        )
+        if playlist.dir_name in (EXTERNAL_DEFAULT_DIR, EXTERNAL_DELETE_DIR):
+            # System pits may contain mixed origins, so preserve per-row hukou.
+            meta_rejected_mutable_count = sum(
+                1
+                for row in self._repository.list_meta_rejected_for_dir(
+                    playlist.dir_name
                 )
-            if is_cross_folder_hardlink(
-                abs_path,
-                video_id=loc.video_id,
-                save_folder=save_folder,
-                catalog=self._catalog,
-                download_root=DOWNLOAD_ROOT,
-                location_inode_cache=inode_cache,
-            ):
-                hardlink += 1
+                if self._raw_row_is_mutable(row)
+            )
+        else:
+            meta_rejected_mutable_count = (
+                meta_rejected_count if playlist.allow_mutate else 0
+            )
+
+        cloud = local
+        # Prefer an inventory-confirmed Raw file with embedded artwork.  The
+        # previous single "latest track" choice could select a coverless file,
+        # while discovered_cover_rel could point at a file already moved away.
+        raw_cover_rel = self._repository.inventory_cover_path(playlist.dir_name)
+        if raw_cover_rel:
+            cover_track_path = f"External/raw/{raw_cover_rel}".replace("\\", "/")
+        elif representative:
+            cover_track_path = f"External/{save_folder}/{representative}".replace(
+                "\\", "/"
+            )
+        else:
+            raw_fallback = self._repository.first_inventory_path(playlist.dir_name)
+            cover_track_path = (
+                f"External/raw/{raw_fallback}".replace("\\", "/")
+                if raw_fallback
+                else None
+            )
 
         return ExternalPlaylistView(
             dir_name=playlist.dir_name,
             allow_mutate=playlist.allow_mutate,
+            access_mode=playlist.access_mode,
+            access_mode_locked=playlist.source_mutated_at is not None,
+            source_mutated_at=playlist.source_mutated_at,
+            source_mutation_kind=playlist.source_mutation_kind,
             show_raw=playlist.show_raw,
             show_junk=bool(playlist.show_raw and playlist.show_junk),
+            inventory_scanned=inventory_scanned,
             unmatched_count=unmatched_count,
             matched_count=matched_count,
             meta_verified_count=meta_verified_count,
+            meta_rejected_count=meta_rejected_count,
+            meta_rejected_mutable_count=meta_rejected_mutable_count,
             cloud=cloud,
             local=local,
             offline=offline,
@@ -613,6 +1039,7 @@ class ExternalLibraryService:
         dir_name: str,
         *,
         allow_mutate: bool | None = None,
+        access_mode: str | None = None,
         show_raw: bool | None = None,
         show_junk: bool | None = None,
         enabled: bool | None = None,
@@ -633,11 +1060,31 @@ class ExternalLibraryService:
                     f"{dir_name} is a system playlist and must stay writable"
                 )
             allow_mutate = True if allow_mutate is not None else None
+            access_mode = EXTERNAL_ACCESS_MANAGED
+
+        requested_mode = access_mode
+        if requested_mode is None and allow_mutate is not None:
+            requested_mode = EXTERNAL_ACCESS_MANAGED if allow_mutate else "readonly"
+        if (
+            requested_mode == EXTERNAL_ACCESS_PENDING
+            and playlist.access_mode != EXTERNAL_ACCESS_PENDING
+        ):
+            raise ValueError("a configured playlist cannot return to pending")
+        if (
+            playlist.source_mutated_at is not None
+            and requested_mode is not None
+            and requested_mode != playlist.access_mode
+        ):
+            raise ValueError(
+                "access mode is locked because original source content "
+                "has already been changed"
+            )
 
         prev_mutate = playlist.allow_mutate
         updated = self._repository.update_playlist_settings(
             dir_name,
             allow_mutate=allow_mutate,
+            access_mode=access_mode,
             show_raw=show_raw,
             show_junk=show_junk,
             enabled=enabled,
@@ -650,7 +1097,7 @@ class ExternalLibraryService:
         )
         if updated is None:
             return None
-        if allow_mutate is not None and allow_mutate != prev_mutate:
+        if updated.allow_mutate != prev_mutate:
             flipped = self._catalog.set_immutable_for_origin(
                 updated.playlist_uid,
                 immutable=not updated.allow_mutate,
@@ -664,6 +1111,111 @@ class ExternalLibraryService:
                 )
         return updated
 
+    def _mark_source_mutated(
+        self,
+        *,
+        playlist_uid: str | None,
+        mutation_kind: str,
+    ) -> None:
+        """Lock a real external source; app-owned/system sources need no lock."""
+        if not playlist_uid:
+            return
+        playlist = self._repository.get_playlist_by_uid(playlist_uid)
+        if playlist is None:
+            return
+        if playlist.dir_name in (EXTERNAL_DEFAULT_DIR, EXTERNAL_DELETE_DIR):
+            return
+        self._repository.mark_source_mutated(
+            playlist_uid,
+            mutation_kind=mutation_kind,
+        )
+
+    def _mark_row_source_mutated(
+        self,
+        row: ExternalRawTrack,
+        mutation_kind: str,
+    ) -> None:
+        if row.origin_kind == "external":
+            self._mark_source_mutated(
+                playlist_uid=row.origin_ref,
+                mutation_kind=mutation_kind,
+            )
+
+    def _mark_catalog_source_mutated(
+        self,
+        record: object,
+        mutation_kind: str,
+    ) -> None:
+        self._mark_source_mutated(
+            playlist_uid=getattr(record, "origin_playlist_uid", None),
+            mutation_kind=mutation_kind,
+        )
+
+    @staticmethod
+    def _existing_file_signature(path: Path) -> tuple[int, int] | None:
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
+        return stat.st_mtime_ns, stat.st_size
+
+    @classmethod
+    def _existing_file_changed(
+        cls,
+        path: Path,
+        before: tuple[int, int] | None,
+    ) -> bool:
+        """New files are reversible additions; only changed existing files lock."""
+        if before is None:
+            return False
+        return cls._existing_file_signature(path) != before
+
+    def activate_pending_playlist_names(self, access_mode: str) -> list[str]:
+        """Classify new folders and return exactly those made processable."""
+        if access_mode not in {"readonly", EXTERNAL_ACCESS_MANAGED}:
+            raise ValueError("access mode must be readonly or managed")
+        activated: list[str] = []
+        for playlist in self._repository.list_playlists():
+            if playlist.access_mode != EXTERNAL_ACCESS_PENDING:
+                continue
+            updated = self._repository.update_playlist_settings(
+                playlist.dir_name,
+                access_mode=access_mode,
+                enabled=True,
+            )
+            if updated is not None:
+                activated.append(updated.dir_name)
+        return activated
+
+    def activate_pending_playlists(self, access_mode: str) -> int:
+        """Compatibility count for callers that do not need activated names."""
+        return len(self.activate_pending_playlist_names(access_mode))
+
+    def configured_playlist_names(self) -> list[str]:
+        """Return external folders eligible for media processing."""
+        return [
+            playlist.dir_name
+            for playlist in self._repository.list_playlists()
+            if playlist.enabled
+            and playlist.access_mode != EXTERNAL_ACCESS_PENDING
+        ]
+
+    def pending_processing_count(self, dir_name: str) -> int:
+        return self._repository.pending_processing_count(
+            dir_name,
+            now=datetime.now(UTC),
+        )
+
+    def _batch_limit(self, playlist: ExternalPlaylist, *, dir_name: str) -> int:
+        """Scale per-pass work with backlog so large libraries drain faster."""
+        base = max(int(playlist.max_items or 50), 20)
+        pending = self.pending_processing_count(dir_name)
+        if pending >= 10_000:
+            return min(500, max(base, pending // 80))
+        if pending >= 1_000:
+            return min(200, max(base, pending // 40))
+        return base
+
     # -- Scan --
 
     def scan_raw(
@@ -672,12 +1224,37 @@ class ExternalLibraryService:
         *,
         enabled_only: bool = False,
         dir_name: str | None = None,
+        metadata_limit: int | None = None,
     ) -> ScanResult:
-        """Walk External/Raw and index audio files, guarded against empty mounts.
+        """Discover filesystem changes, then parse a bounded metadata batch.
 
-        When ``enabled_only`` is True, only walk playlist dirs that are enabled.
-        When ``dir_name`` is set, restrict the walk to that single playlist dir.
+        Discovery only stats files and updates the persistent inventory. Expensive
+        tag reads are a separate resumable queue. ``metadata_limit=None`` keeps
+        the explicit scan API backwards-compatible by draining the queue; normal
+        scheduled/playlist sync passes a finite budget.
         """
+        discovered = self.discover_raw(
+            health,
+            enabled_only=enabled_only,
+            dir_name=dir_name,
+        )
+        indexed, index_errors = self.index_inventory_batch(
+            limit=metadata_limit,
+            enabled_only=enabled_only,
+            dir_name=dir_name,
+        )
+        discovered.updated += indexed
+        discovered.errors += index_errors
+        return discovered
+
+    def discover_raw(
+        self,
+        health: LibraryHealthService,
+        *,
+        enabled_only: bool = False,
+        dir_name: str | None = None,
+    ) -> ScanResult:
+        """Cheap full reconciliation: path/stat only, never opens audio tags."""
         health.ensure_healthy()
         ensure_external_layout()
         root = EXTERNAL_RAW_ROOT
@@ -685,7 +1262,7 @@ class ExternalLibraryService:
             raise ValueError(f"external raw root missing: {root}")
 
         with self._lock:
-            dirs = self.sync_playlists_from_disk()
+            dirs = self.sync_playlists_from_disk(maintenance=True)
             self._repository.refresh_all_norms()
 
             allowed_dirs: set[str] | None = None
@@ -697,9 +1274,10 @@ class ExternalLibraryService:
                     logger.info("External scan_raw: no enabled playlists; skipping")
                     return ScanResult(playlists=0)
 
-            existing = self._repository.list_path_stats()
+            existing = self._repository.list_inventory_path_stats()
             seen: set[str] = set()
             added = updated = errors = scanned = 0
+            inventory_batch: list[tuple[str, str, int, int, int | None]] = []
 
             for dirpath, dirnames, filenames in os.walk(root):
                 dirnames[:] = [d for d in dirnames if not d.startswith(".")]
@@ -732,6 +1310,19 @@ class ExternalLibraryService:
                     playlist_dir = parts[0]
                     if allowed_dirs is not None and playlist_dir not in allowed_dirs:
                         continue
+                    # Raw/Delete is not imported automatically. Preserve unknown
+                    # files for manual recovery rather than deleting them merely
+                    # because the DB was reset or an older migration was partial.
+                    if (
+                        playlist_dir == EXTERNAL_DELETE_DIR
+                        and self._repository.get(rel) is None
+                    ):
+                        logger.warning(
+                            "Skipping unattributed archive file pending "
+                            "manual recovery: %s",
+                            path,
+                        )
+                        continue
                     seen.add(rel)
                     scanned += 1
                     try:
@@ -741,18 +1332,33 @@ class ExternalLibraryService:
                         continue
                     mtime_ns = getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))
                     size = st.st_size
+                    inode = getattr(st, "st_ino", None)
                     prev = existing.get(rel)
-                    if prev is not None and prev == (mtime_ns, size):
+                    if prev is not None and prev == (mtime_ns, size, inode):
                         continue
-                    row = _read_raw_tags(path, rel, playlist_dir)
-                    if row is None:
-                        errors += 1
-                        continue
-                    self._repository.upsert(row)
-                    if prev is None:
-                        added += 1
-                    else:
-                        updated += 1
+                    inventory_batch.append(
+                        (
+                            rel,
+                            playlist_dir,
+                            int(mtime_ns),
+                            int(size),
+                            inode,
+                        )
+                    )
+                    if len(inventory_batch) >= _INVENTORY_WRITE_BATCH:
+                        part_added, part_updated = (
+                            self._repository.upsert_inventory_batch(inventory_batch)
+                        )
+                        added += part_added
+                        updated += part_updated
+                        inventory_batch.clear()
+
+            if inventory_batch:
+                part_added, part_updated = self._repository.upsert_inventory_batch(
+                    inventory_batch
+                )
+                added += part_added
+                updated += part_updated
 
             # Only consider deletes within the scanned scope.
             if allowed_dirs is not None:
@@ -762,17 +1368,50 @@ class ExternalLibraryService:
             else:
                 scoped_existing = list(existing)
             removed_paths = [p for p in scoped_existing if p not in seen]
-            allow_deletes = health.allow_index_deletes(len(seen))
+            scoped_scan = allowed_dirs is not None
+            allow_deletes = (
+                health.allow_scoped_index_deletes(
+                    len(seen),
+                    len(scoped_existing),
+                )
+                if scoped_scan
+                else health.allow_index_deletes(len(seen))
+            )
             removed = 0
             if allow_deletes:
                 if removed_paths:
-                    removed = self._repository.delete_paths(removed_paths)
-                health.record_good_raw_scan(len(seen))
+                    removed = self._repository.delete_inventory_paths(removed_paths)
+                    self._repository.delete_paths(removed_paths)
+                # A single-playlist count must never overwrite the persisted
+                # whole-library baseline.
+                if not scoped_scan:
+                    health.record_good_raw_scan(len(seen))
             else:
-                logger.warning(
-                    "Skipping external raw index deletes: walked %d vs last good %d",
-                    len(seen),
-                    health.last_good_raw_count,
+                if scoped_scan:
+                    logger.warning(
+                        "Skipping scoped external raw index deletes: "
+                        "walked %d vs indexed %d",
+                        len(seen),
+                        len(scoped_existing),
+                    )
+                else:
+                    logger.warning(
+                        "Skipping external raw index deletes: "
+                        "walked %d vs last good %d",
+                        len(seen),
+                        health.last_good_raw_count,
+                    )
+
+            inventory_dirs = allowed_dirs if allowed_dirs is not None else set(dirs)
+            for inventory_dir in inventory_dirs:
+                playlist = self._repository.get_playlist(inventory_dir)
+                cover_rel = (
+                    playlist.discovered_cover_rel if playlist is not None else None
+                )
+                self._repository.record_inventory(
+                    inventory_dir,
+                    audio_count=self._repository.count_inventory_for_dir(inventory_dir),
+                    cover_rel=cover_rel,
                 )
 
             healed = 0
@@ -792,6 +1431,60 @@ class ExternalLibraryService:
                 removed=removed,
                 errors=errors,
             )
+
+    def index_inventory_batch(
+        self,
+        *,
+        limit: int | None,
+        enabled_only: bool = False,
+        dir_name: str | None = None,
+    ) -> tuple[int, int]:
+        """Read tags for pending inventory rows; safe to resume after interruption."""
+        enabled_dirs: set[str] | None = None
+        if enabled_only and dir_name is None:
+            enabled_dirs = self._repository.list_enabled_dir_names()
+        # An explicit unlimited scan drains all currently pending rows. Normal
+        # sync calls always provide a bounded budget.
+        batch_limit = limit
+        if batch_limit is None:
+            batch_limit = max(1, self._repository.count())
+            inventory_total = sum(
+                self._repository.count_inventory_for_dir(name)
+                for name in (
+                    enabled_dirs
+                    if enabled_dirs is not None
+                    else [dir_name]
+                    if dir_name is not None
+                    else [p.dir_name for p in self._repository.list_playlists()]
+                )
+            )
+            batch_limit = max(batch_limit, inventory_total)
+        rows = self._repository.list_pending_inventory(
+            limit=max(0, int(batch_limit)),
+            dir_name=dir_name,
+            dir_names=enabled_dirs,
+        )
+        indexed = errors = 0
+        for inventory in rows:
+            path = EXTERNAL_RAW_ROOT / inventory.rel_path
+            origin_kind, origin_ref = self._playlist_origin(inventory.dir_name)
+            row = _read_raw_tags(
+                path,
+                inventory.rel_path,
+                inventory.dir_name,
+                origin_kind=origin_kind,
+                origin_ref=origin_ref,
+            )
+            if row is None:
+                errors += 1
+                continue
+            self._repository.upsert(row)
+            if self._repository.mark_inventory_indexed(
+                inventory.rel_path,
+                mtime_ns=inventory.mtime_ns,
+            ):
+                indexed += 1
+        return indexed, errors
 
     def heal_orphan_matches(self, dir_name: str | None = None) -> int:
         """Re-ingest MATCH_MATCHED raw rows that have no Organized catalog location.
@@ -899,6 +1592,7 @@ class ExternalLibraryService:
         row: ExternalRawTrack,
         *,
         mode: str,
+        rate_limit: bool,
     ) -> list[MatchCandidate]:
         """Search YTM and rank candidates for ``row``.
 
@@ -956,27 +1650,43 @@ class ExternalLibraryService:
             return []
 
         results = []
+        search_errors: list[Exception] = []
+        successful_searches = 0
         for query in primary_queries:
             try:
+                if rate_limit:
+                    self._wait_for_ytm_auto_match_slot()
                 results.extend(self._client.search_songs(query)[:8])
-            except Exception:
-                logger.exception(
-                    "External match search failed for %s query=%r",
+                successful_searches += 1
+            except UpstreamAPIError as exc:
+                search_errors.append(exc)
+                logger.warning(
+                    "External match search unavailable for %s query=%r: %s",
                     row.rel_path,
                     query,
+                    exc,
                 )
                 continue
         for query in album_queries:
             try:
                 # Fewer hits from album queries — they pollute with OST noise.
+                if rate_limit:
+                    self._wait_for_ytm_auto_match_slot()
                 results.extend(self._client.search_songs(query)[:4])
-            except Exception:
-                logger.exception(
-                    "External match search failed for %s query=%r",
+                successful_searches += 1
+            except UpstreamAPIError as exc:
+                search_errors.append(exc)
+                logger.warning(
+                    "External match search unavailable for %s query=%r: %s",
                     row.rel_path,
                     query,
+                    exc,
                 )
                 continue
+        if not successful_searches and search_errors:
+            raise UpstreamAPIError(
+                f"All YTM search requests failed: {search_errors[-1]}"
+            ) from search_errors[-1]
         if not results:
             return []
 
@@ -1136,6 +1846,7 @@ class ExternalLibraryService:
         strict_tags: bool = True,
         mode: str | None = None,
         record_failure: bool = True,
+        rate_limit: bool = True,
     ) -> tuple[bool, list[MatchCandidate]]:
         if row.video_id and row.match_status == MATCH_MATCHED:
             return True, []
@@ -1152,7 +1863,13 @@ class ExternalLibraryService:
         if match_mode not in {"strict", "relaxed"}:
             match_mode = "strict"
 
-        ranked = self._rank_match_candidates(row, mode=match_mode)
+        try:
+            ranked = self._rank_match_candidates(
+                row, mode=match_mode, rate_limit=rate_limit
+            )
+        except UpstreamAPIError as exc:
+            logger.warning("External match deferred for %s: %s", row.rel_path, exc)
+            return False, []
         if not ranked:
             if record_failure:
                 rejected = self._should_reject_after_fails(row.match_fail_count + 1)
@@ -1300,13 +2017,54 @@ class ExternalLibraryService:
 
             result.checked += 1
             try:
-                if not self.match_one(row):
-                    refreshed = self._repository.get(row.rel_path)
-                    if refreshed and refreshed.match_status == MATCH_REJECTED:
-                        result.rejected += 1
-                    else:
-                        result.deferred += 1
-                elif self.ingest_matched(row.rel_path):
+                matched = self.match_one(row)
+            except (UpstreamAPIError, OSError) as e:
+                # ytmusicapi/requests can surface TLS EOF as OSError.  This is
+                # a remote transport failure before any Raw→Organized write;
+                # never reset a previously confirmed match for it.
+                result.deferred += 1
+                logger.warning(
+                    "External match transport error for %s: %s",
+                    row.rel_path,
+                    e,
+                )
+                continue
+            except Exception:
+                # Matching failed before ingest. Preserve the row so a later
+                # scheduled pass can retry; resetting here loses valid state.
+                result.deferred += 1
+                logger.exception(
+                    "External match failed before ingest for %s",
+                    row.rel_path,
+                )
+                continue
+
+            if not matched:
+                refreshed = self._repository.get(row.rel_path)
+                if refreshed and refreshed.match_status == MATCH_REJECTED:
+                    result.rejected += 1
+                else:
+                    result.deferred += 1
+                continue
+
+            try:
+                ingested = self.ingest_matched(row.rel_path)
+            except OSError as e:
+                # Only this branch has touched Organized. A real filesystem
+                # failure may be retried from Raw, so roll back the match.
+                result.errors += 1
+                self._repository.reset_match_state(row.rel_path)
+                logger.exception(
+                    "External Organized write failed for %s: %s",
+                    row.rel_path,
+                    e,
+                )
+            except Exception:
+                result.errors += 1
+                self._repository.reset_match_state(row.rel_path)
+                logger.exception("External match ingest failed for %s", row.rel_path)
+            else:
+                if ingested:
                     result.matched += 1
                 else:
                     # Matched on YTM but could not place into Organized — roll back
@@ -1319,19 +2077,6 @@ class ExternalLibraryService:
                         "permissions)",
                         row.rel_path,
                     )
-            except OSError as e:
-                result.errors += 1
-                self._repository.reset_match_state(row.rel_path)
-                logger.exception(
-                    "External match ingest OS error for %s: %s "
-                    "(often PermissionError on /External/Organized)",
-                    row.rel_path,
-                    e,
-                )
-            except Exception:
-                result.errors += 1
-                self._repository.reset_match_state(row.rel_path)
-                logger.exception("External match batch failed for %s", row.rel_path)
             if result.checked >= limit:
                 break
         return result
@@ -1350,8 +2095,8 @@ class ExternalLibraryService:
 
         Order (when flags on)::
 
-            scan → fill empty tags (QQ/MB) → YTM match
-            → meta-verify still-unmatched → cover/lyrics enrich → recover
+            scan → fill empty tags (QQ/MB) → meta-verify still-unmatched
+            → YTM match (managed sources only) → cover/lyrics enrich → recover
 
         At least one of ``enrich`` / ``raw_match`` / ``verify_meta`` /
         ``junk_match`` is required.
@@ -1364,47 +2109,55 @@ class ExternalLibraryService:
         playlist = self._repository.get_playlist(dir_name)
         if playlist is None:
             raise ValueError(f"playlist not found: {dir_name}")
+        if playlist.access_mode == EXTERNAL_ACCESS_PENDING:
+            raise ValueError(
+                "playlist access mode is pending; choose read-only or managed first"
+            )
 
         result = SyncPlaylistResult()
         status = "success"
         try:
             health.ensure_healthy()
             readonly = not playlist.allow_mutate
+            batch_limit = self._batch_limit(playlist, dir_name=dir_name)
 
-            if raw_match:
-                self.scan_raw(health, dir_name=dir_name)
-                # A: fill empty title/artist/album via QQ/MB (never YTM).
+            needs_index = raw_match or verify_meta
+            if needs_index:
+                self.index_inventory_batch(
+                    limit=batch_limit,
+                    dir_name=dir_name,
+                )
                 self.fill_empty_tags_batch(
                     dir_name,
-                    limit=max(playlist.max_items, 20),
+                    limit=batch_limit,
                     write_file=bool(playlist.allow_mutate),
                 )
+
+            if verify_meta:
+                meta_result = self.verify_meta_batch(
+                    dir_name,
+                    limit=batch_limit,
+                    write_file=bool(playlist.allow_mutate),
+                    force=False,
+                )
+                result.meta_checked += int(meta_result.get("checked", 0))
+                result.meta_verified += int(meta_result.get("verified", 0))
+
+            if raw_match and playlist.allow_mutate:
                 match_result = self.match_batch(
                     health,
-                    limit=playlist.max_items,
+                    limit=batch_limit,
                     dir_name=dir_name,
                     ignore_backoff=False,
                     include_junk=False,
                     junk_only=False,
-                    enabled_only=False,  # explicit single-playlist sync
+                    enabled_only=False,
                 )
                 result.matched += match_result.matched
                 result.checked += match_result.checked
                 result.deferred += match_result.deferred
                 result.rejected += match_result.rejected
                 result.errors += match_result.errors
-
-            if verify_meta:
-                # B: only still-unmatched rows; every sync entry observes the
-                # same verification freshness/backoff rules.
-                meta_result = self.verify_meta_batch(
-                    dir_name,
-                    limit=max(playlist.max_items, 20),
-                    write_file=bool(playlist.allow_mutate),
-                    force=False,
-                )
-                result.meta_checked += int(meta_result.get("checked", 0))
-                result.meta_verified += int(meta_result.get("verified", 0))
 
             if enrich:
                 # Cover/lyrics only — never rewrite title/artist/album here.
@@ -1478,7 +2231,15 @@ class ExternalLibraryService:
             if not rec.video_id:
                 continue
             try:
+                path = _location_abs_path(loc)
+                audio_before = self._existing_file_signature(path)
+                lyrics_path = path.with_suffix(".lrc")
+                lyrics_before = self._existing_file_signature(lyrics_path)
                 enrich_track(rec.video_id)
+                if self._existing_file_changed(
+                    path, audio_before
+                ) or self._existing_file_changed(lyrics_path, lyrics_before):
+                    self._mark_catalog_source_mutated(rec, "media_overwritten")
             except Exception:
                 logger.exception(
                     "External playlist enrich failed for %s / %s",
@@ -1625,8 +2386,11 @@ class ExternalLibraryService:
             try:
                 if to_raw_delete:
                     if abs_path.is_file():
+                        origin_kind, origin_ref = self._playlist_origin(dir_name)
                         self.ingest_file_to_raw_delete(
                             abs_path,
+                            origin_kind=origin_kind,
+                            origin_ref=origin_ref,
                             title=rec.title,
                             artists=rec.artist,
                             album=rec.album or "",
@@ -1691,13 +2455,21 @@ class ExternalLibraryService:
             "add_matched_to_direct",
             "add_meta_verified_to_wanted",
             "delete_unmatched",
+            "archive_meta_rejected",
+            "delete_meta_rejected",
             "delete_all",
         }
         if mode not in ledger_modes | file_modes | cleanup_modes:
             raise ValueError(f"unknown delete mode: {mode}")
+        if dir_name == EXTERNAL_DELETE_DIR and mode == "clear_offline_to_raw_delete":
+            raise ValueError("recycle-center items cannot be moved to recycle center")
         if mode in file_modes and not playlist.allow_mutate:
             # Meta→Wanted hardlinks the raw file; allowed on readonly playlists.
-            if mode != "add_meta_verified_to_wanted":
+            if mode not in {
+                "add_meta_verified_to_wanted",
+                "archive_meta_rejected",
+                "delete_meta_rejected",
+            }:
                 raise ValueError(
                     "read-only playlist: use forget_matched, "
                     "add_meta_verified_to_wanted, or clear_offline_* modes; "
@@ -1734,6 +2506,16 @@ class ExternalLibraryService:
             unmatched = self._delete_unmatched_raw(dir_name)
             result.deleted_raw += unmatched[0]
             result.errors += unmatched[1]
+        if mode == "delete_meta_rejected":
+            rejected = self._delete_meta_rejected_raw(dir_name)
+            result.deleted_raw += rejected[0]
+            result.skipped_readonly += rejected[1]
+            result.errors += rejected[2]
+        if mode == "archive_meta_rejected":
+            rejected = self._archive_meta_rejected_raw(dir_name)
+            result.moved += rejected[0]
+            result.skipped_readonly += rejected[1]
+            result.errors += rejected[2]
         if mode in ("clear_offline_delete", "clear_offline_to_raw_delete"):
             cleared = self.clear_offline(
                 dir_name,
@@ -1769,8 +2551,11 @@ class ExternalLibraryService:
             try:
                 if delete_files and to_raw_delete:
                     if abs_path.is_file():
+                        origin_kind, origin_ref = self._playlist_origin(dir_name)
                         dest = self.ingest_file_to_raw_delete(
                             abs_path,
+                            origin_kind=origin_kind,
+                            origin_ref=origin_ref,
                             title=rec.title,
                             artists=rec.artist,
                             album=rec.album or "",
@@ -1787,6 +2572,7 @@ class ExternalLibraryService:
                 elif delete_files:
                     if abs_path.is_file():
                         abs_path.unlink()
+                        self._mark_catalog_source_mutated(rec, "audio_deleted")
                         lrc = abs_path.with_suffix(".lrc")
                         if lrc.is_file():
                             lrc.unlink(missing_ok=True)
@@ -1820,10 +2606,18 @@ class ExternalLibraryService:
         deleted_files = deleted_locations = reset_matches = errors = 0
         video_ids: list[str] = []
         for loc, rec in list(self._catalog.list_for_save_folder(save_folder)):
+            if rec.immutable:
+                errors += 1
+                logger.warning(
+                    "Refused deletion of readonly-origin organized track %s",
+                    loc.relative_path,
+                )
+                continue
             abs_path = _location_abs_path(loc)
             if abs_path.is_file():
                 try:
                     abs_path.unlink()
+                    self._mark_catalog_source_mutated(rec, "audio_deleted")
                     lrc = abs_path.with_suffix(".lrc")
                     if lrc.is_file():
                         lrc.unlink(missing_ok=True)
@@ -1832,11 +2626,15 @@ class ExternalLibraryService:
                 except OSError:
                     errors += 1
                     logger.warning("Could not delete organized file %s", abs_path)
+                    continue
             self._catalog.delete_location(save_folder, loc.relative_path)
             deleted_locations += 1
             video_ids.append(rec.video_id)
         for row in self._repository.list_matched(dir_name):
-            if self._repository.reset_match_state(row.rel_path) is not None:
+            if (
+                row.video_id in video_ids
+                and self._repository.reset_match_state(row.rel_path) is not None
+            ):
                 reset_matches += 1
         return deleted_files, deleted_locations, reset_matches, errors, video_ids
 
@@ -1997,7 +2795,14 @@ class ExternalLibraryService:
                         changed = True
                     if changed:
                         audio.save()
-                    refreshed = _read_raw_tags(path, row.rel_path, row.dir_name)
+                        self._mark_row_source_mutated(row, "audio_tags")
+                    refreshed = _read_raw_tags(
+                        path,
+                        row.rel_path,
+                        row.dir_name,
+                        origin_kind=row.origin_kind,
+                        origin_ref=row.origin_ref,
+                    )
                     if refreshed is not None:
                         refreshed.match_status = row.match_status
                         refreshed.video_id = row.video_id
@@ -2021,6 +2826,8 @@ class ExternalLibraryService:
         refreshed = ExternalRawTrack(
             rel_path=row.rel_path,
             dir_name=row.dir_name,
+            origin_kind=row.origin_kind,
+            origin_ref=row.origin_ref,
             mtime_ns=row.mtime_ns,
             size=row.size,
             inode=row.inode,
@@ -2063,6 +2870,12 @@ class ExternalLibraryService:
             if row.match_status == MATCH_MATCHED:
                 skipped += 1
                 continue
+            # Empty-tag recovery is part of the same one-pass decision. Once
+            # this exact file/tag state completed its YTM lane, routine syncs
+            # must not query metadata providers for it again.
+            if row.ytm_attempted_at is not None:
+                skipped += 1
+                continue
             if self.tags_complete_enough(row.title, row.artists, row.album):
                 skipped += 1
                 continue
@@ -2086,6 +2899,9 @@ class ExternalLibraryService:
         Runs after scan, before YTM match. Mutable playlists write verified tags
         back to the audio file; readonly only stores meta_* on the index.
         """
+        from yubal_api.services.meta_search import (
+            musicbrainz_cooldown_remaining_seconds,
+        )
         from yubal_api.services.meta_verify import (
             meta_fingerprint,
             verify_tags_against_wanted_sources,
@@ -2104,24 +2920,14 @@ class ExternalLibraryService:
 
         now = datetime.now(UTC)
         checked = verified = rejected = skipped = 0
-        for row in self._repository.list_for_dir(dir_name):
-            if checked >= limit:
-                break
-            if row.match_status == MATCH_MATCHED:
-                skipped += 1
-                continue
-            if not self.tags_complete_enough(row.title, row.artists, row.album):
-                skipped += 1
-                continue
-
+        candidates = self._repository.list_meta_verifiable(
+            dir_name,
+            now=now,
+            limit=limit,
+            force=force,
+        )
+        for row in candidates:
             fp = meta_fingerprint(row.title, row.artists, row.album)
-            if (
-                row.meta_status == META_VERIFIED
-                and row.meta_fingerprint == fp
-                and not force
-            ):
-                skipped += 1
-                continue
             if (
                 row.meta_status == META_VERIFIED
                 and row.meta_fingerprint
@@ -2129,37 +2935,39 @@ class ExternalLibraryService:
             ):
                 self._repository.invalidate_meta(row.rel_path)
                 row = self._repository.get(row.rel_path) or row
-            if (
-                not force
-                and row.meta_next_eligible_at is not None
-                and row.meta_next_eligible_at > now
-            ):
-                skipped += 1
-                continue
 
             checked += 1
-            # MusicBrainz courtesy: ~1 req/s across providers that hit MB.
-            if checked > 1 and prefs.wanted_source_musicbrainz:
-                time.sleep(1.05)
+            # MusicBrainz limits are shared globally in meta_search so Wanted
+            # and External passes cannot collectively exceed the provider cap.
 
+            mb_cooldown = musicbrainz_cooldown_remaining_seconds()
             result = verify_tags_against_wanted_sources(
                 title=row.title,
                 artists=row.artists,
                 album=row.album,
                 duration_ms=row.duration_ms,
-                enable_musicbrainz=prefs.wanted_source_musicbrainz,
+                # Once the shared circuit opens, skip MusicBrainz for the rest
+                # of this batch instead of logging the same failure per track.
+                enable_musicbrainz=(
+                    prefs.wanted_source_musicbrainz and mb_cooldown <= 0
+                ),
                 enable_qq=prefs.wanted_source_qq,
                 enable_discogs=prefs.wanted_source_discogs,
                 enable_lastfm=prefs.wanted_source_lastfm,
                 lastfm_api_key=prefs.lastfm_api_key,
             )
-            if result.hit is None and result.errored and not result.rejected:
-                # Provider transport failure — short backoff, keep pending.
-                fails = int(row.meta_fail_count or 0) + 1
-                delay_h = min(6, max(1, fails))
+            mb_cooldown = musicbrainz_cooldown_remaining_seconds()
+            if result.hit is None and (
+                (result.errored and not result.rejected)
+                or (prefs.wanted_source_musicbrainz and mb_cooldown > 0)
+            ):
+                # Incomplete provider coverage stays pending. Retry shortly
+                # after the real shared cooldown, rather than turning a
+                # two-minute outage into a one-hour per-track delay.
+                delay_seconds = max(60, mb_cooldown + 15)
                 self._repository.defer_meta_retry(
                     row.rel_path,
-                    next_eligible_at=now + timedelta(hours=delay_h),
+                    next_eligible_at=now + timedelta(seconds=delay_seconds),
                 )
                 skipped += 1
                 continue
@@ -2292,10 +3100,17 @@ class ExternalLibraryService:
                 changed = True
             if changed:
                 audio.save()
+                self._mark_row_source_mutated(row, "audio_tags")
         except Exception:
             logger.exception("Failed writing meta tags to %s", path)
             return False
-        refreshed = _read_raw_tags(path, row.rel_path, row.dir_name)
+        refreshed = _read_raw_tags(
+            path,
+            row.rel_path,
+            row.dir_name,
+            origin_kind=row.origin_kind,
+            origin_ref=row.origin_ref,
+        )
         if refreshed is None:
             return False
         refreshed.match_status = row.match_status
@@ -2329,29 +3144,38 @@ class ExternalLibraryService:
         moved = deleted_locations = errors = 0
         video_ids: list[str] = []
         for loc, rec in list(self._catalog.list_for_save_folder(save_folder)):
+            if rec.immutable:
+                errors += 1
+                logger.warning(
+                    "Refused move of readonly-origin organized track %s",
+                    loc.relative_path,
+                )
+                continue
             src = _location_abs_path(loc)
             dest = dest_base / loc.relative_path
-            if src.is_file():
+            if not src.is_file():
+                errors += 1
+                logger.warning("Source missing during move to Direct: %s", src)
+                continue
+            try:
+                self._move_file_preserving_sidecar(src, dest)
+                self._mark_catalog_source_mutated(rec, "audio_moved")
+                moved += 1
+                cleanup_after_audio_removed(src.parent, EXTERNAL_ROOT / save_folder)
+                self._track_index.set(rec.video_id, dest)
                 try:
-                    self._move_file_preserving_sidecar(src, dest)
-                    moved += 1
-                    cleanup_after_audio_removed(src.parent, EXTERNAL_ROOT / save_folder)
-                    self._track_index.set(rec.video_id, dest)
-                    try:
-                        rel_dl = str(
-                            dest.resolve().relative_to(DOWNLOAD_ROOT.resolve())
-                        )
-                        self._catalog.set_canonical(
-                            rec.video_id,
-                            storage=STORAGE_DOWNLOAD,
-                            relative_path=rel_dl,
-                        )
-                    except ValueError:
-                        pass
-                except OSError:
-                    errors += 1
-                    logger.warning("Could not move %s to %s", src, dest)
-                    continue
+                    rel_dl = str(dest.resolve().relative_to(DOWNLOAD_ROOT.resolve()))
+                    self._catalog.set_canonical(
+                        rec.video_id,
+                        storage=STORAGE_DOWNLOAD,
+                        relative_path=rel_dl,
+                    )
+                except ValueError:
+                    pass
+            except OSError:
+                errors += 1
+                logger.warning("Could not move %s to %s", src, dest)
+                continue
             self._catalog.upsert_location(
                 video_id=rec.video_id,
                 save_folder=dest_folder,
@@ -2430,10 +3254,18 @@ class ExternalLibraryService:
         for row in self._repository.list_for_dir(dir_name):
             if row.match_status == MATCH_MATCHED:
                 continue
+            if not self._raw_row_is_mutable(row):
+                errors += 1
+                logger.warning(
+                    "Refused bulk deletion of readonly-origin raw file %s",
+                    row.rel_path,
+                )
+                continue
             path = EXTERNAL_RAW_ROOT / row.rel_path
             if path.is_file():
                 try:
                     path.unlink()
+                    self._mark_row_source_mutated(row, "audio_deleted")
                     lrc = path.with_suffix(".lrc")
                     if lrc.is_file():
                         lrc.unlink(missing_ok=True)
@@ -2446,6 +3278,66 @@ class ExternalLibraryService:
         if paths:
             self._repository.delete_paths(paths)
         return deleted_raw, errors
+
+    def _delete_meta_rejected_raw(self, dir_name: str) -> tuple[int, int, int]:
+        """Delete only completed tag-validation failures from mutable sources."""
+        deleted = skipped_readonly = errors = 0
+        paths: list[str] = []
+        stop_at = EXTERNAL_RAW_ROOT / dir_name
+        for row in self._repository.list_meta_rejected_for_dir(dir_name):
+            if not self._raw_row_is_mutable(row):
+                skipped_readonly += 1
+                continue
+            path = EXTERNAL_RAW_ROOT / row.rel_path
+            try:
+                if path.is_file():
+                    path.unlink()
+                    self._mark_row_source_mutated(row, "audio_deleted")
+                    path.with_suffix(".lrc").unlink(missing_ok=True)
+                    cleanup_after_audio_removed(path.parent, stop_at)
+                    deleted += 1
+                paths.append(row.rel_path)
+            except OSError:
+                errors += 1
+                logger.warning("Could not delete meta-rejected raw file %s", path)
+        if paths:
+            self._repository.delete_paths(paths)
+        return deleted, skipped_readonly, errors
+
+    def _archive_meta_rejected_raw(self, dir_name: str) -> tuple[int, int, int]:
+        """Move tag-validation failures to the archive without losing provenance."""
+        if dir_name == EXTERNAL_DEFAULT_DIR:
+            raise ValueError("archive items are already in archived tracks")
+        moved = skipped_readonly = errors = 0
+        stop_at = EXTERNAL_RAW_ROOT / dir_name
+        for row in self._repository.list_meta_rejected_for_dir(dir_name):
+            if not self._raw_row_is_mutable(row):
+                skipped_readonly += 1
+                continue
+            path = EXTERNAL_RAW_ROOT / row.rel_path
+            try:
+                if not path.is_file():
+                    self._repository.delete_paths([row.rel_path])
+                    continue
+                dest = self.ingest_file_to_raw_default(
+                    path,
+                    origin_kind=row.origin_kind,
+                    origin_ref=row.origin_ref,
+                    title=row.title,
+                    artists=row.artists,
+                    album=row.album,
+                    album_artist=row.album_artist,
+                    year=row.year,
+                    track_number=row.track_number,
+                )
+                if dest is not None:
+                    self._repository.delete_paths([row.rel_path])
+                    cleanup_after_audio_removed(path.parent, stop_at)
+                    moved += 1
+            except OSError:
+                errors += 1
+                logger.warning("Could not archive meta-rejected raw file %s", path)
+        return moved, skipped_readonly, errors
 
     def reset_match(self, rel_path: str) -> ExternalRawTrack | None:
         """Manual reset so a track is retried on the next match batch."""
@@ -2599,6 +3491,10 @@ class ExternalLibraryService:
                 if dest.exists():
                     dest.unlink()
                 self._move_file_preserving_sidecar(source, dest)
+                self._mark_source_mutated(
+                    playlist_uid=playlist.playlist_uid,
+                    mutation_kind="audio_moved",
+                )
             master = dest
             try:
                 rel_to_external = master.resolve().relative_to(EXTERNAL_ROOT.resolve())
@@ -2679,7 +3575,7 @@ class ExternalLibraryService:
         link_from: Path,
         promote_raw: bool,
     ) -> bool:
-        """Hardlink Organized door onto ``link_from``; leave Raw alone when not promoting."""
+        """Link Organized onto ``link_from`` without changing Raw."""
         _ = promote_raw
         dest = self._dest_for_row(row, organized_base, link_from.suffix.lower())
         if dest.resolve() != link_from.resolve():
@@ -2777,6 +3673,10 @@ class ExternalLibraryService:
                 if dest.exists():
                     dest.unlink()
                 os.rename(source, dest)
+                self._mark_source_mutated(
+                    playlist_uid=playlist.playlist_uid,
+                    mutation_kind="audio_moved",
+                )
             else:
                 if not self._hardlink_only(source, dest):
                     logger.warning(
@@ -2854,7 +3754,6 @@ class ExternalLibraryService:
 
         save_folder = organized_save_folder(dir_name)
         out: list[PlaylistTrackView] = []
-        readonly = playlist is not None and not playlist.allow_mutate
         direct_ids = {
             loc.video_id
             for loc, _rec in self._catalog.list_for_save_folder(DIRECT_FOLDER)
@@ -2884,6 +3783,7 @@ class ExternalLibraryService:
                     track_number=rec.track_number,
                     organized_relative_path=loc.relative_path,
                     in_direct=rec.video_id in direct_ids,
+                    can_mutate=not rec.immutable,
                 )
             )
 
@@ -2892,7 +3792,8 @@ class ExternalLibraryService:
                 if row.match_status == MATCH_MATCHED:
                     continue
                 tags_ok = self.tags_complete_enough(row.title, row.artists, row.album)
-                junk_kind = self.junk_kind_for_row(row, readonly)
+                can_mutate = self._raw_row_is_mutable(row)
+                junk_kind = self.junk_kind_for_row(row, not can_mutate)
                 if junk_kind is not None and not effective_show_junk:
                     continue
                 out.append(
@@ -2916,10 +3817,85 @@ class ExternalLibraryService:
                         meta_source=row.meta_source,
                         meta_source_id=row.meta_source_id,
                         meta_source_url=row.meta_source_url,
+                        can_mutate=can_mutate,
                     )
                 )
 
         return out
+
+    @staticmethod
+    def _playlist_track_page_key(
+        track: PlaylistTrackView,
+        sort_key: str,
+    ) -> tuple[int, str, str]:
+        """Mirror the UI's stable quality-bucket ordering for paged rows."""
+        if not track.is_raw:
+            bucket = 0
+        elif track.meta_status == META_VERIFIED:
+            bucket = 1
+        elif track.junk_kind == "rw":
+            bucket = 3
+        elif track.junk_kind == "ro":
+            bucket = 4
+        else:
+            bucket = 2
+        value = (
+            track.artist
+            if sort_key == "artist"
+            else track.album
+            if sort_key == "album"
+            else track.title
+        )
+        return bucket, (value or "").casefold(), track.rel_path.casefold()
+
+    def list_playlist_tracks_page(
+        self,
+        dir_name: str,
+        *,
+        offset: int,
+        limit: int,
+        sort_key: str = "title",
+        show_raw: bool | None = None,
+    ) -> tuple[int, list[PlaylistTrackView]]:
+        """Return a stable cached slice instead of serializing the whole list."""
+        normalized_sort = (
+            sort_key if sort_key in {"title", "artist", "album"} else "title"
+        )
+        cache_key = (dir_name, show_raw, normalized_sort)
+        now = time.monotonic()
+        cached = self._track_page_cache.get(cache_key)
+        if cached is None or cached[0] <= now:
+            for key in [
+                key
+                for key, value in self._track_page_cache.items()
+                if value[0] <= now
+            ]:
+                self._track_page_cache.pop(key, None)
+            while len(self._track_page_cache) >= 4:
+                self._track_page_cache.pop(next(iter(self._track_page_cache)))
+            rows = self.list_playlist_tracks(dir_name, show_raw=show_raw)
+            rows.sort(
+                key=lambda track: self._playlist_track_page_key(
+                    track,
+                    normalized_sort,
+                )
+            )
+            # Long enough for a user to browse many pages; all mutations use a
+            # fresh service request after this bounded snapshot expires.
+            cached = (now + 300.0, rows)
+            self._track_page_cache[cache_key] = cached
+        rows = cached[1]
+        start = max(0, int(offset))
+        size = max(1, min(200, int(limit)))
+        return len(rows), rows[start : start + size]
+
+    def invalidate_track_page_cache(self, dir_name: str | None = None) -> None:
+        """Drop paged UI snapshots after a known playlist mutation."""
+        if dir_name is None:
+            self._track_page_cache.clear()
+            return
+        for key in [key for key in self._track_page_cache if key[0] == dir_name]:
+            self._track_page_cache.pop(key, None)
 
     def delete_track(
         self,
@@ -2950,8 +3926,6 @@ class ExternalLibraryService:
             raw_rel = normalized[len(EXTERNAL_RAW_DIR) + 1 :]
             if mode != "delete_raw":
                 raise ValueError("unmatched tracks only support delete_raw")
-            if not playlist.allow_mutate:
-                raise PermissionError("readonly playlist cannot delete raw files")
             deleted, errors = self._delete_raw_paths(dir_name, [raw_rel])
             return {
                 "deleted_files": deleted,
@@ -2979,10 +3953,13 @@ class ExternalLibraryService:
         if loc_rec is None:
             raise ValueError(f"matched track not found: {rel_path}")
         loc, rec = loc_rec
+        if rec.immutable:
+            raise PermissionError("readonly-origin track cannot be removed")
         abs_path = _location_abs_path(loc)
         if abs_path.is_file():
             try:
                 abs_path.unlink()
+                self._mark_catalog_source_mutated(rec, "audio_deleted")
                 lrc = abs_path.with_suffix(".lrc")
                 if lrc.is_file():
                     lrc.unlink(missing_ok=True)
@@ -2993,7 +3970,9 @@ class ExternalLibraryService:
             except OSError:
                 errors = 1
                 logger.warning("Could not delete organized file %s", abs_path)
-        if mode == "clear_match":
+        # Do not detach catalog state if the physical deletion failed; it must
+        # stay visible and retryable.
+        if mode == "clear_match" and errors == 0:
             self._catalog.delete_location(save_folder, loc.relative_path)
             deleted_locations = 1
             for row in self._repository.list_matched(dir_name):
@@ -3017,19 +3996,29 @@ class ExternalLibraryService:
             if row is None or row.dir_name != dir_name:
                 errors += 1
                 continue
+            if not self._raw_row_is_mutable(row):
+                errors += 1
+                logger.warning(
+                    "Refused deletion of readonly-origin raw file %s", raw_rel
+                )
+                continue
             path = EXTERNAL_RAW_ROOT / row.rel_path
+            deleted_or_missing = not path.is_file()
             if path.is_file():
                 try:
                     path.unlink()
+                    self._mark_row_source_mutated(row, "audio_deleted")
                     lrc = path.with_suffix(".lrc")
                     if lrc.is_file():
                         lrc.unlink(missing_ok=True)
                     deleted += 1
+                    deleted_or_missing = True
                     cleanup_after_audio_removed(path.parent, stop_at)
                 except OSError:
                     errors += 1
                     logger.warning("Could not delete raw file %s", path)
-            paths.append(row.rel_path)
+            if deleted_or_missing:
+                paths.append(row.rel_path)
         if paths:
             self._repository.delete_paths(paths)
         return deleted, errors
@@ -3072,7 +4061,7 @@ class ExternalLibraryService:
             row = self.get_raw_track(raw_rel) or row
 
         matched, candidates = self._match_one_with_candidates(
-            row, strict_tags=False, mode=match_mode
+            row, strict_tags=False, mode=match_mode, rate_limit=False
         )
         if matched:
             refreshed = self.get_raw_track(raw_rel)
@@ -3324,6 +4313,8 @@ class ExternalLibraryService:
             refreshed = ExternalRawTrack(
                 rel_path=row.rel_path,
                 dir_name=row.dir_name,
+                origin_kind=row.origin_kind,
+                origin_ref=row.origin_ref,
                 mtime_ns=row.mtime_ns,
                 size=row.size,
                 inode=row.inode,
@@ -3376,10 +4367,17 @@ class ExternalLibraryService:
             ):
                 audio.albumartist = artists
             audio.save()
+            self._mark_row_source_mutated(row, "audio_tags")
         except Exception:
             logger.exception("Failed writing scraped tags to %s", path)
             return False
-        refreshed = _read_raw_tags(path, row.rel_path, row.dir_name)
+        refreshed = _read_raw_tags(
+            path,
+            row.rel_path,
+            row.dir_name,
+            origin_kind=row.origin_kind,
+            origin_ref=row.origin_ref,
+        )
         if refreshed is None:
             return False
         # Preserve match bookkeeping fields when re-upserting from disk.
@@ -3425,7 +4423,7 @@ class ExternalLibraryService:
 
                 length = MediaFile(path).length
                 if length is not None and float(length) > 0:
-                    duration = max(1, int(round(float(length))))
+                    duration = max(1, round(float(length)))
             except Exception:
                 logger.debug(
                     "Could not read duration for post-match enrich %s",
@@ -3454,7 +4452,14 @@ class ExternalLibraryService:
                 ),
                 ytmusic_client=self._client,
             )
+            audio_before = self._existing_file_signature(path)
+            lyrics_path = path.with_suffix(".lrc")
+            lyrics_before = self._existing_file_signature(lyrics_path)
             outcome = service.enrich_file(path, meta, rewrite_metadata=rewrite_metadata)
+            if self._existing_file_changed(
+                path, audio_before
+            ) or self._existing_file_changed(lyrics_path, lyrics_before):
+                self._mark_catalog_source_mutated(record, "media_overwritten")
             self._catalog.update_asset_state(
                 video_id=video_id,
                 has_embedded_cover=outcome.has_embedded_cover,
@@ -3516,6 +4521,8 @@ class ExternalLibraryService:
         self,
         src: Path,
         *,
+        origin_kind: str,
+        origin_ref: str,
         title: str = "",
         artists: str = "",
         album: str = "",
@@ -3524,8 +4531,65 @@ class ExternalLibraryService:
         track_number: int | None = None,
     ) -> Path | None:
         """Move a file into ``Raw/Delete`` as unmatched (YTM id cleared)."""
+        return self._ingest_file_to_raw_system_folder(
+            src,
+            target_dir=EXTERNAL_DELETE_DIR,
+            origin_kind=origin_kind,
+            origin_ref=origin_ref,
+            title=title,
+            artists=artists,
+            album=album,
+            album_artist=album_artist,
+            year=year,
+            track_number=track_number,
+        )
+
+    def ingest_file_to_raw_default(
+        self,
+        src: Path,
+        *,
+        origin_kind: str,
+        origin_ref: str,
+        title: str = "",
+        artists: str = "",
+        album: str = "",
+        album_artist: str = "",
+        year: str | None = None,
+        track_number: int | None = None,
+    ) -> Path | None:
+        """Move an unmatched file into the writable archive ingress."""
+        return self._ingest_file_to_raw_system_folder(
+            src,
+            target_dir=EXTERNAL_DEFAULT_DIR,
+            origin_kind=origin_kind,
+            origin_ref=origin_ref,
+            title=title,
+            artists=artists,
+            album=album,
+            album_artist=album_artist,
+            year=year,
+            track_number=track_number,
+        )
+
+    def _ingest_file_to_raw_system_folder(
+        self,
+        src: Path,
+        *,
+        target_dir: str,
+        origin_kind: str,
+        origin_ref: str,
+        title: str,
+        artists: str,
+        album: str,
+        album_artist: str,
+        year: str | None,
+        track_number: int | None,
+    ) -> Path | None:
+        """Move a file into a system Raw folder while preserving provenance."""
         if not EXTERNAL_ROOT.is_dir():
             raise RuntimeError("external library mount not available")
+        if target_dir not in {EXTERNAL_DELETE_DIR, EXTERNAL_DEFAULT_DIR}:
+            raise ValueError(f"invalid system raw folder: {target_dir}")
         self.ensure_special_playlists()
         if not src.is_file():
             return None
@@ -3534,7 +4598,7 @@ class ExternalLibraryService:
         base_name = f"{safe_artist} - {safe_title}{src.suffix.lower()}"
         # Avoid path separators from tags.
         base_name = base_name.replace("/", "-").replace("\\", "-")
-        dest_dir = EXTERNAL_RAW_ROOT / EXTERNAL_DELETE_DIR
+        dest_dir = EXTERNAL_RAW_ROOT / target_dir
         dest_dir.mkdir(parents=True, exist_ok=True)
         dest = dest_dir / base_name
         if dest.exists():
@@ -3547,13 +4611,30 @@ class ExternalLibraryService:
                     dest = candidate
                     break
                 n += 1
+        # Validate provenance before changing the source file.  A bad caller
+        # must not leave an untracked file in Raw after the move succeeds.
+        if not origin_kind or not origin_ref:
+            raise ValueError("archive source provenance is required")
         self._move_file_preserving_sidecar(src, dest)
-        rel = f"{EXTERNAL_DELETE_DIR}/{dest.name}"
-        row = _read_raw_tags(dest, rel, EXTERNAL_DELETE_DIR)
+        if origin_kind == "external":
+            self._mark_source_mutated(
+                playlist_uid=origin_ref,
+                mutation_kind="audio_moved",
+            )
+        rel = f"{target_dir}/{dest.name}"
+        row = _read_raw_tags(
+            dest,
+            rel,
+            target_dir,
+            origin_kind=origin_kind,
+            origin_ref=origin_ref,
+        )
         if row is None:
             row = ExternalRawTrack(
                 rel_path=rel,
-                dir_name=EXTERNAL_DELETE_DIR,
+                dir_name=target_dir,
+                origin_kind=origin_kind,
+                origin_ref=origin_ref,
                 title=safe_title,
                 artists=safe_artist,
                 album=album or "",
@@ -3734,29 +4815,31 @@ class ExternalLibraryService:
         src = _location_abs_path(loc)
         dest = dest_base / loc.relative_path
         moved = errors = 0
-        if src.is_file():
+        if not src.is_file():
+            logger.warning("Source missing during single move to Direct: %s", src)
+            return {"moved": 0, "deleted_locations": 0, "errors": 1, "ok": False}
+        try:
+            self._move_file_preserving_sidecar(src, dest)
+            moved = 1
+            self._track_index.set(rec.video_id, dest)
             try:
-                self._move_file_preserving_sidecar(src, dest)
-                moved = 1
-                self._track_index.set(rec.video_id, dest)
-                try:
-                    rel_dl = str(dest.resolve().relative_to(DOWNLOAD_ROOT.resolve()))
-                    self._catalog.set_canonical(
-                        rec.video_id,
-                        storage=STORAGE_DOWNLOAD,
-                        relative_path=rel_dl,
-                    )
-                except ValueError:
-                    pass
-            except OSError:
-                errors = 1
-                logger.warning("Could not move %s to %s", src, dest)
-                return {
-                    "moved": 0,
-                    "deleted_locations": 0,
-                    "errors": 1,
-                    "ok": False,
-                }
+                rel_dl = str(dest.resolve().relative_to(DOWNLOAD_ROOT.resolve()))
+                self._catalog.set_canonical(
+                    rec.video_id,
+                    storage=STORAGE_DOWNLOAD,
+                    relative_path=rel_dl,
+                )
+            except ValueError:
+                pass
+        except OSError:
+            errors = 1
+            logger.warning("Could not move %s to %s", src, dest)
+            return {
+                "moved": 0,
+                "deleted_locations": 0,
+                "errors": 1,
+                "ok": False,
+            }
         self._catalog.upsert_location(
             video_id=rec.video_id,
             save_folder=dest_folder,

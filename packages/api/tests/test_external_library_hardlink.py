@@ -6,12 +6,16 @@ import os
 from pathlib import Path
 
 import pytest
-from sqlmodel import SQLModel, create_engine
-
 import yubal.utils.library as library
 import yubal_api.services.external_library_service as ext_svc
-from yubal.utils.library import STORAGE_DOWNLOAD, STORAGE_EXTERNAL
-
+from sqlmodel import SQLModel, create_engine
+from yubal.utils.library import (
+    DIRECT_FOLDER,
+    EXTERNAL_ORGANIZED_DIR,
+    EXTERNAL_RAW_DIR,
+    STORAGE_DOWNLOAD,
+    STORAGE_EXTERNAL,
+)
 from yubal_api.db.external_library_repository import ExternalLibraryRepository
 from yubal_api.db.track_catalog_repository import TrackCatalogRepository
 from yubal_api.services.external_library_service import ExternalLibraryService
@@ -23,15 +27,26 @@ from yubal_api.services.preferences import PreferencesStore
 
 
 @pytest.fixture
-def library_roots(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def library_roots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Path, Path]:
     download = tmp_path / "Download"
     external = tmp_path / "External"
     download.mkdir()
     external.mkdir()
     monkeypatch.setattr(library, "DOWNLOAD_ROOT", download)
     monkeypatch.setattr(library, "EXTERNAL_ROOT", external)
-    monkeypatch.setattr(library, "EXTERNAL_RAW_ROOT", external / "Raw")
-    monkeypatch.setattr(library, "EXTERNAL_ORGANIZED_ROOT", external / "Organized")
+    monkeypatch.setattr(
+        library,
+        "EXTERNAL_RAW_ROOT",
+        external / EXTERNAL_RAW_DIR,
+    )
+    monkeypatch.setattr(
+        library,
+        "EXTERNAL_ORGANIZED_ROOT",
+        external / EXTERNAL_ORGANIZED_DIR,
+    )
     monkeypatch.setattr(
         library,
         "STORAGE_ROOTS",
@@ -67,10 +82,10 @@ def test_raw_organized_link_not_counted_as_download_hardlink(
     """Readonly ingest Raw↔Organized links are exclusive, not hardlink."""
     _download, external = library_roots
     dir_name = "MyList"
-    save_folder = f"Organized/{dir_name}"
+    save_folder = f"{EXTERNAL_ORGANIZED_DIR}/{dir_name}"
     org_rel = "Artist/Year - Album/01 Song.flac"
     org_path = external / save_folder / org_rel
-    raw_path = external / "Raw" / dir_name / "song.flac"
+    raw_path = external / EXTERNAL_RAW_DIR / dir_name / "song.flac"
     org_path.parent.mkdir(parents=True)
     raw_path.parent.mkdir(parents=True)
     raw_path.write_bytes(b"audio")
@@ -110,11 +125,11 @@ def test_copy_into_direct_stays_exclusive_both_sides(
     """Catalog row on Direct + Raw↔Organized nlink must not inflate hardlink."""
     download, external = library_roots
     dir_name = "TEST"
-    save_folder = f"Organized/{dir_name}"
+    save_folder = f"{EXTERNAL_ORGANIZED_DIR}/{dir_name}"
     org_rel = "Artist/Year - Album/01 Song.flac"
     org_path = external / save_folder / org_rel
-    raw_path = external / "Raw" / dir_name / "song.flac"
-    dl_path = download / "Direct" / org_rel
+    raw_path = external / EXTERNAL_RAW_DIR / dir_name / "song.flac"
+    dl_path = download / DIRECT_FOLDER / org_rel
     org_path.parent.mkdir(parents=True)
     raw_path.parent.mkdir(parents=True)
     dl_path.parent.mkdir(parents=True)
@@ -143,7 +158,7 @@ def test_copy_into_direct_stays_exclusive_both_sides(
     )
     catalog.upsert_location(
         video_id="vid-copy",
-        save_folder="Direct",
+        save_folder=DIRECT_FOLDER,
         relative_path=org_rel,
         origin="external_add",
         storage_root=STORAGE_DOWNLOAD,
@@ -158,7 +173,7 @@ def test_copy_into_direct_stays_exclusive_both_sides(
         classify_catalog_file(
             dl_path,
             video_id="vid-copy",
-            save_folder="Direct",
+            save_folder=DIRECT_FOLDER,
             catalog=catalog,
             download_root=download,
         )
@@ -172,7 +187,7 @@ def test_organized_download_link_counted_as_hardlink(
 ) -> None:
     download, external = library_roots
     dir_name = "Shared"
-    save_folder = f"Organized/{dir_name}"
+    save_folder = f"{EXTERNAL_ORGANIZED_DIR}/{dir_name}"
     org_rel = "Artist/Year - Album/01 Song.flac"
     dl_rel = "SubList/Default/Artist/Year - Album/01 Song.flac"
     org_path = external / save_folder / org_rel

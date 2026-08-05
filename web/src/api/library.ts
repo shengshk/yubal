@@ -2,18 +2,21 @@ import { basePath } from "@/lib/base-path";
 import { sharedJsonGet } from "./shared-get";
 
 export type LibraryTrackSummary = {
-  effective_count: number;
-  identified_count: number;
-  unidentified_count: number;
-  verified_count: number;
-  unverified_count: number;
-  physical_count: number;
-  hardlink_duplicate_count: number;
+  effective_count: number | null;
+  identified_count: number | null;
+  unidentified_count: number | null;
+  verified_count: number | null;
+  unverified_count: number | null;
+  physical_count: number | null;
+  hardlink_duplicate_count: number | null;
+  refreshing: boolean;
 };
 
-export async function getLibraryTrackSummary(): Promise<LibraryTrackSummary | null> {
+export async function getLibraryTrackSummary(
+  refresh = false,
+): Promise<LibraryTrackSummary | null> {
   const result = await sharedJsonGet<LibraryTrackSummary>(
-    `${basePath}/api/library/track-summary`,
+    `${basePath}/api/library/track-summary${refresh ? "?refresh=true" : ""}`,
   );
   return result.ok ? result.data : null;
 }
@@ -107,6 +110,10 @@ export async function deleteLibraryFolder(
 
 export function trackCoverUrl(filePath: string): string {
   return `${basePath}/api/library/track-cover?path=${encodeURIComponent(filePath)}`;
+}
+
+export function bestCoverUrl(filePath: string): string {
+  return `${basePath}/api/library/best-cover?path=${encodeURIComponent(filePath)}`;
 }
 
 export function playlistCoverUrl(folder: string): string {

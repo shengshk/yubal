@@ -823,6 +823,12 @@ export interface components {
             next_run_subscription_id?: string | null;
             /** Next Run Subscription Name */
             next_run_subscription_name?: string | null;
+            /** Next Run Target Kind */
+            next_run_target_kind?: "subscription" | "external" | "direct" | "wanted" | "external_inventory" | null;
+            /** Next Run Target Id */
+            next_run_target_id?: string | null;
+            /** Next Run Target Name */
+            next_run_target_name?: string | null;
             subscription_counts: components["schemas"]["SubscriptionCounts"];
         };
         /**

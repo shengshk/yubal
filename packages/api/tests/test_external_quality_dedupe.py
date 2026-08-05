@@ -2,17 +2,19 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import pytest
-from sqlmodel import SQLModel, create_engine
-
 import yubal.utils.library as library
 import yubal_api.db.track_catalog_repository as catalog_repo
 import yubal_api.services.external_library_service as ext_svc
-from yubal.utils.library import STORAGE_DOWNLOAD, STORAGE_EXTERNAL
-
+from sqlmodel import SQLModel, create_engine
+from yubal.utils.library import (
+    EXTERNAL_ORGANIZED_DIR,
+    EXTERNAL_RAW_DIR,
+    STORAGE_DOWNLOAD,
+    STORAGE_EXTERNAL,
+)
 from yubal_api.db.external_library import MATCH_MATCHED, ExternalRawTrack
 from yubal_api.db.external_library_repository import ExternalLibraryRepository
 from yubal_api.db.track_catalog_repository import TrackCatalogRepository
@@ -21,23 +23,42 @@ from yubal_api.services.preferences import PreferencesStore
 
 
 @pytest.fixture
-def library_roots(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def library_roots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Path, Path]:
     download = tmp_path / "Download"
     external = tmp_path / "External"
     download.mkdir()
-    (external / "Raw").mkdir(parents=True)
-    (external / "Organized").mkdir(parents=True)
+    (external / EXTERNAL_RAW_DIR).mkdir(parents=True)
+    (external / EXTERNAL_ORGANIZED_DIR).mkdir(parents=True)
     monkeypatch.setattr(library, "DOWNLOAD_ROOT", download)
     monkeypatch.setattr(library, "EXTERNAL_ROOT", external)
-    monkeypatch.setattr(library, "EXTERNAL_RAW_ROOT", external / "Raw")
-    monkeypatch.setattr(library, "EXTERNAL_ORGANIZED_ROOT", external / "Organized")
+    monkeypatch.setattr(
+        library,
+        "EXTERNAL_RAW_ROOT",
+        external / EXTERNAL_RAW_DIR,
+    )
+    monkeypatch.setattr(
+        library,
+        "EXTERNAL_ORGANIZED_ROOT",
+        external / EXTERNAL_ORGANIZED_DIR,
+    )
     roots = {STORAGE_DOWNLOAD: download, STORAGE_EXTERNAL: external}
     monkeypatch.setattr(library, "STORAGE_ROOTS", roots)
     monkeypatch.setattr(catalog_repo, "STORAGE_ROOTS", roots)
     monkeypatch.setattr(ext_svc, "DOWNLOAD_ROOT", download)
     monkeypatch.setattr(ext_svc, "EXTERNAL_ROOT", external)
-    monkeypatch.setattr(ext_svc, "EXTERNAL_RAW_ROOT", external / "Raw")
-    monkeypatch.setattr(ext_svc, "EXTERNAL_ORGANIZED_ROOT", external / "Organized")
+    monkeypatch.setattr(
+        ext_svc,
+        "EXTERNAL_RAW_ROOT",
+        external / EXTERNAL_RAW_DIR,
+    )
+    monkeypatch.setattr(
+        ext_svc,
+        "EXTERNAL_ORGANIZED_ROOT",
+        external / EXTERNAL_ORGANIZED_DIR,
+    )
     monkeypatch.setattr(ext_svc, "STORAGE_ROOTS", roots)
     return download, external
 
@@ -92,7 +113,7 @@ def test_readonly_worse_raw_links_organized_to_existing(
     )
 
     # Worse Raw (small mp3).
-    raw = external / "Raw" / "TEST2" / "song.mp3"
+    raw = external / EXTERNAL_RAW_DIR / "TEST2" / "song.mp3"
     raw.parent.mkdir(parents=True)
     raw.write_bytes(b"y" * 100)
     service._repository.upsert(
@@ -115,9 +136,11 @@ def test_readonly_worse_raw_links_organized_to_existing(
     assert raw.is_file()
     assert raw.stat().st_nlink == 1  # Raw not linked away
 
-    org_locs = catalog.list_for_save_folder("Organized/TEST2")
+    org_locs = catalog.list_for_save_folder(f"{EXTERNAL_ORGANIZED_DIR}/TEST2")
     assert len(org_locs) == 1
-    org_path = external / "Organized" / "TEST2" / org_locs[0][0].relative_path
+    org_path = (
+        external / EXTERNAL_ORGANIZED_DIR / "TEST2" / org_locs[0][0].relative_path
+    )
     assert org_path.is_file()
     assert org_path.stat().st_ino == sub.stat().st_ino
 
@@ -159,7 +182,7 @@ def test_readonly_better_raw_becomes_master_hardlink(
         relative_path="SubList/Album/song.mp3",
     )
 
-    raw = external / "Raw" / "TEST2" / "song.flac"
+    raw = external / EXTERNAL_RAW_DIR / "TEST2" / "song.flac"
     raw.parent.mkdir(parents=True)
     raw.write_bytes(b"z" * 8000)
     service._repository.upsert(
@@ -180,6 +203,9 @@ def test_readonly_better_raw_becomes_master_hardlink(
 
     assert service.ingest_matched("TEST2/song.flac") is True
     assert raw.is_file()
+    playlist = service._repository.get_playlist("TEST2")
+    assert playlist is not None
+    assert playlist.source_mutated_at is None
 
     sub_after = download / "SubList" / "Album" / "song.mp3"
     assert sub_after.is_file()
@@ -190,4 +216,4 @@ def test_readonly_better_raw_becomes_master_hardlink(
     assert rec is not None
     assert rec.immutable is True
     assert rec.canonical_storage == STORAGE_EXTERNAL
-    assert rec.canonical_rel and rec.canonical_rel.startswith("Raw/")
+    assert rec.canonical_rel and rec.canonical_rel.startswith(f"{EXTERNAL_RAW_DIR}/")

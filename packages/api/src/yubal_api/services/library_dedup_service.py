@@ -76,6 +76,24 @@ class LibraryDedupService:
             )
         return batch
 
+    def collapse_for_folder(self, save_folder: str) -> DedupBatchResult:
+        """Check only IDs touched by one completed folder job."""
+        batch = DedupBatchResult()
+        video_ids = {
+            location.video_id
+            for location, _ in self._catalog.list_for_save_folder(save_folder)
+        }
+        batch.checked = len(video_ids)
+        for video_id in video_ids:
+            locations = self._catalog.list_locations_for_video(video_id)
+            if len(locations) < 2:
+                continue
+            batch.multi_location += 1
+            result = self.ensure_single_inode(video_id)
+            batch.linked += result.linked
+            batch.errors += result.errors
+        return batch
+
     def _resolve_location_path(self, loc: TrackLocation) -> Path | None:
         root = STORAGE_ROOTS.get(loc.storage_root)
         if root is None:
@@ -88,6 +106,11 @@ class LibraryDedupService:
     def ensure_single_inode(self, video_id: str) -> DedupResult:
         """Collapse all of a video's locations onto one physical file."""
         locations = self._catalog.list_locations_for_video(video_id)
+        record = self._catalog.get_track(video_id)
+        if record is not None and record.immutable:
+            # Read-only External sources are never replaced, even when another
+            # location shares the same YTM ID.
+            return DedupResult(video_id=video_id)
         resolved: list[Path] = []
         for loc in locations:
             path = self._resolve_location_path(loc)

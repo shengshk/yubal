@@ -95,6 +95,12 @@ class SyncResponse(BaseModel):
     steps: list["SyncStepResult"] = Field(default_factory=list)
 
 
+class LikedSongRatingRequest(BaseModel):
+    """Requested remote thumbs-up state for an already identified song."""
+
+    liked: bool
+
+
 class SyncStepResult(BaseModel):
     """Immediate Sync All pipeline step result."""
 

@@ -14,15 +14,17 @@ import { getSettings, type TrackSortKey } from "@/api/settings";
 import {
   disposeSubscriptionTrack,
   deleteSubscriptionTrackFile,
+  listSubscriptions,
   listSubscriptionTracks,
   downloadSubscriptionTrack,
+  rateLikedSong,
   unblockSubscriptionTrack,
 } from "@/api/subscriptions";
 import {
   acceptExternalMatch,
   acceptExternalMeta,
   deleteExternalTrack,
-  listExternalPlaylistTracks,
+  listExternalPlaylistTracksPage,
   matchExternalTrack,
   type ExternalMatchCandidate,
   type ExternalMetaCandidate,
@@ -30,17 +32,21 @@ import {
 } from "@/api/external";
 import {
   addWantedTrack,
+  deleteWantedTrack,
   listWantedTracks,
   type WantedTrack,
 } from "@/api/wanted";
 import { useLibraryAudio } from "@/features/sync/library-audio";
+import { FavoriteAction } from "@/features/sync/favorite-action";
 import { SectionIndexRail } from "@/features/sync/section-index-rail";
 import {
   SYNC_ACTION_BTN,
   TRACK_ACTIONS,
+  TRACK_ACTION_SLOT,
   TRACK_INDEX,
   TRACK_INDEX_ICON,
   TRACK_ROW_GRID,
+  TrackActionSlot,
   TrackTextCells,
 } from "@/features/sync/track-columns";
 import {
@@ -66,6 +72,7 @@ import {
   type JunkKind,
 } from "@/features/sync/track-list-order";
 import { formatArtistTitle } from "@/features/sync/track-label";
+import { isLikedMusicUrl } from "@/lib/subscription-labels";
 import { showErrorToast, showSuccessToast } from "@/lib/toast";
 import {
   Button,
@@ -102,6 +109,7 @@ import { useTranslation } from "react-i18next";
 
 const ADDED_TO_DIRECT_KEY = "yubal:added-to-direct";
 const ADDED_TTL_MS = 24 * 60 * 60 * 1000;
+const TRACK_PAGE_SIZE = 100;
 
 function candidateSourceLabel(source: string): string {
   if (source.toLowerCase() === "musicbrainz") return "MusicBrainz";
@@ -184,6 +192,10 @@ type Props = {
   showJunk?: boolean;
   /** Called after a match action completes, so the parent can refresh counts. */
   onMatched?: () => void;
+  /** Makes rows in this list remote Likes; clicking cancels the YTM Like. */
+  likedSubscriptionId?: string | null;
+  /** Only used when two logical sources share the same card. */
+  withTopBorder?: boolean;
 };
 
 const ACTION_BTN = SYNC_ACTION_BTN;
@@ -221,6 +233,7 @@ function wantedTrackToItem(track: WantedTrack, index: number): SyncTrackItem {
     tags_complete: true,
     wanted_id: track.id,
     source_url: track.source_url,
+    meta_source: track.source,
   };
 }
 
@@ -305,6 +318,7 @@ function externalTrackToItem(
     is_junk: Boolean(track.is_junk) || junkKind != null,
     junk_kind: junkKind,
     in_direct: Boolean(track.in_direct),
+    can_mutate: track.can_mutate,
   };
 }
 
@@ -334,8 +348,11 @@ function TrackRow({
   onDownloadRequest,
   onAddToDirect,
   addedToDirect = false,
-  onAddToWanted,
   inWanted = false,
+  wantedTrackId = null,
+  remoteLiked = false,
+  onLikedToggle,
+  onLocalHeartToggle,
 }: {
   track: SyncTrackItem;
   saveFolder: string;
@@ -367,8 +384,11 @@ function TrackRow({
   onDownloadRequest?: (track: SyncTrackItem) => void;
   onAddToDirect?: (track: SyncTrackItem) => void;
   addedToDirect?: boolean;
-  onAddToWanted?: (track: SyncTrackItem) => void;
   inWanted?: boolean;
+  wantedTrackId?: string | null;
+  remoteLiked?: boolean;
+  onLikedToggle?: (track: SyncTrackItem) => void;
+  onLocalHeartToggle?: (track: SyncTrackItem, wantedId?: string | null) => void;
 }) {
   const { t } = useTranslation();
   const audio = useLibraryAudio();
@@ -405,13 +425,13 @@ function TrackRow({
   const showUnmatchedMatch = showMatchOrEnrich && isUnmatched;
   const showMatchedEnrich =
     showMatchOrEnrich && !isUnmatched && Boolean(track.video_id);
-  const showMetaWantedHeart =
-    external &&
-    wantedEnabled &&
-    Boolean(onAddToWanted) &&
+  const hasValidYtmId = Boolean(track.video_id) && !offline && !blocked;
+  const canUseLocalHeart =
+    !wanted &&
+    !hasValidYtmId &&
     track.meta_status === "verified" &&
-    isUnmatched &&
-    !isJunk;
+    track.tags_complete === true &&
+    Boolean(onLocalHeartToggle);
 
   const enrichButtonClass = isPremium
     ? "!text-success-400/80 data-[disabled=true]:opacity-100"
@@ -469,7 +489,10 @@ function TrackRow({
   };
 
   return (
-    <li className="relative h-8 overflow-hidden">
+    <li
+      className="relative h-8 overflow-hidden"
+      style={{ contentVisibility: "auto", containIntrinsicSize: "32px" }}
+    >
       <div
         className={`${TRACK_ROW_GRID} ${
           dimmed ? "text-foreground-400" : "text-foreground"
@@ -517,240 +540,249 @@ function TrackRow({
         />
 
         <div className={TRACK_ACTIONS}>
-          {missing && !offline && !blocked && onDownloadRequest ? (
-            <Button
-              variant="light"
-              size="sm"
-              isIconOnly
-              isLoading={busy}
-              isDisabled={busy || !track.video_id}
-              className={`${ACTION_BTN} text-warning hover:text-warning`}
-              aria-label={t("sync.trackDownload")}
-              title={t("sync.trackDownload")}
-              onPress={() => onDownloadRequest(track)}
-            >
-              <DownloadIcon className="h-3.5 w-3.5" />
-            </Button>
-          ) : null}
-          {showMatchedEnrich && onAddToDirect ? (
-            <Button
-              variant="light"
-              size="sm"
-              isIconOnly
-              isDisabled={busy || addedToDirect}
-              className={`${ACTION_BTN} ${
-                addedToDirect
-                  ? "!text-success-600 opacity-100"
-                  : "text-success hover:text-success"
-              }`}
-              aria-label={
-                addedToDirect
-                  ? t("sync.addToDirectDone")
-                  : t("sync.addToDirect")
-              }
-              title={
-                addedToDirect
-                  ? t("sync.addToDirectDone")
-                  : t("sync.addToDirect")
-              }
-              onPress={() => {
-                if (addedToDirect) return;
-                onAddToDirect(track);
-              }}
-            >
-              <PlusIcon className="h-3.5 w-3.5" />
-            </Button>
-          ) : null}
-          {showMetaWantedHeart ? (
-            <Button
-              variant="light"
-              size="sm"
-              isIconOnly
-              isDisabled={busy || inWanted}
-              className={
-                inWanted
-                  ? `${ACTION_BTN} text-danger opacity-100`
-                  : `${ACTION_BTN} hover:text-danger`
-              }
-              aria-label={
-                inWanted ? t("search.addedToWanted") : t("search.addToWanted")
-              }
-              title={
-                inWanted ? t("search.addedToWanted") : t("search.addToWanted")
-              }
-              onPress={() => {
-                if (!inWanted && onAddToWanted) onAddToWanted(track);
-              }}
-            >
-              <HeartIcon
-                className="h-3.5 w-3.5"
-                fill={inWanted ? "currentColor" : "none"}
-              />
-            </Button>
-          ) : null}
-          {wanted && track.source_url ? (
-            <Button
-              as="a"
-              href={track.source_url}
-              target="_blank"
-              rel="noopener noreferrer"
-              variant="light"
-              size="sm"
-              isIconOnly
-              className={`${ACTION_BTN} hover:text-primary`}
-              aria-label={t("sync.wantedOpenSource")}
-              title={t("sync.wantedOpenSource")}
-            >
-              <ExternalLinkIcon className="h-3.5 w-3.5" />
-            </Button>
-          ) : null}
-
-          {wanted && onWantedMatch ? (
-            <Button
-              variant="light"
-              size="sm"
-              isIconOnly
-              isLoading={busy}
-              className={
-                track.video_id
-                  ? `${ACTION_BTN} hover:text-primary`
-                  : `${ACTION_BTN} !text-danger hover:!text-danger-600`
-              }
-              aria-label={t("sync.wantedMatchYtm")}
-              title={t("sync.wantedMatchYtm")}
-              onPress={() => {
-                if (!busy) onWantedMatch(track);
-              }}
-            >
-              {!busy ? <SparklesIcon className="h-3.5 w-3.5" /> : null}
-            </Button>
-          ) : null}
-
-          {track.video_id ? (
-            <Button
-              as="a"
-              href={`https://music.youtube.com/watch?v=${encodeURIComponent(track.video_id)}`}
-              target="_blank"
-              rel="noopener noreferrer"
-              variant="light"
-              size="sm"
-              isIconOnly
-              className={`${ACTION_BTN} hover:text-primary`}
-              aria-label={t("sync.openInYtm")}
-              title={t("sync.openInYtm")}
-            >
-              <ExternalLinkIcon className="h-3.5 w-3.5" />
-            </Button>
-          ) : null}
-
-          {showEdit ? (
-            <Button
-              variant="light"
-              size="sm"
-              isIconOnly
-              isDisabled={editDisabled}
-              className={`${ACTION_BTN} ${
-                editDisabled ? "opacity-40" : "hover:text-primary"
-              }`}
-              aria-label={
-                mutable ? t("sync.editTrackTags") : t("sync.editTrackAssets")
-              }
-              title={
-                isReadonlyJunk
-                  ? t("sync.editJunkRoHint")
-                  : isWritableJunk
-                    ? t("sync.editJunkRwHint")
-                    : editNeedsMatch
-                      ? t("sync.editAfterMatch")
-                      : mutable
-                        ? t("sync.editTrackTags")
-                        : t("sync.editTrackAssetsHint")
-              }
-              onPress={handleEditPress}
-            >
-              <PencilIcon className="h-3.5 w-3.5" />
-            </Button>
-          ) : null}
-
-          {showUnmatchedMatch ? (
-            <Button
-              variant="light"
-              size="sm"
-              isIconOnly
-              isDisabled={matchDisabled}
-              className={`${ACTION_BTN} !text-danger hover:!text-danger-600`}
-              aria-label={
-                isReadonlyJunk
-                  ? t("sync.matchJunkRoTitle")
-                  : isWritableJunk
-                    ? t("sync.matchJunkRwTitle")
-                    : t("sync.matchTrack")
-              }
-              title={
-                isReadonlyJunk
-                  ? t("sync.matchJunkRoHint")
-                  : isWritableJunk
-                    ? t("sync.matchJunkRwHint")
-                    : t("sync.matchTrack")
-              }
-              onPress={() => {
-                if (!matchDisabled) onMatchRequest?.(track);
-              }}
-            >
-              <SparklesIcon className="h-3.5 w-3.5" />
-            </Button>
-          ) : null}
-
-          {showMatchedEnrich ? (
-            <Button
-              variant="light"
-              size="sm"
-              isIconOnly
-              isDisabled={busy || isPremium}
-              className={`${ACTION_BTN} ${enrichButtonClass}`}
-              aria-label={enrichLabel}
-              title={enrichLabel}
-              onPress={() => onEnrichRequest(track)}
-            >
-              <SparklesIcon className="h-3.5 w-3.5" />
-            </Button>
-          ) : null}
-
-          {blocked ? (
-            <Button
-              variant="light"
-              size="sm"
-              isIconOnly
-              isDisabled={busy}
-              className={`${ACTION_BTN} !text-danger hover:!text-danger-600`}
-              aria-label={t("sync.blockedTrackActions")}
-              title={t("sync.blockedTrackActions")}
-              onPress={() => onUnblockRequest?.(track)}
-            >
-              <BanIcon className="h-3.5 w-3.5" />
-            </Button>
-          ) : offline && onDispose ? (
-            <>
-              <span
-                className="text-warning flex h-7 w-7 items-center justify-center"
-                aria-label={offlineBadgeLabel}
+          <span className={TRACK_ACTION_SLOT}>
+            {offline &&
+            offlineKind === "id_invalid" &&
+            wantedEnabled &&
+            onDispose ? (
+              <Button
+                variant="light"
+                size="sm"
+                isIconOnly
+                isDisabled={busy}
+                className={`${ACTION_BTN} hover:text-danger`}
+                aria-label={t("sync.migrateToWanted")}
+                title={t("sync.migrateToWantedHint")}
+                onPress={() => onDispose(track, "to_wanted")}
               >
-                <CloudOffIcon className="h-3.5 w-3.5" />
-              </span>
-              {wantedEnabled && offlineKind === "id_invalid" ? (
-                <Button
-                  variant="light"
-                  size="sm"
-                  isIconOnly
-                  isDisabled={busy}
-                  className={`${ACTION_BTN} hover:text-primary`}
-                  aria-label={t("sync.migrateToWanted")}
-                  title={t("sync.migrateToWantedHint")}
-                  onPress={() => onDispose(track, "to_wanted")}
-                >
-                  <HeartIcon className="h-3.5 w-3.5" />
-                </Button>
-              ) : null}
+                <HeartIcon className="h-3.5 w-3.5" />
+              </Button>
+            ) : wanted && track.wanted_id && onLocalHeartToggle ? (
+              <FavoriteAction
+                kind="local"
+                active
+                busy={busy}
+                className={ACTION_BTN}
+                onPress={() => onLocalHeartToggle(track, track.wanted_id)}
+              />
+            ) : hasValidYtmId && onLikedToggle ? (
+              <FavoriteAction
+                kind="remote"
+                active={remoteLiked}
+                busy={busy}
+                className={ACTION_BTN}
+                onPress={() => onLikedToggle(track)}
+              />
+            ) : canUseLocalHeart ? (
+              <FavoriteAction
+                kind="local"
+                active={inWanted}
+                busy={busy}
+                className={ACTION_BTN}
+                onPress={() => onLocalHeartToggle!(track, wantedTrackId)}
+              />
+            ) : (
+              <FavoriteAction
+                kind={track.video_id ? "remote" : "local"}
+                active={false}
+                disabled
+                className={ACTION_BTN}
+              />
+            )}
+          </span>
+          <TrackActionSlot
+            fallbackIcon={<ExternalLinkIcon className="h-3.5 w-3.5" />}
+            fallbackLabel={t("sync.openInYtm")}
+          >
+            {wanted && track.source_url ? (
+              <Button
+                as="a"
+                href={track.source_url}
+                target="_blank"
+                rel="noopener noreferrer"
+                variant="light"
+                size="sm"
+                isIconOnly
+                className={`${ACTION_BTN} hover:text-primary`}
+                aria-label={t("sync.wantedOpenSource")}
+                title={t("sync.wantedOpenSource")}
+              >
+                <ExternalLinkIcon className="h-3.5 w-3.5" />
+              </Button>
+            ) : track.video_id ? (
+              <Button
+                as="a"
+                href={`https://music.youtube.com/watch?v=${encodeURIComponent(track.video_id)}`}
+                target="_blank"
+                rel="noopener noreferrer"
+                variant="light"
+                size="sm"
+                isIconOnly
+                className={`${ACTION_BTN} hover:text-primary`}
+                aria-label={t("sync.openInYtm")}
+                title={t("sync.openInYtm")}
+              >
+                <ExternalLinkIcon className="h-3.5 w-3.5" />
+              </Button>
+            ) : null}
+          </TrackActionSlot>
+          <TrackActionSlot
+            fallbackIcon={<DownloadIcon className="h-3.5 w-3.5" />}
+            fallbackLabel={t("sync.trackDownload")}
+          >
+            {missing && !offline && !blocked && onDownloadRequest ? (
+              <Button
+                variant="light"
+                size="sm"
+                isIconOnly
+                isLoading={busy}
+                isDisabled={busy || !track.video_id}
+                className={`${ACTION_BTN} text-warning hover:text-warning`}
+                aria-label={t("sync.trackDownload")}
+                title={t("sync.trackDownload")}
+                onPress={() => onDownloadRequest(track)}
+              >
+                <DownloadIcon className="h-3.5 w-3.5" />
+              </Button>
+            ) : showMatchedEnrich && onAddToDirect ? (
+              <Button
+                variant="light"
+                size="sm"
+                isIconOnly
+                isDisabled={busy || addedToDirect}
+                className={`${ACTION_BTN} ${
+                  addedToDirect
+                    ? "!text-success-600 opacity-100"
+                    : "text-success hover:text-success"
+                }`}
+                aria-label={
+                  addedToDirect
+                    ? t("sync.addToDirectDone")
+                    : t("sync.addToDirect")
+                }
+                title={
+                  addedToDirect
+                    ? t("sync.addToDirectDone")
+                    : t("sync.addToDirect")
+                }
+                onPress={() => {
+                  if (!addedToDirect) onAddToDirect(track);
+                }}
+              >
+                <PlusIcon className="h-3.5 w-3.5" />
+              </Button>
+            ) : null}
+          </TrackActionSlot>
+          <TrackActionSlot
+            fallbackIcon={<PencilIcon className="h-3.5 w-3.5" />}
+            fallbackLabel={t("sync.editTrackTags")}
+          >
+            {showEdit ? (
+              <Button
+                variant="light"
+                size="sm"
+                isIconOnly
+                isDisabled={editDisabled}
+                className={`${ACTION_BTN} ${
+                  editDisabled ? "opacity-40" : "hover:text-primary"
+                }`}
+                aria-label={
+                  mutable ? t("sync.editTrackTags") : t("sync.editTrackAssets")
+                }
+                title={
+                  isReadonlyJunk
+                    ? t("sync.editJunkRoHint")
+                    : isWritableJunk
+                      ? t("sync.editJunkRwHint")
+                      : editNeedsMatch
+                        ? t("sync.editAfterMatch")
+                        : mutable
+                          ? t("sync.editTrackTags")
+                          : t("sync.editTrackAssetsHint")
+                }
+                onPress={handleEditPress}
+              >
+                <PencilIcon className="h-3.5 w-3.5" />
+              </Button>
+            ) : null}
+          </TrackActionSlot>
+          <TrackActionSlot
+            fallbackIcon={<SparklesIcon className="h-3.5 w-3.5" />}
+            fallbackLabel={t("sync.matchTrack")}
+          >
+            {wanted && onWantedMatch ? (
+              <Button
+                variant="light"
+                size="sm"
+                isIconOnly
+                isLoading={busy}
+                className={
+                  track.video_id
+                    ? `${ACTION_BTN} hover:text-primary`
+                    : `${ACTION_BTN} !text-danger hover:!text-danger-600`
+                }
+                aria-label={t("sync.wantedMatchYtm")}
+                title={t("sync.wantedMatchYtm")}
+                onPress={() => {
+                  if (!busy) onWantedMatch(track);
+                }}
+              >
+                {!busy ? <SparklesIcon className="h-3.5 w-3.5" /> : null}
+              </Button>
+            ) : showUnmatchedMatch ? (
+              <Button
+                variant="light"
+                size="sm"
+                isIconOnly
+                isDisabled={matchDisabled}
+                className={`${ACTION_BTN} !text-danger hover:!text-danger-600`}
+                aria-label={
+                  isReadonlyJunk
+                    ? t("sync.matchJunkRoTitle")
+                    : isWritableJunk
+                      ? t("sync.matchJunkRwTitle")
+                      : t("sync.matchTrack")
+                }
+                title={
+                  isReadonlyJunk
+                    ? t("sync.matchJunkRoHint")
+                    : isWritableJunk
+                      ? t("sync.matchJunkRwHint")
+                      : t("sync.matchTrack")
+                }
+                onPress={() => {
+                  if (!matchDisabled) onMatchRequest?.(track);
+                }}
+              >
+                <SparklesIcon className="h-3.5 w-3.5" />
+              </Button>
+            ) : showMatchedEnrich ? (
+              <Button
+                variant="light"
+                size="sm"
+                isIconOnly
+                isDisabled={busy || isPremium}
+                className={`${ACTION_BTN} ${enrichButtonClass}`}
+                aria-label={enrichLabel}
+                title={enrichLabel}
+                onPress={() => onEnrichRequest(track)}
+              >
+                <SparklesIcon className="h-3.5 w-3.5" />
+              </Button>
+            ) : blocked ? (
+              <Button
+                variant="light"
+                size="sm"
+                isIconOnly
+                isDisabled={busy}
+                className={`${ACTION_BTN} !text-danger hover:!text-danger-600`}
+                aria-label={t("sync.blockedTrackActions")}
+                title={t("sync.blockedTrackActions")}
+                onPress={() => onUnblockRequest?.(track)}
+              >
+                <BanIcon className="h-3.5 w-3.5" />
+              </Button>
+            ) : offline && onDispose ? (
               <Button
                 variant="light"
                 size="sm"
@@ -763,6 +795,25 @@ function TrackRow({
               >
                 <ArchiveIcon className="h-3.5 w-3.5" />
               </Button>
+            ) : offline ? (
+              <Button
+                variant="light"
+                size="sm"
+                isIconOnly
+                isDisabled
+                className={`${ACTION_BTN} text-warning opacity-40`}
+                aria-label={offlineBadgeLabel}
+                title={offlineBadgeLabel}
+              >
+                <CloudOffIcon className="h-3.5 w-3.5" />
+              </Button>
+            ) : null}
+          </TrackActionSlot>
+          <TrackActionSlot
+            fallbackIcon={<Trash2Icon className="h-3.5 w-3.5" />}
+            fallbackLabel={t("sync.deleteTrack")}
+          >
+            {offline && onDispose ? (
               <Button
                 variant="light"
                 size="sm"
@@ -775,15 +826,7 @@ function TrackRow({
               >
                 <Trash2Icon className="h-3.5 w-3.5" />
               </Button>
-            </>
-          ) : offline && !onDispose && canDelete ? (
-            <>
-              <span
-                className="text-warning flex h-7 w-7 items-center justify-center"
-                aria-label={offlineBadgeLabel}
-              >
-                <CloudOffIcon className="h-3.5 w-3.5" />
-              </span>
+            ) : canDelete ? (
               <Button
                 variant="light"
                 size="sm"
@@ -791,24 +834,13 @@ function TrackRow({
                 className={`${ACTION_BTN} hover:text-danger`}
                 isDisabled={missing && !allowDeleteWhenMissing}
                 aria-label={t("sync.deleteTrack")}
+                title={t("sync.deleteTrack")}
                 onPress={() => onDeleteRequest(track)}
               >
                 <Trash2Icon className="h-3.5 w-3.5" />
               </Button>
-            </>
-          ) : canDelete ? (
-            <Button
-              variant="light"
-              size="sm"
-              isIconOnly
-              className={`${ACTION_BTN} hover:text-danger`}
-              isDisabled={missing && !allowDeleteWhenMissing}
-              aria-label={t("sync.deleteTrack")}
-              onPress={() => onDeleteRequest(track)}
-            >
-              <Trash2Icon className="h-3.5 w-3.5" />
-            </Button>
-          ) : null}
+            ) : null}
+          </TrackActionSlot>
         </div>
       </div>
     </li>
@@ -831,6 +863,8 @@ export function LedgerTrackList({
   onWantedDelete,
   onWantedMatch,
   wantedBusyId,
+  likedSubscriptionId = null,
+  withTopBorder = true,
 }: Props) {
   const { t } = useTranslation();
   const audio = useLibraryAudio();
@@ -859,8 +893,20 @@ export function LedgerTrackList({
   const [selectedMetaKey, setSelectedMetaKey] = useState<string | null>(null);
   const [acceptingMatch, setAcceptingMatch] = useState(false);
   const [wantedKeys, setWantedKeys] = useState<Set<string>>(new Set());
+  const [wantedTrackIds, setWantedTrackIds] = useState<Map<string, string>>(
+    new Map(),
+  );
+  const [likedVideoIds, setLikedVideoIds] = useState<Set<string>>(new Set());
+  const [favoriteSubscriptionId, setFavoriteSubscriptionId] = useState<
+    string | null
+  >(null);
   const [addingWantedPath, setAddingWantedPath] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [externalNextOffset, setExternalNextOffset] = useState<number | null>(
+    null,
+  );
+  const [externalTotal, setExternalTotal] = useState(0);
   const [externalEnabled, setExternalEnabled] = useState(false);
   const [wantedEnabled, setWantedEnabled] = useState(false);
   const [addedMap, setAddedMap] = useState<Record<string, number>>(() =>
@@ -878,9 +924,11 @@ export function LedgerTrackList({
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const [indexThreshold, setIndexThreshold] = useState(DEFAULT_INDEX_THRESHOLD);
   const [trackSortKey, setTrackSortKey] = useState<TrackSortKey>("title");
+  const [renderLimit, setRenderLimit] = useState(TRACK_PAGE_SIZE);
 
   const reload = useCallback(() => {
     if (!open) return;
+    setRenderLimit(TRACK_PAGE_SIZE);
 
     if (isWanted) {
       const token = ++reloadToken.current;
@@ -901,13 +949,20 @@ export function LedgerTrackList({
       if (!externalDirName) return;
       const token = ++reloadToken.current;
       setLoading(true);
-      void listExternalPlaylistTracks(externalDirName).then((items) => {
+      setLoadingMore(false);
+      void listExternalPlaylistTracksPage(externalDirName, {
+        offset: 0,
+        limit: TRACK_PAGE_SIZE,
+        refresh: true,
+      }).then((page) => {
         if (token !== reloadToken.current) return;
-        const mapped = items
-          .map((item, i) => externalTrackToItem(item, i))
+        const mapped = page.items
+          .map((item, i) => externalTrackToItem(item, page.offset + i + 1))
           .filter((item) => showRaw || item.tier !== "raw")
           .filter((item) => showJunk || !item.is_junk);
         setTracks(mapped);
+        setExternalTotal(page.total);
+        setExternalNextOffset(page.next_offset);
         setOfflineIds(new Set());
         setIdInvalidIds(new Set());
         setBlockedIds(new Set());
@@ -1027,9 +1082,52 @@ export function LedgerTrackList({
     showJunk,
   ]);
 
+  const loadMoreExternal = useCallback(() => {
+    if (
+      !open ||
+      !isExternal ||
+      !externalDirName ||
+      externalNextOffset === null ||
+      loading ||
+      loadingMore
+    ) {
+      return;
+    }
+    const token = reloadToken.current;
+    const offset = externalNextOffset;
+    setLoadingMore(true);
+    void listExternalPlaylistTracksPage(externalDirName, {
+      offset,
+      limit: TRACK_PAGE_SIZE,
+    }).then((page) => {
+      if (token !== reloadToken.current) return;
+      const mapped = page.items
+        .map((item, i) => externalTrackToItem(item, page.offset + i + 1))
+        .filter((item) => showRaw || item.tier !== "raw")
+        .filter((item) => showJunk || !item.is_junk);
+      setTracks((current) => [...(current ?? []), ...mapped]);
+      setExternalTotal(page.total);
+      setExternalNextOffset(page.next_offset);
+      setLoadingMore(false);
+    });
+  }, [
+    externalDirName,
+    externalNextOffset,
+    isExternal,
+    loading,
+    loadingMore,
+    open,
+    showJunk,
+    showRaw,
+  ]);
+
   useEffect(() => {
     if (!open) {
       setTracks(null);
+      setRenderLimit(TRACK_PAGE_SIZE);
+      setExternalNextOffset(null);
+      setExternalTotal(0);
+      setLoadingMore(false);
       setOfflineIds(new Set());
       setBlockedIds(new Set());
       setOfflineMembershipIds(new Map());
@@ -1068,8 +1166,9 @@ export function LedgerTrackList({
   }, []);
 
   useEffect(() => {
-    if (!isExternal || !wantedEnabled) {
+    if (!open || !wantedEnabled) {
       setWantedKeys(new Set());
+      setWantedTrackIds(new Map());
       return;
     }
     let cancelled = false;
@@ -1077,12 +1176,20 @@ export function LedgerTrackList({
       const rows = await listWantedTracks();
       if (cancelled) return;
       const next = new Set<string>();
+      const ids = new Map<string, string>();
       for (const row of rows) {
-        next.add(wantedSoftKey(row.title, row.artists, row.album));
+        const soft = wantedSoftKey(row.title, row.artists, row.album);
+        next.add(soft);
+        ids.set(soft, row.id);
         const sid = (row.source_id || row.video_id || "").trim();
-        if (sid) next.add(`sid:${sid}`);
+        if (sid) {
+          const key = `sid:${sid}`;
+          next.add(key);
+          ids.set(key, row.id);
+        }
       }
       setWantedKeys(next);
+      setWantedTrackIds(ids);
     };
     void loadWanted();
     const onChanged = () => {
@@ -1093,7 +1200,39 @@ export function LedgerTrackList({
       cancelled = true;
       window.removeEventListener("yubal:ledger-changed", onChanged);
     };
-  }, [isExternal, wantedEnabled]);
+  }, [open, wantedEnabled]);
+
+  useEffect(() => {
+    if (!open || isWanted) return;
+    let cancelled = false;
+    const loadLiked = async () => {
+      const liked = (await listSubscriptions()).find((sub) =>
+        isLikedMusicUrl(sub.url),
+      );
+      if (cancelled) return;
+      setFavoriteSubscriptionId(liked?.id ?? null);
+      if (!liked) {
+        setLikedVideoIds(new Set());
+        return;
+      }
+      const rows = await listSubscriptionTracks(liked.id);
+      if (cancelled) return;
+      setLikedVideoIds(
+        new Set(
+          rows
+            .filter((row) => row.membership_status === "active")
+            .map((row) => row.video_id),
+        ),
+      );
+    };
+    void loadLiked();
+    const onChanged = () => void loadLiked();
+    window.addEventListener("yubal:ledger-changed", onChanged);
+    return () => {
+      cancelled = true;
+      window.removeEventListener("yubal:ledger-changed", onChanged);
+    };
+  }, [open, isWanted]);
 
   const combinedTracks = useMemo(() => {
     if (!tracks) return null;
@@ -1121,14 +1260,19 @@ export function LedgerTrackList({
     ];
   }, [combinedTracks, trackSortKey, orderCtx, isWanted]);
 
+  const renderedOrderedTracks = useMemo(
+    () => orderedTracks?.slice(0, renderLimit) ?? null,
+    [orderedTracks, renderLimit],
+  );
+
   const indexedMode = Boolean(
-    combinedTracks && combinedTracks.length >= indexThreshold,
+    renderedOrderedTracks && renderedOrderedTracks.length >= indexThreshold,
   );
 
   const sections = useMemo(() => {
-    if (!orderedTracks || !indexedMode) return null;
-    return buildOrderedTrackSections(orderedTracks, trackSortKey);
-  }, [orderedTracks, indexedMode, trackSortKey]);
+    if (!renderedOrderedTracks || !indexedMode) return null;
+    return buildOrderedTrackSections(renderedOrderedTracks, trackSortKey);
+  }, [renderedOrderedTracks, indexedMode, trackSortKey]);
 
   /** Current track in this folder (playing or paused) — pinned above the list. */
   const pinnedTrack = useMemo(() => {
@@ -1149,13 +1293,13 @@ export function LedgerTrackList({
 
   /** Flat display order: playing pinned, then unified bucket sort. */
   const displayTracks = useMemo(() => {
-    if (!orderedTracks) return null;
-    if (!pinnedKey) return orderedTracks;
-    return orderedTracks.filter(
+    if (!renderedOrderedTracks) return null;
+    if (!pinnedKey) return renderedOrderedTracks;
+    return renderedOrderedTracks.filter(
       (track) =>
         audioPath(saveFolder, track.relative_path, rawPath) !== pinnedKey,
     );
-  }, [orderedTracks, pinnedKey, saveFolder, rawPath]);
+  }, [renderedOrderedTracks, pinnedKey, saveFolder, rawPath]);
 
   const listSections = useMemo(() => {
     if (!sections) return null;
@@ -1273,25 +1417,60 @@ export function LedgerTrackList({
     };
   }, [sectionsWithIds]);
 
+  useEffect(() => {
+    const root = viewportRef.current;
+    if (!root || !isExternal || externalNextOffset === null) return;
+    const maybeLoad = () => {
+      if (root.scrollHeight - root.scrollTop - root.clientHeight < 192) {
+        loadMoreExternal();
+      }
+    };
+    maybeLoad();
+    root.addEventListener("scroll", maybeLoad, { passive: true });
+    return () => root.removeEventListener("scroll", maybeLoad);
+  }, [externalNextOffset, isExternal, loadMoreExternal]);
+
+  useEffect(() => {
+    const root = viewportRef.current;
+    if (
+      !root ||
+      isExternal ||
+      !orderedTracks ||
+      renderLimit >= orderedTracks.length
+    ) {
+      return;
+    }
+    const maybeReveal = () => {
+      if (root.scrollHeight - root.scrollTop - root.clientHeight < 192) {
+        setRenderLimit((current) =>
+          Math.min(current + TRACK_PAGE_SIZE, orderedTracks.length),
+        );
+      }
+    };
+    maybeReveal();
+    root.addEventListener("scroll", maybeReveal, { passive: true });
+    return () => root.removeEventListener("scroll", maybeReveal);
+  }, [isExternal, orderedTracks, renderLimit]);
+
   const displayNumbers = useMemo(() => {
     if (!combinedTracks) return new Map<string, string>();
     return assignDisplayNumbers(combinedTracks, trackSortKey, orderCtx);
   }, [combinedTracks, trackSortKey, orderCtx]);
 
-  /** Wanted numbering: plain # for hardlinked, W# for tags-only. */
+  /** Local-heart numbering: R for cloud-like recovery, H for local hearts. */
   const wantedNumbers = useMemo(() => {
     const map = new Map<string, string>();
     if (!isWanted || !orderedTracks) return map;
-    let matched = 0;
-    let unmatched = 0;
+    let recovery = 0;
+    let localHeart = 0;
     for (const track of orderedTracks) {
       if (!track.wanted_id) continue;
-      if (track.relative_path) {
-        matched += 1;
-        map.set(track.wanted_id, String(matched));
+      if (track.meta_source === "liked_recovery") {
+        recovery += 1;
+        map.set(track.wanted_id, `R${recovery}`);
       } else {
-        unmatched += 1;
-        map.set(track.wanted_id, `W${unmatched}`);
+        localHeart += 1;
+        map.set(track.wanted_id, `H${localHeart}`);
       }
     }
     return map;
@@ -1345,6 +1524,33 @@ export function LedgerTrackList({
       );
     }
     reload();
+    window.dispatchEvent(new Event("yubal:ledger-changed"));
+  };
+
+  const toggleRemoteLike = async (track: SyncTrackItem) => {
+    const subscriptionId = likedSubscriptionId || favoriteSubscriptionId;
+    if (!subscriptionId || !track.video_id || busyVideoId) return;
+    const liked = likedVideoIds.has(track.video_id);
+    setBusyVideoId(track.video_id);
+    const result = await rateLikedSong(subscriptionId, track.video_id, !liked);
+    setBusyVideoId(null);
+    if (!result.success) {
+      showErrorToast(
+        liked ? t("sync.unlikeYtm") : t("sync.likeYtm"),
+        result.error,
+      );
+      return;
+    }
+    setLikedVideoIds((current) => {
+      const next = new Set(current);
+      if (liked) next.delete(track.video_id!);
+      else next.add(track.video_id!);
+      return next;
+    });
+    showSuccessToast(
+      liked ? t("sync.unlikeYtm") : t("sync.likeYtm"),
+      liked ? t("sync.unlikeYtmQueued") : t("sync.likeYtmQueued"),
+    );
     window.dispatchEvent(new Event("yubal:ledger-changed"));
   };
 
@@ -1465,6 +1671,28 @@ export function LedgerTrackList({
     });
     showSuccessToast(t("search.addToWanted"), t("search.addedToWanted"));
     window.dispatchEvent(new Event("yubal:ledger-changed"));
+  };
+
+  const toggleLocalHeart = async (
+    track: SyncTrackItem,
+    wantedId?: string | null,
+  ) => {
+    if (addingWantedPath) return;
+    if (wantedId) {
+      setAddingWantedPath(track.relative_path || wantedId);
+      const ok = await deleteWantedTrack(wantedId, "remove");
+      setAddingWantedPath(null);
+      if (!ok) {
+        showErrorToast(
+          t("sync.removeLocalHeart"),
+          t("sync.favoriteActionFailed"),
+        );
+        return;
+      }
+      window.dispatchEvent(new Event("yubal:ledger-changed"));
+      return;
+    }
+    await handleAddMetaToWanted(track);
   };
 
   const handleTagsSaved = (result: {
@@ -1662,13 +1890,14 @@ export function LedgerTrackList({
   if (!open) return null;
 
   const renderRow = (track: SyncTrackItem) => {
-    const quality = isExternal ? externalQualityTier(track, allowMutate) : null;
+    const rowMutable = isExternal ? (track.can_mutate ?? allowMutate) : true;
+    const quality = isExternal ? externalQualityTier(track, rowMutable) : null;
     const rowCanDelete = isExternal
       ? quality === "junk_rw" || quality === "junk_ro"
         ? false
         : quality === "raw"
-          ? allowMutate
-          : Boolean(canDelete)
+          ? rowMutable
+          : Boolean(canDelete) && rowMutable
       : Boolean(canDelete);
     return (
       <TrackRow
@@ -1710,7 +1939,7 @@ export function LedgerTrackList({
           (!isWanted && addingWantedPath === track.relative_path)
         }
         playable
-        mutable={!isExternal || allowMutate}
+        mutable={!isExternal || rowMutable}
         external={isExternal}
         wanted={isWanted}
         wantedEnabled={wantedEnabled}
@@ -1753,14 +1982,21 @@ export function LedgerTrackList({
         addedToDirect={Boolean(
           track.in_direct || addedMap[track.video_id || track.relative_path],
         )}
-        onAddToWanted={
-          isExternal && wantedEnabled
-            ? (item) => {
-                void handleAddMetaToWanted(item);
-              }
+        inWanted={trackWantedKeys(track).some((k) => wantedKeys.has(k))}
+        wantedTrackId={
+          trackWantedKeys(track)
+            .map((key) => wantedTrackIds.get(key))
+            .find(Boolean) ?? null
+        }
+        remoteLiked={Boolean(
+          track.video_id && likedVideoIds.has(track.video_id),
+        )}
+        onLikedToggle={
+          !isWanted && (likedSubscriptionId || favoriteSubscriptionId)
+            ? toggleRemoteLike
             : undefined
         }
-        inWanted={trackWantedKeys(track).some((k) => wantedKeys.has(k))}
+        onLocalHeartToggle={toggleLocalHeart}
       />
     );
   };
@@ -1768,7 +2004,9 @@ export function LedgerTrackList({
   return (
     <>
       <div
-        className="border-default-200 bg-content2/40 relative z-10 border-t"
+        className={`bg-content2/40 relative z-10 ${
+          withTopBorder ? "border-default-200 border-t" : ""
+        }`}
         role="region"
         aria-label={t("sync.trackList")}
       >
@@ -1822,6 +2060,14 @@ export function LedgerTrackList({
                       {displayTracks.map((track) => renderRow(track))}
                     </ul>
                   )}
+                  {loadingMore ? (
+                    <div className="text-foreground-400 flex h-10 items-center justify-center gap-2 text-xs">
+                      <Spinner size="sm" />
+                      <span>
+                        {tracks?.length ?? 0} / {externalTotal}
+                      </span>
+                    </div>
+                  ) : null}
                 </div>
               </div>
               {indexedMode && sectionsWithIds ? (

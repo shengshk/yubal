@@ -5,8 +5,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import secrets
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -18,6 +19,11 @@ from yubal.utils.url import (
 )
 
 from yubal_api.db.track_catalog_repository import TrackCatalogRepository
+from yubal_api.services.factory_reset_service import (
+    FactoryResetMode,
+    FactoryResetPreview,
+    FactoryResetService,
+)
 from yubal_api.services.job_executor import JobExecutor
 from yubal_api.services.job_store import JobStore
 from yubal_api.services.library_hardlink import location_abs_path
@@ -29,7 +35,6 @@ from yubal_api.services.subscription_service import SubscriptionService
 from yubal_api.services.telegram.admin_reports import (
     collect_library_stats,
     collect_runtime_status,
-    render_factory_placeholder,
     render_start_guide,
     render_stats,
     render_status,
@@ -111,6 +116,11 @@ class ChatSession:
     # Meta wish payloads aligned by index when kind == meta
     online_meta: list[dict[str, Any]] = field(default_factory=list)
     pending_url: str = ""
+    factory_mode: FactoryResetMode | None = None
+    factory_token: str = ""
+    factory_stage: int = 0
+    factory_code: str = ""
+    factory_expires_at: datetime | None = None
     busy: bool = False
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
@@ -135,6 +145,8 @@ def _callback_toast(data: str) -> str:
         return "已选择"
     if data.startswith("ow:"):
         return "已加入心愿"
+    if data.startswith("fr"):
+        return "已选择"
     return "处理中…"
 
 
@@ -168,6 +180,7 @@ class TelegramBotService:
         library_health: LibraryHealthService | None = None,
         db_engine: object | None = None,
         wanted_service: WantedService | None = None,
+        factory_reset: FactoryResetService | None = None,
     ) -> None:
         self._preferences = preferences
         self._catalog = catalog
@@ -180,6 +193,7 @@ class TelegramBotService:
         self._scheduler = scheduler
         self._library_health = library_health
         self._wanted = wanted_service
+        self._factory_reset = factory_reset
         self._db_engine = db_engine or getattr(catalog, "_engine", None)
         self._data_path = data_path
         self._tg_api_url = (tg_api_url or "").strip()
@@ -198,6 +212,12 @@ class TelegramBotService:
     @property
     def is_running(self) -> bool:
         return self._task is not None and not self._task.done()
+
+    def clear_factory_state(self) -> None:
+        """Drop account-bound Telegram caches after a full reset."""
+        self._file_ids.clear()
+        self._quota.clear()
+        self._sessions.clear()
 
     async def start(self) -> None:
         await self.reload()
@@ -316,7 +336,20 @@ class TelegramBotService:
         session.query = ""
         session.online_ids = []
         session.pending_url = ""
+        session.factory_mode = None
+        session.factory_token = ""
+        session.factory_stage = 0
+        session.factory_code = ""
+        session.factory_expires_at = None
         session.busy = False
+
+    async def _clear_controls(self, chat_id: int) -> None:
+        """Remove control messages without discarding an active factory flow."""
+        assert self._client is not None
+        session = self._session(chat_id)
+        for mid in list(session.control_ids):
+            await self._client.delete_message(chat_id, mid)
+        session.control_ids.clear()
 
     async def _flash(
         self,
@@ -462,6 +495,14 @@ class TelegramBotService:
             await self._handle_admin_command(chat_id, legacy[text], user_mid=mid)
             return
 
+        if (
+            role == "admin"
+            and session.factory_mode is FactoryResetMode.FULL
+            and session.factory_stage == 2
+        ):
+            await self._handle_factory_code(chat_id, text)
+            return
+
         if session.busy or session.lock.locked():
             tip = await self._say(chat_id, "请稍候，当前操作尚未结束。")
             self._spawn(
@@ -491,8 +532,8 @@ class TelegramBotService:
                 body = await self._report_status()
                 delay = _BURN_REPORT
             elif cmd == "factory":
-                body = render_factory_placeholder()
-                delay = _BURN_REPORT
+                await self._start_factory_menu(chat_id)
+                return
             else:
                 body = "未知命令。"
                 delay = _BURN_EPHEMERAL
@@ -558,6 +599,247 @@ class TelegramBotService:
             library_healthy=healthy,
         )
         return render_status(status)
+
+    async def _start_factory_menu(self, chat_id: int) -> None:
+        await self._cleanup(chat_id)
+        await self._say(
+            chat_id,
+            "\n".join(
+                [
+                    "恢复与清理",
+                    "",
+                    "1. 恢复默认偏好",
+                    "保留歌单、文件、账号、Cookie 与 TG 配置。",
+                    "",
+                    "2. 清理无效数据",
+                    "清理 Yubal 管理范围内无 ID 且未验证的数据；"
+                    "外部原始曲库保留。",
+                    "",
+                    "3. 完全恢复出厂",
+                    "永久清除全部音乐、列表、备份、Cookie、账号与 TG 配置。",
+                ]
+            ),
+            reply_markup=_inline(
+                [
+                    [("1 · 恢复偏好", "fr:1")],
+                    [("2 · 清理无效数据", "fr:2")],
+                    [("3 · 完全恢复出厂", "fr:3")],
+                    [("取消", "x")],
+                ]
+            ),
+        )
+
+    @staticmethod
+    def _factory_counts(preview: FactoryResetPreview) -> str:
+        size_mib = preview.bytes / (1024 * 1024)
+        return (
+            f"列表记录 {preview.list_entries} · "
+            f"真实文件 {preview.files} · "
+            f"路径 {preview.paths} · "
+            f"{size_mib:.1f} MiB"
+        )
+
+    async def _factory_preview(
+        self,
+        chat_id: int,
+        mode: FactoryResetMode,
+    ) -> FactoryResetPreview | None:
+        if self._factory_reset is None:
+            await self._say(chat_id, "恢复服务暂不可用。")
+            await self._cleanup(chat_id)
+            return None
+        preview = await asyncio.to_thread(self._factory_reset.preview, mode)
+        session = self._session(chat_id)
+        session.factory_mode = mode
+        session.factory_token = preview.token
+        session.factory_stage = 1
+        session.factory_expires_at = datetime.now(UTC) + timedelta(
+            seconds=preview.expires_in_seconds
+        )
+        return preview
+
+    async def _handle_factory_callback(
+        self,
+        chat_id: int,
+        role: str,
+        data: str,
+    ) -> None:
+        if role != "admin":
+            await self._say(chat_id, "无权限。")
+            await self._cleanup(chat_id)
+            return
+        session = self._session(chat_id)
+
+        if data in {"fr:1", "fr:2", "fr:3"}:
+            await self._clear_controls(chat_id)
+            mode = {
+                "fr:1": FactoryResetMode.PREFERENCES,
+                "fr:2": FactoryResetMode.INVALID,
+                "fr:3": FactoryResetMode.FULL,
+            }[data]
+            preview = await self._factory_preview(chat_id, mode)
+            if preview is None:
+                return
+            if mode is FactoryResetMode.PREFERENCES:
+                await self._say(
+                    chat_id,
+                    "确认恢复默认偏好？\n不会删除歌单、文件或账号。",
+                    reply_markup=_inline(
+                        [[("确认恢复", "fr1:go"), ("取消", "x")]]
+                    ),
+                )
+            elif mode is FactoryResetMode.INVALID:
+                await self._say(
+                    chat_id,
+                    "\n".join(
+                        [
+                            "第一次确认：清理无效数据",
+                            self._factory_counts(preview),
+                            "",
+                            "只处理无 YTM ID 且未通过标签验证的数据；"
+                            "外部原始文件保留。",
+                        ]
+                    ),
+                    reply_markup=_inline(
+                        [[("继续", "fr2:next"), ("取消", "x")]]
+                    ),
+                )
+            else:
+                await self._say(
+                    chat_id,
+                    "\n".join(
+                        [
+                            "第一次确认：完全恢复出厂",
+                            self._factory_counts(preview),
+                            f"数据库备份 {preview.backups}",
+                            "",
+                            "所有音乐、外部原始文件、列表、备份、Cookie、"
+                            "Web 账号与 TG 配置都将永久删除。",
+                        ]
+                    ),
+                    reply_markup=_inline(
+                        [[("我已了解，继续", "fr3:next"), ("取消", "x")]]
+                    ),
+                )
+            return
+
+        if not session.factory_token or session.factory_mode is None:
+            await self._say(chat_id, "确认已过期，请重新输入 /factory。")
+            await self._cleanup(chat_id)
+            return
+        if (
+            session.factory_expires_at is None
+            or session.factory_expires_at <= datetime.now(UTC)
+        ):
+            await self._say(chat_id, "确认已过期，请重新输入 /factory。")
+            await self._cleanup(chat_id)
+            return
+
+        if data == "fr1:go" and session.factory_mode is FactoryResetMode.PREFERENCES:
+            await self._execute_factory_from_telegram(chat_id)
+            return
+        if data == "fr2:next" and session.factory_mode is FactoryResetMode.INVALID:
+            session.factory_stage = 2
+            await self._clear_controls(chat_id)
+            await self._say(
+                chat_id,
+                "第二次确认：删除后无法在 Yubal 中恢复这些无效数据。",
+                reply_markup=_inline(
+                    [[("确认清理", "fr2:go"), ("取消", "x")]]
+                ),
+            )
+            return
+        if data == "fr2:go" and session.factory_mode is FactoryResetMode.INVALID:
+            await self._execute_factory_from_telegram(chat_id)
+            return
+        if data == "fr3:next" and session.factory_mode is FactoryResetMode.FULL:
+            session.factory_stage = 2
+            session.factory_code = f"{secrets.randbelow(1_000_000):06d}"
+            await self._clear_controls(chat_id)
+            await self._say(
+                chat_id,
+                "\n".join(
+                    [
+                        "第二次确认：此操作不可恢复。",
+                        f"请在 5 分钟内发送验证码：{session.factory_code}",
+                        "发送其他内容不会执行删除。",
+                    ]
+                ),
+            )
+            return
+
+        await self._say(chat_id, "确认状态无效，请重新输入 /factory。")
+        await self._cleanup(chat_id)
+
+    async def _handle_factory_code(self, chat_id: int, text: str) -> None:
+        session = self._session(chat_id)
+        if (
+            session.factory_mode is not FactoryResetMode.FULL
+            or session.factory_stage != 2
+            or not session.factory_code
+        ):
+            return
+        if (
+            session.factory_expires_at is None
+            or session.factory_expires_at <= datetime.now(UTC)
+        ):
+            await self._say(chat_id, "验证码已过期，请重新输入 /factory。")
+            await self._cleanup(chat_id)
+            return
+        if not secrets.compare_digest(text, session.factory_code):
+            await self._flash(
+                chat_id,
+                "验证码不正确，未执行删除。",
+                delay=_BURN_EPHEMERAL,
+            )
+            return
+        await self._execute_factory_from_telegram(chat_id, authorized=True)
+
+    async def _execute_factory_from_telegram(
+        self,
+        chat_id: int,
+        *,
+        authorized: bool = False,
+    ) -> None:
+        session = self._session(chat_id)
+        mode = session.factory_mode
+        token = session.factory_token
+        if self._factory_reset is None or mode is None or not token:
+            await self._say(chat_id, "确认已过期，请重新输入 /factory。")
+            await self._cleanup(chat_id)
+            return
+        await self._clear_controls(chat_id)
+        await self._say(chat_id, "正在执行，请勿重复操作。", track=False)
+        try:
+            await asyncio.to_thread(
+                self._factory_reset.execute,
+                mode,
+                token,
+                authorized=authorized,
+            )
+        except (PermissionError, ValueError):
+            await self._say(chat_id, "确认已失效，未执行删除。", track=False)
+            await self._cleanup(chat_id)
+            return
+
+        await self._say(
+            chat_id,
+            (
+                "完全恢复出厂已完成，Web 端需要重新注册。"
+                if mode is FactoryResetMode.FULL
+                else "操作已完成。"
+            ),
+            track=False,
+        )
+        if mode is FactoryResetMode.FULL:
+            self.clear_factory_state()
+            asyncio.create_task(self._reload_after_factory())
+        else:
+            await self._cleanup(chat_id)
+
+    async def _reload_after_factory(self) -> None:
+        await asyncio.sleep(1)
+        await self.reload()
 
     # -- input routing ---------------------------------------------------------
 
@@ -900,9 +1182,16 @@ class TelegramBotService:
             try:
                 await self._handle_callback(chat_id, user_id, role, data)
             except Exception:
-                logger.exception("Telegram callback failed: %s", data)
+                delivery = data.startswith(("pick:", "loc:"))
+                if delivery:
+                    logger.exception("Telegram audio delivery failed: %s", data)
+                else:
+                    logger.exception("Telegram callback failed: %s", data)
                 try:
-                    await self._say(chat_id, "操作失败。")
+                    await self._say(
+                        chat_id,
+                        "音频发送失败，请稍后重试。" if delivery else "操作失败。",
+                    )
                 except Exception:
                     pass
                 await self._cleanup(chat_id)
@@ -913,6 +1202,10 @@ class TelegramBotService:
         self, chat_id: int, user_id: int, role: str, data: str
     ) -> None:
         session = self._session(chat_id)
+
+        if data.startswith("fr"):
+            await self._handle_factory_callback(chat_id, role, data)
+            return
 
         if data == "x":
             if session.preview_msg_id is not None and self._client:

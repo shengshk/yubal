@@ -10,7 +10,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from yubal.utils.library import TRACK_INDEX_DIR
+from yubal.utils.library import runtime_state_path
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +23,7 @@ COVER_CHECK_DOWNLOAD = "download"
 
 
 def scrape_state_path(base_path: Path) -> Path:
-    return base_path / TRACK_INDEX_DIR / "scrape_state.json"
+    return runtime_state_path(base_path, "scrape_state.json")
 
 
 def _parse_dt(value: Any) -> datetime | None:
@@ -111,9 +111,7 @@ class TrackScrapeState:
             kind_s = None
 
         return cls(
-            cover_source=str(raw["cover_source"])
-            if raw.get("cover_source")
-            else None,
+            cover_source=str(raw["cover_source"]) if raw.get("cover_source") else None,
             apple_checked_at=_parse_dt(raw.get("apple_checked_at")),
             cover_compared_at=_parse_dt(raw.get("cover_compared_at")),
             cover_check_kind=kind_s,
@@ -161,9 +159,7 @@ class ScrapeStateStore:
             self._data[video_id] = state
             self._save_unlocked()
 
-    def apple_in_cooldown(
-        self, state: TrackScrapeState, cooldown_hours: int
-    ) -> bool:
+    def apple_in_cooldown(self, state: TrackScrapeState, cooldown_hours: int) -> bool:
         """Legacy helper: hours-based Apple miss cooldown (lyrics-era)."""
         if cooldown_hours <= 0 or state.apple_checked_at is None:
             return False

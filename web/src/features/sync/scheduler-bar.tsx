@@ -4,6 +4,7 @@ import type { LibraryTrackSummary } from "@/api/library";
 import type { SchedulerStatus } from "@/api/subscriptions";
 import type { SyncStepResult } from "@/api/subscriptions";
 import { formatSmartDateTime } from "@/lib/format";
+import { externalPlaylistDisplayName } from "@/lib/playlist-labels";
 import { layout } from "@/lib/ui-styles";
 import { Alert, Tooltip } from "@heroui/react";
 import {
@@ -47,11 +48,20 @@ export function SchedulerBar({
     onCountdownExpire,
   );
   const schedulerOn = schedulerStatus?.enabled !== false;
-  const nextTitle = schedulerStatus?.next_run_subscription_name?.trim() || null;
+  const nextTitle = schedulerStatus?.next_run_target_name?.trim() || null;
+  const nextKind = schedulerStatus?.next_run_target_kind;
+  const nextTarget = nextTitle
+    ? nextKind === "external"
+      ? `${t("settings.externalTitle")} · ${externalPlaylistDisplayName(nextTitle, t)}`
+      : nextKind === "subscription"
+        ? `${t("playlists.nextSubscription")} · ${nextTitle}`
+        : nextTitle
+    : null;
   const nextUpdateLabel =
     countdown === "—"
       ? t("playlists.nextUpdate")
       : `${t("playlists.nextUpdate")}：${countdown}${t("playlists.remaining")}`;
+  const summaryValue = (value: number | null | undefined) => value ?? "—";
 
   return (
     <div className={`${layout.blockMargin} flex flex-col gap-4`}>
@@ -60,8 +70,31 @@ export function SchedulerBar({
           placement="bottom-start"
           content={
             <div className="max-w-[18rem] space-y-1 text-xs leading-relaxed">
-              <p>{t("playlists.librarySummaryTipScope")}</p>
-              <p>{t("playlists.librarySummaryTipRule")}</p>
+              <p>
+                {t("playlists.detailEffective")}：
+                {summaryValue(librarySummary?.effective_count)}
+              </p>
+              <p>
+                {t("playlists.detailWithId")}：
+                {summaryValue(librarySummary?.identified_count)}
+                {" · "}
+                {t("playlists.detailWithoutId")}：
+                {summaryValue(librarySummary?.unidentified_count)}
+              </p>
+              <p>
+                {t("playlists.detailVerified")}：
+                {summaryValue(librarySummary?.verified_count)}
+                {" · "}
+                {t("playlists.detailUnverified")}：
+                {summaryValue(librarySummary?.unverified_count)}
+              </p>
+              <p>
+                {t("playlists.detailPhysical")}：
+                {summaryValue(librarySummary?.physical_count)}
+                {" · "}
+                {t("playlists.detailHardlinkPaths")}：
+                {summaryValue(librarySummary?.hardlink_duplicate_count)}
+              </p>
             </div>
           }
           classNames={{ content: "px-3 py-2" }}
@@ -72,7 +105,7 @@ export function SchedulerBar({
               className="max-w-full"
             >
               <SubscriptionCard.Value className="text-xs">
-                {librarySummary
+                {librarySummary?.effective_count != null
                   ? t("playlists.libraryTrackBreakdown", {
                       effective: librarySummary.effective_count,
                       identified: librarySummary.identified_count,
@@ -80,7 +113,7 @@ export function SchedulerBar({
                       verified: librarySummary.verified_count,
                       unverified: librarySummary.unverified_count,
                     })
-                  : "—"}
+                  : t("playlists.librarySummaryCalculating")}
               </SubscriptionCard.Value>
             </SubscriptionCard.Header>
             <SubscriptionCard.Icon className="bg-primary/10 text-primary">
@@ -92,14 +125,30 @@ export function SchedulerBar({
         <Tooltip
           placement="bottom"
           content={
-            <p className="max-w-[18rem] text-xs leading-relaxed">
-              {t("playlists.subscriptionCountTip")}
-            </p>
+            <div className="max-w-[18rem] space-y-1 text-xs leading-relaxed">
+              <p>
+                {t("playlists.detailEnabledSubscriptions")}：{enabledCount}
+              </p>
+              <p>
+                {t("playlists.detailTotalSubscriptions")}：{totalCount}
+              </p>
+              <p>
+                {t("playlists.detailScheduler")}：
+                {t(
+                  schedulerOn
+                    ? "playlists.detailEnabled"
+                    : "playlists.detailDisabled",
+                )}
+              </p>
+            </div>
           }
           classNames={{ content: "px-3 py-2" }}
         >
           <div className="h-full w-full">
-            <SubscriptionCard className="h-full w-full" isDisabled={!schedulerOn}>
+            <SubscriptionCard
+              className="h-full w-full"
+              isDisabled={!schedulerOn}
+            >
               <SubscriptionCard.Header title={t("playlists.subscriptionCount")}>
                 <SubscriptionCard.Value
                   suffix={t("playlists.ofTotal", { count: totalCount })}
@@ -117,18 +166,47 @@ export function SchedulerBar({
         <Tooltip
           placement="bottom"
           content={
-            <p className="max-w-[18rem] text-xs leading-relaxed">
-              {t(
-                schedulerOn
-                  ? "playlists.nextUpdateTip"
-                  : "playlists.lastDataUpdateTip",
+            <div className="max-w-[20rem] space-y-1 text-xs leading-relaxed">
+              <p>
+                {t("playlists.detailScheduler")}：
+                {t(
+                  schedulerOn
+                    ? "playlists.detailEnabled"
+                    : "playlists.detailDisabled",
+                )}
+              </p>
+              {schedulerOn ? (
+                <>
+                  <p>
+                    {t("playlists.detailPlannedAt")}：
+                    {formatSmartDateTime(schedulerStatus?.next_run_at ?? null)}
+                  </p>
+                  <p>
+                    {t("playlists.detailRemaining")}：{countdown}
+                  </p>
+                  <p>
+                    {t("playlists.detailNextTask")}：{nextTarget ?? "—"}
+                  </p>
+                  <p>
+                    {t("playlists.detailTimezone")}：
+                    {schedulerStatus?.timezone ?? "—"}
+                  </p>
+                </>
+              ) : (
+                <p>
+                  {t("playlists.detailLastDataUpdate")}：
+                  {formatSmartDateTime(lastDataUpdatedAt)}
+                </p>
               )}
-            </p>
+            </div>
           }
           classNames={{ content: "px-3 py-2" }}
         >
           <div className="h-full w-full">
-            <SubscriptionCard className="h-full w-full" isDisabled={!schedulerOn}>
+            <SubscriptionCard
+              className="h-full w-full"
+              isDisabled={!schedulerOn}
+            >
               <SubscriptionCard.Header
                 title={
                   schedulerOn ? nextUpdateLabel : t("playlists.lastDataUpdate")
@@ -136,7 +214,7 @@ export function SchedulerBar({
               >
                 {schedulerOn ? (
                   <SubscriptionCard.Value>
-                    {nextTitle ?? "—"}
+                    {nextTarget ?? "—"}
                   </SubscriptionCard.Value>
                 ) : (
                   <SubscriptionCard.Value>

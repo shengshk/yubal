@@ -52,6 +52,11 @@ class FileIdStore:
             self._data[vid] = {"file_id": fid, "kind": k}
             self._save_unlocked()
 
+    def clear(self) -> None:
+        with self._lock:
+            self._data = {}
+            self._path.unlink(missing_ok=True)
+
     def _load(self) -> None:
         if not self._path.exists():
             return
@@ -117,6 +122,12 @@ class DailyQuota:
             self._counts[key] = used + 1
             self._save_unlocked()
             return True
+
+    def clear(self) -> None:
+        with self._lock:
+            self._day = date.today().isoformat()
+            self._counts = {}
+            self._path.unlink(missing_ok=True)
 
     def _roll(self) -> None:
         today = date.today().isoformat()

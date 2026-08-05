@@ -160,6 +160,28 @@ export async function clearSubscriptionOffline(
   };
 }
 
+/** Change one identified track's remote YTM thumbs-up state, then refresh LM. */
+export async function rateLikedSong(
+  subscriptionId: string,
+  videoId: string,
+  liked: boolean,
+): Promise<{ success: true } | { success: false; error: string }> {
+  const res = await fetch(
+    `${basePath}/api/subscriptions/${encodeURIComponent(subscriptionId)}` +
+      `/tracks/${encodeURIComponent(videoId)}/rating`,
+    {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ liked }),
+    },
+  );
+  if (!res.ok) {
+    return { success: false, error: await res.text() };
+  }
+  return { success: true };
+}
+
 export async function listSubscriptionTracks(
   id: string,
   status?: MembershipStatus,

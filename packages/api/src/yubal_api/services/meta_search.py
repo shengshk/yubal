@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
+import time
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote
@@ -30,6 +32,26 @@ _QQ_SEARCH = "https://c.y.qq.com/soso/fcgi-bin/client_search_cp"
 _MB_SEARCH = "https://musicbrainz.org/ws/2/recording"
 _DISCOGS_SEARCH = "https://api.discogs.com/database/search"
 _LASTFM_SEARCH = "https://ws.audioscrobbler.com/2.0/"
+
+# MusicBrainz asks clients to stay at or below one request per second.  This
+# module is used by Wanted and External passes, which can run on different
+# worker threads, so the limiter must be shared rather than per batch.
+_MB_MIN_REQUEST_INTERVAL_SECONDS = 1.05
+_MB_DEFAULT_COOLDOWN_SECONDS = 15 * 60
+_MB_MAX_COOLDOWN_SECONDS = 60 * 60
+_mb_request_lock = threading.Lock()
+_mb_next_request_at = 0.0
+_mb_cooldown_until = 0.0
+
+
+class MusicBrainzUnavailableError(RuntimeError):
+    """MusicBrainz is temporarily unavailable or in a provider cooldown."""
+
+
+def musicbrainz_cooldown_remaining_seconds() -> int:
+    """Return the shared provider cooldown without making a request."""
+    with _mb_request_lock:
+        return max(0, round(_mb_cooldown_until - time.monotonic()))
 
 
 @dataclass(frozen=True)
@@ -82,15 +104,101 @@ def _safe_get_json(
         return None
 
 
+def _musicbrainz_retry_after_seconds(exc: Exception) -> float:
+    """Honor a numeric Retry-After header, bounded to a sensible cooldown."""
+    if not isinstance(exc, httpx.HTTPStatusError) or exc.response is None:
+        return _MB_DEFAULT_COOLDOWN_SECONDS
+    try:
+        retry_after = float(exc.response.headers.get("Retry-After", ""))
+    except ValueError:
+        return _MB_DEFAULT_COOLDOWN_SECONDS
+    return min(_MB_MAX_COOLDOWN_SECONDS, max(1.0, retry_after))
+
+
+def _is_musicbrainz_transient_error(exc: Exception) -> bool:
+    if isinstance(exc, httpx.TransportError):
+        return True
+    return isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in {
+        429,
+        500,
+        502,
+        503,
+        504,
+    }
+
+
+def _reserve_musicbrainz_request() -> None:
+    """Wait for the shared rate limit and fail fast while the source cools."""
+    global _mb_next_request_at
+    with _mb_request_lock:
+        now = time.monotonic()
+        if now < _mb_cooldown_until:
+            remaining = round(_mb_cooldown_until - now)
+            raise MusicBrainzUnavailableError(
+                f"MusicBrainz cooldown active ({remaining}s remaining)"
+            )
+        wait_seconds = max(0.0, _mb_next_request_at - now)
+        _mb_next_request_at = (
+            max(_mb_next_request_at, now) + _MB_MIN_REQUEST_INTERVAL_SECONDS
+        )
+
+    if wait_seconds:
+        time.sleep(wait_seconds)
+
+    # A request which was already queued can wake after another request opened
+    # the circuit; do not send it into a known outage.
+    with _mb_request_lock:
+        if time.monotonic() < _mb_cooldown_until:
+            remaining = round(_mb_cooldown_until - time.monotonic())
+            raise MusicBrainzUnavailableError(
+                f"MusicBrainz cooldown active ({remaining}s remaining)"
+            )
+
+
+def _cool_down_musicbrainz(exc: Exception) -> None:
+    global _mb_cooldown_until
+    delay = _musicbrainz_retry_after_seconds(exc)
+    with _mb_request_lock:
+        _mb_cooldown_until = max(_mb_cooldown_until, time.monotonic() + delay)
+
+
+def _get_musicbrainz_json(
+    *,
+    params: dict[str, Any],
+    headers: dict[str, str],
+) -> Any:
+    """Rate-limited MusicBrainz request with one retry for a dropped socket."""
+    for attempt in range(2):
+        _reserve_musicbrainz_request()
+        try:
+            return _get_json(_MB_SEARCH, params=params, headers=headers)
+        except Exception as exc:
+            if not _is_musicbrainz_transient_error(exc):
+                raise
+            # A one-off EOF can recover on the next, rate-limited connection.
+            if isinstance(exc, httpx.TransportError) and attempt == 0:
+                logger.info("MusicBrainz transport error; retrying once: %s", exc)
+                continue
+            _cool_down_musicbrainz(exc)
+            raise MusicBrainzUnavailableError(
+                "MusicBrainz temporarily unavailable; source cooled down"
+            ) from exc
+    raise AssertionError("unreachable")
+
+
 def search_musicbrainz(
     query: str, *, limit: int = 8, raise_on_error: bool = False
 ) -> list[MetaHit]:
-    getter = _get_json if raise_on_error else _safe_get_json
-    data = getter(
-        _MB_SEARCH,
-        params={"query": query, "fmt": "json", "limit": limit},
-        headers={**_UA, "Accept": "application/json"},
-    )
+    try:
+        data = _get_musicbrainz_json(
+            params={"query": query, "fmt": "json", "limit": limit},
+            headers={**_UA, "Accept": "application/json"},
+        )
+    except Exception as exc:
+        if raise_on_error:
+            raise
+        logger.info("Meta search failed %s: %s", _MB_SEARCH, exc)
+        return []
     if not isinstance(data, dict):
         return []
     hits: list[MetaHit] = []

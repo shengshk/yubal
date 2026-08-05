@@ -85,6 +85,7 @@ RUN chmod +x /entrypoint.sh
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
     YUBAL_ROOT=/app \
+    YUBAL_STATE_ROOT=/config/state \
     YUBAL_HOST=0.0.0.0 \
     YUBAL_PORT=8000
 

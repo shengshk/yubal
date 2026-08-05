@@ -7,7 +7,12 @@ from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, status
 
-from yubal_api.api.deps import SyncPipelineServiceDep, WantedServiceDep
+from yubal_api.api.deps import (
+    SchedulerDep,
+    SubscriptionServiceDep,
+    SyncPipelineServiceDep,
+    WantedServiceDep,
+)
 from yubal_api.schemas.wanted import (
     WantedAddRequest,
     WantedDeleteRequest,
@@ -15,6 +20,7 @@ from yubal_api.schemas.wanted import (
     WantedSummary,
     WantedTrackResponse,
 )
+from yubal_api.services.subscription_service import is_liked_music_url
 
 router = APIRouter(prefix="/wanted", tags=["wanted"])
 
@@ -78,15 +84,34 @@ def match_local(wanted: WantedServiceDep) -> dict:
 @router.post("/sync", response_model=dict)
 async def sync_wanted(pipeline: SyncPipelineServiceDep) -> dict:
     """Run the canonical pipeline for the Wanted playlist scope."""
-    return await asyncio.to_thread(pipeline.sync_wanted, trigger="wanted")
+    return await asyncio.to_thread(
+        pipeline.sync_wanted,
+        trigger="wanted",
+        force_ytm=True,
+    )
 
 
 @router.post("/tracks/{track_id}/match-ytm", response_model=dict)
-async def match_ytm_one(track_id: UUID, wanted: WantedServiceDep) -> dict:
+async def match_ytm_one(
+    track_id: UUID,
+    wanted: WantedServiceDep,
+    subscriptions: SubscriptionServiceDep,
+    scheduler: SchedulerDep,
+) -> dict:
     try:
-        return await asyncio.to_thread(wanted.match_ytm_one, track_id)
+        result = await asyncio.to_thread(wanted.match_ytm_one, track_id)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if result.get("awaiting_liked_sync"):
+        liked = next(
+            (sub for sub in subscriptions.list(enabled=True) if is_liked_music_url(sub.url)),
+            None,
+        )
+        if liked is not None:
+            job_id = scheduler.sync_subscription(liked.id)
+            if job_id is not None:
+                result["liked_sync_job_id"] = job_id
+    return result
 
 
 @router.post("/match/ytm", response_model=dict)

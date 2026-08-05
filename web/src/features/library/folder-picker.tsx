@@ -5,6 +5,7 @@ import {
   renameLibraryFolder,
   type LibraryFolders,
 } from "@/api/library";
+import { ConfirmationModal } from "@/components/common/confirmation-modal";
 import {
   buildFolderTree,
   canCreateChild,
@@ -285,12 +286,7 @@ function occupiedHasChildUnder(
   return false;
 }
 
-export function FolderPicker({
-  label,
-  value,
-  onChange,
-  isDisabled,
-}: Props) {
+export function FolderPicker({ label, value, onChange, isDisabled }: Props) {
   const { t } = useTranslation();
   const [folders, setFolders] = useState<LibraryFolders | null>(null);
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
@@ -298,6 +294,7 @@ export function FolderPicker({
   const [inlineEdit, setInlineEdit] = useState<InlineEdit | null>(null);
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [deletePath, setDeletePath] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     const data = await listLibraryFolders();
@@ -390,7 +387,9 @@ export function FolderPicker({
   };
 
   const startRename = (path: string) => {
-    const name = path.includes("/") ? path.slice(path.lastIndexOf("/") + 1) : path;
+    const name = path.includes("/")
+      ? path.slice(path.lastIndexOf("/") + 1)
+      : path;
     setActionError(null);
     setInlineEdit({ mode: "rename", path, name });
     setContextMenu(null);
@@ -445,9 +444,6 @@ export function FolderPicker({
   };
 
   const handleDelete = async (path: string) => {
-    setContextMenu(null);
-    const ok = window.confirm(t("library.deleteConfirm", { path }));
-    if (!ok) return;
     setBusy(true);
     setActionError(null);
     const result = await deleteLibraryFolder(path);
@@ -463,92 +459,106 @@ export function FolderPicker({
   };
 
   return (
-    <div className="flex flex-col gap-2">
-      <div className="flex items-baseline justify-between gap-2">
-        <span className="text-foreground-600 text-sm">{label}</span>
-        {value ? (
-          <span className="text-foreground-400 max-w-[70%] truncate font-mono text-xs">
-            {value}
-          </span>
-        ) : null}
-      </div>
+    <>
+      <div className="flex flex-col gap-2">
+        <div className="flex items-baseline justify-between gap-2">
+          <span className="text-foreground-600 text-sm">{label}</span>
+          {value ? (
+            <span className="text-foreground-400 max-w-[70%] truncate font-mono text-xs">
+              {value}
+            </span>
+          ) : null}
+        </div>
 
-      <div
-        className={`border-default-200 max-h-56 overflow-y-auto rounded-lg border ${
-          isDisabled ? "pointer-events-none opacity-50" : ""
-        }`}
-      >
-        <ul className="m-0 list-none p-1">
-          <TreeRow
-            node={rootNode}
-            depth={0}
-            selected={value}
-            expanded={expanded}
-            occupied={occupied}
-            emptyFolders={emptyFolders}
-            inlineEdit={inlineEdit}
-            busy={busy}
-            isRoot
-            onToggle={handleToggle}
-            onSelect={onChange}
-            onContextMenu={openContextMenu}
-            onInlineNameChange={(name) => {
-              setInlineEdit((prev) => (prev ? { ...prev, name } : prev));
-            }}
-            onInlineCommit={() => {
-              void commitInline();
-            }}
-            onInlineCancel={() => setInlineEdit(null)}
-            isDisabled={isDisabled}
-          />
-        </ul>
-      </div>
-
-      {sharedCount > 1 && (
-        <p className="text-warning text-xs">
-          {t("library.sharedHint", { count: sharedCount })}
-        </p>
-      )}
-
-      {actionError && <p className="text-danger text-xs">{actionError}</p>}
-
-      {contextMenu && (
         <div
-          className="border-default-200 bg-content1 fixed z-[100] min-w-[10rem] rounded-lg border py-1 shadow-lg"
-          style={{ left: contextMenu.x, top: contextMenu.y }}
-          onClick={(event) => event.stopPropagation()}
+          className={`border-default-200 max-h-56 overflow-y-auto rounded-lg border ${
+            isDisabled ? "pointer-events-none opacity-50" : ""
+          }`}
         >
-          {contextMenu.canCreate && (
-            <button
-              type="button"
-              className="hover:bg-default-100 w-full px-3 py-2 text-left text-sm"
-              onClick={() => startCreate(contextMenu.path)}
-            >
-              {t("library.contextNewChild")}
-            </button>
-          )}
-          {contextMenu.canManage && (
-            <>
+          <ul className="m-0 list-none p-1">
+            <TreeRow
+              node={rootNode}
+              depth={0}
+              selected={value}
+              expanded={expanded}
+              occupied={occupied}
+              emptyFolders={emptyFolders}
+              inlineEdit={inlineEdit}
+              busy={busy}
+              isRoot
+              onToggle={handleToggle}
+              onSelect={onChange}
+              onContextMenu={openContextMenu}
+              onInlineNameChange={(name) => {
+                setInlineEdit((prev) => (prev ? { ...prev, name } : prev));
+              }}
+              onInlineCommit={() => {
+                void commitInline();
+              }}
+              onInlineCancel={() => setInlineEdit(null)}
+              isDisabled={isDisabled}
+            />
+          </ul>
+        </div>
+
+        {sharedCount > 1 && (
+          <p className="text-warning text-xs">
+            {t("library.sharedHint", { count: sharedCount })}
+          </p>
+        )}
+
+        {actionError && <p className="text-danger text-xs">{actionError}</p>}
+
+        {contextMenu && (
+          <div
+            className="border-default-200 bg-content1 fixed z-[100] min-w-[10rem] rounded-lg border py-1 shadow-lg"
+            style={{ left: contextMenu.x, top: contextMenu.y }}
+            onClick={(event) => event.stopPropagation()}
+          >
+            {contextMenu.canCreate && (
               <button
                 type="button"
                 className="hover:bg-default-100 w-full px-3 py-2 text-left text-sm"
-                onClick={() => startRename(contextMenu.path)}
+                onClick={() => startCreate(contextMenu.path)}
               >
-                {t("library.contextRename")}
+                {t("library.contextNewChild")}
               </button>
-              <button
-                type="button"
-                className="hover:bg-danger-50 text-danger w-full px-3 py-2 text-left text-sm"
-                onClick={() => {
-                  void handleDelete(contextMenu.path);
-                }}
-              >
-                {t("library.contextDelete")}
-              </button>
-            </>
-          )}
-        </div>
-      )}
-    </div>
+            )}
+            {contextMenu.canManage && (
+              <>
+                <button
+                  type="button"
+                  className="hover:bg-default-100 w-full px-3 py-2 text-left text-sm"
+                  onClick={() => startRename(contextMenu.path)}
+                >
+                  {t("library.contextRename")}
+                </button>
+                <button
+                  type="button"
+                  className="hover:bg-danger-50 text-danger w-full px-3 py-2 text-left text-sm"
+                  onClick={() => {
+                    setDeletePath(contextMenu.path);
+                    setContextMenu(null);
+                  }}
+                >
+                  {t("library.contextDelete")}
+                </button>
+              </>
+            )}
+          </div>
+        )}
+      </div>
+      <ConfirmationModal
+        isOpen={deletePath !== null}
+        message={t("library.deleteConfirm", { path: deletePath ?? "" })}
+        confirmColor="danger"
+        isBusy={busy}
+        onClose={() => setDeletePath(null)}
+        onConfirm={() => {
+          if (!deletePath) return;
+          void handleDelete(deletePath).then(() => setDeletePath(null));
+        }}
+      />
+    </>
   );
 }

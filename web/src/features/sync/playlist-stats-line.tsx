@@ -1,3 +1,4 @@
+import { Tooltip } from "@heroui/react";
 import { Fragment, type ReactNode } from "react";
 
 export type PlaylistStatItem = {
@@ -5,6 +6,8 @@ export type PlaylistStatItem = {
   value: number | string;
   /** Optional tone for the whole segment (e.g. warning for readonly). */
   className?: string;
+  /** Existing tooltip surface for compact pending/error breakdowns. */
+  detail?: string;
 };
 
 type Props = {
@@ -14,31 +17,40 @@ type Props = {
   className?: string;
 };
 
-/**
- * Stats row with tabular numbers so 1 vs 10 does not shift following labels.
- * Each value gets a fixed digit slot (up to 3 digits) for column-like alignment.
- */
+/** Shared compact stats row with uniform separator spacing. */
 export function PlaylistStatsLine({ items, trailing, className }: Props) {
   return (
     <span
-      className={`inline-flex flex-wrap items-baseline gap-x-0 ${className ?? ""}`}
+      className={`inline-flex max-w-full flex-nowrap items-baseline gap-x-0 overflow-hidden whitespace-nowrap align-bottom ${className ?? ""}`}
     >
       {items.map((item, i) => (
         <Fragment key={`${item.label}-${i}`}>
           {i > 0 ? (
-            <span className="text-foreground-400 px-1" aria-hidden>
+            <span className="text-foreground-400 px-2" aria-hidden>
               ·
             </span>
           ) : null}
-          <span
-            className={`inline-flex items-baseline gap-0.5 whitespace-nowrap ${item.className ?? ""}`}
-          >
-            <span>{item.label}</span>
-            {/* Width reserved on the right so digits sit next to the label, not the · */}
-            <span className="inline-block min-w-[3ch] text-left tabular-nums">
-              {item.value}
+          {item.detail ? (
+            <Tooltip content={item.detail}>
+              <span
+                className={`inline-flex shrink-0 items-baseline gap-0.5 whitespace-nowrap ${item.className ?? ""}`}
+              >
+                <span>{item.label}</span>
+                <span className="tabular-nums">
+                  {item.value}
+                </span>
+              </span>
+            </Tooltip>
+          ) : (
+            <span
+              className={`inline-flex shrink-0 items-baseline gap-0.5 whitespace-nowrap ${item.className ?? ""}`}
+            >
+              <span>{item.label}</span>
+              <span className="tabular-nums">
+                {item.value}
+              </span>
             </span>
-          </span>
+          )}
         </Fragment>
       ))}
       {trailing}

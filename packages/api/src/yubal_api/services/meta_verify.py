@@ -336,7 +336,10 @@ def list_meta_candidates(
                 lastfm_api_key=lastfm_api_key,
             )
             if errored:
-                continue
+                # A source transport error cannot be improved by immediately
+                # repeating the fallback query; it may also have opened a
+                # provider cooldown.
+                break
             for hit in hits:
                 key = f"{hit.source}:{hit.source_id}"
                 if key in source_seen:
@@ -501,7 +504,6 @@ def verify_tags_against_wanted_sources(
         return MetaVerifyResult(hit=None, rejected=True, errored=False)
 
     any_error = False
-    any_hits = False
     for source in _VERIFY_SOURCE_ORDER:
         if not enabled.get(source):
             continue
@@ -514,8 +516,7 @@ def verify_tags_against_wanted_sources(
             )
             if errored:
                 any_error = True
-                continue
-            any_hits = any_hits or bool(hits)
+                break
             matches = [
                 hit
                 for hit in hits
@@ -540,7 +541,8 @@ def verify_tags_against_wanted_sources(
                 )
                 return MetaVerifyResult(hit=best, rejected=False, errored=False)
 
-    if any_error and not any_hits:
-        # Transport/parse failure with no usable results — backoff only.
+    if any_error:
+        # An enabled source was unavailable.  Preserve the row as pending
+        # rather than recording a negative verification from incomplete data.
         return MetaVerifyResult(hit=None, rejected=False, errored=True)
     return MetaVerifyResult(hit=None, rejected=True, errored=any_error)

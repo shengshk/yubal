@@ -6,11 +6,16 @@ import { AudioSpectrum } from "@/features/sync/audio-spectrum";
 import { LedgerTrackList } from "@/features/sync/ledger-track-list";
 import { useLibraryAudio } from "@/features/sync/library-audio";
 import type { PlayMode } from "@/features/sync/play-mode";
-import { PlaylistStatsLine } from "@/features/sync/playlist-stats-line";
 import { PlaylistTitleTooltip } from "@/features/sync/playlist-title-tooltip";
+import {
+  ownershipCounts,
+  UnifiedPlaylistStats,
+} from "@/features/sync/unified-playlist-stats";
 import {
   SYNC_ACTION_BTN,
   SYNC_CARD_ACTIONS,
+  SYNC_CARD_CONTENT,
+  SYNC_CARD_HEADER,
 } from "@/features/sync/track-columns";
 import { formatDateTime } from "@/lib/format";
 import { isActive, isRunning } from "@/lib/job-status";
@@ -54,20 +59,6 @@ type Props = {
   onSyncDirect?: () => void;
   schedulerEnabled?: boolean;
 };
-
-/** Partition synced files: exclusive + shared + hardlink === synced. */
-function ownershipCounts(
-  synced: number,
-  hardlinkRaw: number,
-  folderShared: boolean,
-): { exclusive: number; shared: number; hardlink: number } {
-  const hard = Math.min(Math.max(0, hardlinkRaw), Math.max(0, synced));
-  const real = Math.max(0, synced - hard);
-  if (folderShared) {
-    return { exclusive: 0, shared: real, hardlink: hard };
-  }
-  return { exclusive: real, shared: 0, hardlink: hard };
-}
 
 const LINE =
   "text-foreground-500 mt-1 truncate whitespace-nowrap font-mono text-xs leading-relaxed";
@@ -236,38 +227,36 @@ export function LedgerCard({
   const blockedCount = entry.blocked_count ?? 0;
   const missing = entry.missing_count ?? 0;
 
-  const statsItems = isSubscription
-    ? [
-        { label: t("sync.statCloud"), value: totalCount },
-        { label: t("sync.statLocal"), value: syncedCount },
-        { label: t("sync.statBlocked"), value: blockedCount },
-        { label: t("sync.statNotInCloudPlaylist"), value: offlineCount },
-        {
-          label: t("sync.statIdInvalid"),
-          value: entry.id_invalid_count ?? 0,
-        },
-        { label: t("sync.statExclusive"), value: ownership.exclusive },
-        { label: t("sync.statShared"), value: ownership.shared },
-        { label: t("sync.statHardlink"), value: ownership.hardlink },
-      ]
-    : isDirect
-      ? [
-          { label: t("sync.statCloud"), value: totalCount },
-          { label: t("sync.statLocal"), value: syncedCount },
-          { label: t("sync.statBlocked"), value: blockedCount },
-          { label: t("sync.statIdInvalid"), value: offlineCount },
-          { label: t("sync.statExclusive"), value: ownership.exclusive },
-          { label: t("sync.statShared"), value: ownership.shared },
-          { label: t("sync.statHardlink"), value: ownership.hardlink },
-        ]
-      : [
-          { label: t("sync.statCloud"), value: totalCount },
-          { label: t("sync.statLocal"), value: syncedCount },
-          { label: t("sync.statIdInvalid"), value: offlineCount },
-          { label: t("sync.statExclusive"), value: ownership.exclusive },
-          { label: t("sync.statShared"), value: ownership.shared },
-          { label: t("sync.statHardlink"), value: ownership.hardlink },
-        ];
+  const invalidCount = entry.id_invalid_count ?? 0;
+  const failedCount = entry.failed_count ?? 0;
+  const logicalTotal = Math.max(
+    totalCount,
+    syncedCount + missing + offlineCount + invalidCount + blockedCount,
+  );
+  const statsCounts = {
+    total: logicalTotal,
+    cloud: totalCount,
+    local: syncedCount,
+    pending: missing,
+    abnormal: blockedCount + offlineCount + invalidCount + failedCount,
+    exclusive: ownership.exclusive,
+    shared: ownership.shared,
+    hardlink: ownership.hardlink,
+    pendingDetails: [
+      { label: t("sync.statMissing"), value: missing },
+    ],
+    abnormalDetails: [
+      { label: t("sync.statBlocked"), value: blockedCount },
+      {
+        label: isSubscription
+          ? t("sync.statNotInCloudPlaylist")
+          : t("sync.statOffline"),
+        value: offlineCount,
+      },
+      { label: t("sync.statIdInvalid"), value: invalidCount },
+      { label: t("sync.resultFailed"), value: failedCount },
+    ],
+  };
 
   const outcomeNote = buildOutcomeNote(entry, t);
 
@@ -344,21 +333,7 @@ export function LedgerCard({
   // Transport only while this folder is actually playing (hidden when paused).
   const showTransport = Boolean(folder && canExpand && isPlayingHere);
 
-  const statsWithFolder = (
-    <PlaylistStatsLine
-      items={statsItems}
-      trailing={
-        (isSubscription || isDirect) && missing > 0 ? (
-          <span className="text-warning">
-            <span className="text-foreground-400 px-1" aria-hidden>
-              ·
-            </span>
-            {t("sync.missingHint", { count: missing })}
-          </span>
-        ) : null
-      }
-    />
-  );
+  const statsWithFolder = <UnifiedPlaylistStats counts={statsCounts} />;
 
   const headline = isPlayingHere ? audio.nowPlayingLabel || title : title;
   const subline = isPlayingHere ? (
@@ -428,7 +403,7 @@ export function LedgerCard({
   return (
     <div ref={rootRef}>
       <Card shadow="sm" className="bg-content1 overflow-hidden">
-        <CardBody className="relative flex flex-row items-center gap-3 overflow-hidden p-0">
+        <CardBody className={SYNC_CARD_HEADER}>
           {isPlayingHere ? <AudioSpectrum /> : null}
           {isPlayingHere ? (
             <div
@@ -523,7 +498,7 @@ export function LedgerCard({
 
           <button
             type="button"
-            className={`relative z-10 flex min-w-0 flex-1 items-center gap-3 py-3 pr-0 text-left outline-none ${
+            className={`${SYNC_CARD_CONTENT} ${
               canExpand ? "cursor-pointer" : ""
             }`}
             onClick={() => onToggleTracks?.()}
@@ -531,7 +506,7 @@ export function LedgerCard({
             aria-expanded={tracksOpen}
             aria-label={t("sync.toggleTrackList")}
           >
-            <div className="min-w-0 flex-1">
+            <div className="max-h-full min-w-0 flex-1 overflow-hidden">
               <div className="flex min-w-0 flex-nowrap items-center gap-2">
                 <PlaylistTitleTooltip
                   kind={
@@ -542,7 +517,7 @@ export function LedgerCard({
                         : "subscription"
                   }
                   saveFolder={folder}
-                  className="text-foreground min-w-0 truncate text-sm font-medium"
+                  className="text-foreground block w-full min-w-0 truncate text-sm font-medium"
                 >
                   {headline}
                 </PlaylistTitleTooltip>

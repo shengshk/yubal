@@ -69,6 +69,10 @@ class PlaylistInfoService:
         """Return a private identifier for the currently authenticated account."""
         return self._client.get_account_fingerprint()
 
+    def rate_song(self, video_id: str, *, liked: bool) -> None:
+        """Set one song's YTM thumbs-up state with the configured cookies."""
+        self._client.rate_song(video_id, liked=liked)
+
     def get_content_info(self, url: str) -> ContentInfo:
         """Get content info for any supported YouTube URL.
 

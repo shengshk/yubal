@@ -1,19 +1,30 @@
 """Runtime settings endpoints (user preferences)."""
 
+import asyncio
 import os
+from dataclasses import asdict
 
 from fastapi import APIRouter, HTTPException, Query
 from yubal.services.scrape_state import ScrapeStateStore
-from yubal.utils.library import EXTERNAL_ROOT
+from yubal.utils.library import EXTERNAL_ROOT, WANTED_ROOT
 
 from yubal_api.api.deps import (
     ExternalLibraryServiceDep,
+    FactoryResetServiceDep,
     LibraryHealthServiceDep,
     PreferencesStoreDep,
     ServicesDep,
     SettingsDep,
 )
-from yubal_api.schemas.settings import SettingsResponse, SettingsUpdate
+from yubal_api.schemas.settings import (
+    FactoryResetExecuteRequest,
+    FactoryResetPreviewRequest,
+    FactoryResetPreviewResponse,
+    FactoryResetResultResponse,
+    SettingsResponse,
+    SettingsUpdate,
+)
+from yubal_api.services.factory_reset_service import FactoryResetMode
 from yubal_api.services.preferences import DOWNLOAD_CACHE_ROOT, PreferencesStore
 
 router = APIRouter(prefix="/settings", tags=["settings"])
@@ -47,8 +58,11 @@ def _to_response(
         replaygain=prefs.replaygain,
         scheduler_enabled=prefs.scheduler_enabled,
         scheduler_cron=prefs.scheduler_cron,
+        external_inventory_schedule_enabled=(prefs.external_inventory_schedule_enabled),
+        external_inventory_schedule_time=prefs.external_inventory_schedule_time,
         job_timeout_seconds=prefs.job_timeout_seconds,
         external_library_enabled=prefs.external_library_enabled,
+        external_new_playlist_mode=prefs.external_new_playlist_mode,  # type: ignore[arg-type]
         # Legacy preselect fields kept for schema compat; always off / fixed.
         preselect_enabled=False,
         wash_enabled=False,
@@ -132,6 +146,7 @@ async def update_settings(
 ) -> SettingsResponse:
     """Update editable preferences (UI overrides env defaults)."""
     payload = data.model_dump(exclude_unset=True)
+    previous_match_strictness = store.effective().match_strictness
 
     # Drop retired preselect/wash keys if a stale client still sends them.
     for key in (
@@ -162,11 +177,49 @@ async def update_settings(
                 detail="Download cache is missing or not writable",
             )
 
-    telegram_changed = any(
-        key.startswith("telegram_") for key in payload
-    )
+    telegram_changed = any(key.startswith("telegram_") for key in payload)
     if payload:
         store.update(**payload)
+        if (
+            "match_strictness" in payload
+            and store.effective().match_strictness != previous_match_strictness
+        ):
+            # A different matching rule invalidates prior negative decisions.
+            services.external_library_service.clear_match_cooldowns(
+                include_rejected=True
+            )
+            configured = (
+                services.external_library_service.configured_playlist_names()
+            )
+            for dir_name in configured:
+                await services.scheduler.queue_external_playlist_sync(
+                    dir_name,
+                    enrich=False,
+                    raw_match=True,
+                    verify_meta=True,
+                    junk_match=False,
+                    drain=True,
+                )
+        if any(
+            key in payload
+            for key in (
+                "scheduler_enabled",
+                "scheduler_cron",
+                "external_inventory_schedule_enabled",
+                "external_inventory_schedule_time",
+                "external_library_enabled",
+            )
+        ):
+            services.scheduler.invalidate_plan()
+        elif any(
+            key in payload
+            for key in (
+                "wanted_enabled",
+                "wanted_auto_match_enabled",
+                "wanted_sync_jitter_seconds",
+            )
+        ):
+            services.scheduler.invalidate_wanted_plan()
     if telegram_changed:
         bot = getattr(services, "telegram_bot", None)
         if bot is not None:
@@ -191,8 +244,8 @@ async def reset_settings(
     library_health: LibraryHealthServiceDep,
     settings: SettingsDep,
 ) -> SettingsResponse:
-    """Clear preferences.json so values fall back to environment defaults."""
-    store.reset()
+    """Compatibility endpoint for the level-1 preference reset."""
+    store.reset_preferences()
     bot = getattr(services, "telegram_bot", None)
     if bot is not None:
         await bot.reload()
@@ -208,10 +261,57 @@ async def reset_settings(
     )
 
 
+@router.post(
+    "/factory/preview",
+    response_model=FactoryResetPreviewResponse,
+)
+async def preview_factory_reset(
+    body: FactoryResetPreviewRequest,
+    service: FactoryResetServiceDep,
+) -> FactoryResetPreviewResponse:
+    preview = await asyncio.to_thread(
+        service.preview,
+        FactoryResetMode(body.mode),
+    )
+    return FactoryResetPreviewResponse(**asdict(preview))
+
+
+@router.post(
+    "/factory/execute",
+    response_model=FactoryResetResultResponse,
+)
+async def execute_factory_reset(
+    body: FactoryResetExecuteRequest,
+    service: FactoryResetServiceDep,
+    services: ServicesDep,
+) -> FactoryResetResultResponse:
+    mode = FactoryResetMode(body.mode)
+    try:
+        result = await asyncio.to_thread(
+            service.execute,
+            mode,
+            body.token,
+            password=body.password,
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=401, detail="invalid password") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    if mode is FactoryResetMode.FULL:
+        services.search_service.delete()
+        services.telegram_bot.clear_factory_state()
+        await services.telegram_bot.reload()
+        services.job_store.clear_finished()
+
+    return FactoryResetResultResponse(**asdict(result))
+
+
 @router.post("/clear-scrape-cooldowns")
 def clear_scrape_cooldowns(settings: SettingsDep) -> dict[str, int]:
     """Clear all scrape-state cover/lyrics cooldowns."""
-    cleared = ScrapeStateStore(settings.data).clear_all()
+    roots = (settings.data, EXTERNAL_ROOT, WANTED_ROOT)
+    cleared = sum(ScrapeStateStore(root).clear_all() for root in roots)
     return {"cleared": cleared}
 
 
@@ -220,9 +320,7 @@ def clear_match_cooldowns(
     service: ExternalLibraryServiceDep,
     include_rejected: bool = Query(
         default=False,
-        description=(
-            "When true, also requeue rejected (junk) rows as unmatched."
-        ),
+        description=("When true, also requeue rejected (junk) rows as unmatched."),
     ),
 ) -> dict[str, int]:
     """Clear external-library match backoff counters."""

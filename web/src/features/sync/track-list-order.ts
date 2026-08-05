@@ -54,7 +54,8 @@ export const BUCKET_PREFIX_HINT_KEY: Record<string, string> = {
 /** Wanted-list numbering prefixes. */
 export const WANTED_PREFIX_HINT_KEY: Record<string, string> = {
   "": "indexHintWantedMatched",
-  W: "indexHintWantedUnmatched",
+  R: "indexHintFavoriteRecovery",
+  H: "indexHintFavoriteLocal",
 };
 
 const BUCKET_RANK = Object.fromEntries(

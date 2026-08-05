@@ -82,7 +82,10 @@ class BotApiClient:
             raise
         except httpx.HTTPError as exc:
             logger.warning(
-                "Telegram API %s failed: %s", method, self._redact(str(exc))
+                "Telegram API %s failed: %s: %s",
+                method,
+                type(exc).__name__,
+                self._redact(str(exc)),
             )
             raise
         if not payload.get("ok"):
@@ -214,6 +217,20 @@ class BotApiClient:
             form["duration"] = str(int(duration))
         safe_name = filename.strip() or resolved.name
         mime = _AUDIO_MIME.get(resolved.suffix.lower(), "application/octet-stream")
+        if self._local:
+            try:
+                return await self._send_local_path(
+                    "sendAudio",
+                    media_key="audio",
+                    path=resolved,
+                    form=form,
+                )
+            except (httpx.HTTPError, RuntimeError) as exc:
+                logger.warning(
+                    "Telegram local-path sendAudio failed (%s); "
+                    "falling back to multipart upload",
+                    type(exc).__name__,
+                )
         with resolved.open("rb") as handle:
             files = {
                 "audio": (safe_name, handle, mime),
@@ -244,11 +261,48 @@ class BotApiClient:
         form: dict[str, Any] = {"chat_id": str(chat_id)}
         safe_name = filename.strip() or resolved.name
 
+        if self._local:
+            try:
+                return await self._send_local_path(
+                    "sendDocument",
+                    media_key="document",
+                    path=resolved,
+                    form=form,
+                )
+            except (httpx.HTTPError, RuntimeError) as exc:
+                logger.warning(
+                    "Telegram local-path sendDocument failed (%s); "
+                    "falling back to multipart upload",
+                    type(exc).__name__,
+                )
         with resolved.open("rb") as handle:
             files = {
                 "document": (safe_name, handle, "application/octet-stream"),
             }
             return await self.call("sendDocument", form=form, files=files)
+
+    async def _send_local_path(
+        self,
+        method: str,
+        *,
+        media_key: str,
+        path: Path,
+        form: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Send a shared local file URI, retrying one transient transport error."""
+        payload = dict(form)
+        payload[media_key] = path.as_uri()
+        for attempt in range(2):
+            try:
+                return await self.call(method, form=payload)
+            except httpx.TransportError:
+                if attempt > 0:
+                    raise
+                logger.warning(
+                    "Telegram local-path %s transport failed; retrying once",
+                    method,
+                )
+        raise RuntimeError(f"Telegram local-path {method} failed")
 
     async def set_my_commands(self, commands: list[dict[str, str]]) -> None:
         await self.call("setMyCommands", commands=commands)

@@ -117,6 +117,20 @@ class LibraryHealthService:
                 return False
             return True
 
+    @staticmethod
+    def allow_scoped_index_deletes(
+        walked_count: int,
+        indexed_count: int,
+    ) -> bool:
+        """Guard one playlist scan against its own indexed baseline."""
+        walked = max(0, int(walked_count))
+        indexed = max(0, int(indexed_count))
+        if indexed < EMPTY_GUARD_MIN_INDEXED:
+            return True
+        if walked == 0:
+            return False
+        return walked >= indexed * EMPTY_GUARD_RATIO
+
     def check(self, *, force: bool = True) -> LibraryHealth:
         """Probe mounts and update cached health."""
         _ = force

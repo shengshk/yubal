@@ -77,12 +77,15 @@ class WantedRepository:
             session.commit()
             return len(rows)
 
-    def list_matchable(self, *, now: datetime | None = None, limit: int = 25) -> list[WantedTrack]:
+    def list_matchable(
+        self, *, now: datetime | None = None, limit: int = 25
+    ) -> list[WantedTrack]:
         now = now or datetime.now(UTC)
         with Session(self._engine) as session:
             rows = session.exec(
                 select(WantedTrack)
                 .where(
+                    col(WantedTrack.video_id).is_(None),
                     (col(WantedTrack.match_next_eligible_at).is_(None))
                     | (WantedTrack.match_next_eligible_at <= now)
                 )
@@ -90,3 +93,24 @@ class WantedRepository:
                 .limit(limit)
             ).all()
             return list(rows)
+
+    def delete_by_video_id(self, video_id: str) -> int:
+        """Drop local-heart rows once their remote like is confirmed."""
+        with Session(self._engine) as session:
+            rows = list(
+                session.exec(
+                    select(WantedTrack).where(WantedTrack.video_id == video_id)
+                ).all()
+            )
+            for row in rows:
+                session.delete(row)
+            session.commit()
+            return len(rows)
+
+    def list_by_video_id(self, video_id: str) -> list[WantedTrack]:
+        with Session(self._engine) as session:
+            return list(
+                session.exec(
+                    select(WantedTrack).where(WantedTrack.video_id == video_id)
+                ).all()
+            )

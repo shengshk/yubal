@@ -9,7 +9,6 @@ from pathlib import Path
 
 from sqlalchemy import func
 from sqlmodel import Session, col, select
-
 from yubal.utils.library import DIRECT_FOLDER, sanitize_direct_folder
 
 from yubal_api.db.external_library import (
@@ -262,7 +261,7 @@ def render_start_guide() -> str:
             "/stats — 数据库统计",
             "/sync — 立即同步",
             "/status — 运行概况",
-            "/factory — 恢复出厂（占位）",
+            "/factory — 恢复与清理",
         ]
     )
 
@@ -322,16 +321,5 @@ def render_status(status: RuntimeStatus) -> str:
             f"刮削退避：{status.scrape_fail_backlog}",
             "",
             "<i>匹配/刮削积压为累计未恢复条目，非严格 24h 窗口。</i>",
-        ]
-    )
-
-
-def render_factory_placeholder() -> str:
-    return "\n".join(
-        [
-            f"⚠️ {_bold('恢复出厂设置')}",
-            "",
-            "功能占位，尚未开放。",
-            "不会执行任何清除或重置操作。",
         ]
     )

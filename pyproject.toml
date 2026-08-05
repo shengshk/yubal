@@ -32,4 +32,4 @@ quote-style = "double"
 
 [tool.pytest.ini_options]
 testpaths = ["packages/*/tests"]
-addopts = "--tb=short --disable-socket"
+addopts = "--tb=short --disable-socket --allow-unix-socket"

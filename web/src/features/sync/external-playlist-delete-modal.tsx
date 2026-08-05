@@ -16,6 +16,8 @@ type Props = {
   dirName: string;
   /** Writable playlists may touch raw/matched files; ID-invalid cleanup always allowed. */
   allowMutate: boolean;
+  /** Tag-validation failures whose immutable original source permits cleanup. */
+  metaRejectedMutableCount: number;
   onClose: () => void;
   onConfirm: (mode: ExternalDeleteMode) => Promise<boolean>;
 };
@@ -34,13 +36,17 @@ const ID_INVALID_MODES: ExternalDeleteMode[] = [
 const FILE_MODES: ExternalDeleteMode[] = [
   "delete_matched",
   "move_matched_to_direct",
-  "delete_unmatched",
-  "delete_all",
 ];
+const REJECTED_MODES: ExternalDeleteMode[] = [
+  "archive_meta_rejected",
+  "delete_meta_rejected",
+];
+const PRIMARY_MODES: ExternalDeleteMode[] = ["forget_matched", "delete_all"];
 
 const DANGER: ReadonlySet<ExternalDeleteMode> = new Set([
   "delete_matched",
   "delete_unmatched",
+  "delete_meta_rejected",
   "delete_all",
   "clear_offline_delete",
 ]);
@@ -49,6 +55,7 @@ export function ExternalPlaylistDeleteModal({
   isOpen,
   dirName,
   allowMutate,
+  metaRejectedMutableCount,
   onClose,
   onConfirm,
 }: Props) {
@@ -78,6 +85,8 @@ export function ExternalPlaylistDeleteModal({
       add_matched_to_direct: "sync.deleteExternalMoveMatched",
       add_meta_verified_to_wanted: "sync.addMetaVerifiedToWanted",
       delete_unmatched: "sync.deleteExternalUnmatched",
+      archive_meta_rejected: "sync.archiveMetaRejected",
+      delete_meta_rejected: "sync.deleteMetaRejected",
       delete_all: "sync.deleteExternalAll",
       clear_offline_delete: "sync.clearIdInvalidDelete",
       clear_offline_to_raw_delete: "sync.clearIdInvalidToRawDelete",
@@ -91,6 +100,8 @@ export function ExternalPlaylistDeleteModal({
       add_matched_to_direct: "sync.deleteExternalMoveMatchedHint",
       add_meta_verified_to_wanted: "sync.addMetaVerifiedToWantedHint",
       delete_unmatched: "sync.deleteExternalUnmatchedHint",
+      archive_meta_rejected: "sync.archiveMetaRejectedHint",
+      delete_meta_rejected: "sync.deleteMetaRejectedHint",
       delete_all: "sync.deleteExternalAllHint",
       clear_offline_delete: "sync.clearIdInvalidDeleteHint",
       clear_offline_to_raw_delete: "sync.clearIdInvalidToRawDeleteHint",
@@ -104,6 +115,8 @@ export function ExternalPlaylistDeleteModal({
       add_matched_to_direct: "sync.deleteExternalConfirmMove",
       add_meta_verified_to_wanted: "sync.addMetaVerifiedToWantedHint",
       delete_unmatched: "sync.deleteExternalConfirmUnmatched",
+      archive_meta_rejected: "sync.archiveMetaRejectedConfirm",
+      delete_meta_rejected: "sync.deleteMetaRejectedConfirm",
       delete_all: "sync.deleteExternalConfirmAll",
       clear_offline_delete: "sync.clearIdInvalidConfirmDelete",
       clear_offline_to_raw_delete: "sync.clearIdInvalidConfirmRawDelete",
@@ -113,7 +126,8 @@ export function ExternalPlaylistDeleteModal({
   const isSoftConfirm =
     isLedger ||
     mode === "clear_offline_to_raw_delete" ||
-    mode === "move_matched_to_direct";
+    mode === "move_matched_to_direct" ||
+    mode === "archive_meta_rejected";
 
   const renderModeButton = (m: ExternalDeleteMode, enabled: boolean) => (
     <Button
@@ -147,39 +161,61 @@ export function ExternalPlaylistDeleteModal({
 
               <div className="flex flex-col gap-2">
                 <p className="text-foreground-500 text-xs font-medium">
-                  {t("sync.deleteExternalSectionLedger")}
+                  {t("sync.deletePrimaryTitle")}
                 </p>
                 <p className="text-foreground-400 -mt-1 text-xs">
-                  {t("sync.deleteExternalSectionLedgerHint")}
+                  {t("sync.deletePrimaryHint")}
                 </p>
-                {LEDGER_MODES.map((m) => renderModeButton(m, true))}
-              </div>
-
-              <div className="mt-2 flex flex-col gap-2">
-                <p className="text-foreground-500 text-xs font-medium">
-                  {t("sync.deleteSectionIdInvalid")}
-                </p>
-                <p className="text-foreground-400 -mt-1 text-xs">
-                  {t("sync.deleteSectionIdInvalidHint")}
-                </p>
-                {ID_INVALID_MODES.map((m) => renderModeButton(m, true))}
-              </div>
-
-              <div className="mt-2 flex flex-col gap-2">
-                <p className="text-foreground-500 text-xs font-medium">
-                  {t("sync.deleteExternalSectionFiles")}
-                </p>
-                {!allowMutate ? (
-                  <p className="text-warning text-xs">
-                    {t("sync.deleteExternalReadonlyBlock")}
-                  </p>
-                ) : (
-                  <p className="text-foreground-400 -mt-1 text-xs">
-                    {t("sync.deleteExternalSectionFilesHint")}
-                  </p>
+                {PRIMARY_MODES.map((m) =>
+                  renderModeButton(m, m !== "delete_all" || allowMutate),
                 )}
-                {FILE_MODES.map((m) => renderModeButton(m, allowMutate))}
               </div>
+
+              <details className="border-default-200 rounded-lg border">
+                <summary className="hover:bg-default-100 cursor-pointer rounded-lg px-3 py-2.5 text-sm font-medium">
+                  {t("sync.moreProcessing")}
+                </summary>
+                <div className="flex flex-col gap-4 px-3 pb-3">
+                  <p className="text-foreground-400 text-xs">
+                    {t("sync.moreProcessingHint")}
+                  </p>
+                  <div className="flex flex-col gap-2">
+                    <p className="text-foreground-500 text-xs font-medium">
+                      {t("sync.deleteSectionIdInvalid")}
+                    </p>
+                    {ID_INVALID_MODES.filter(
+                      (m) =>
+                        m !== "clear_offline_to_raw_delete" ||
+                        dirName !== "delete",
+                    ).map((m) => renderModeButton(m, true))}
+                  </div>
+                  {metaRejectedMutableCount > 0 ? (
+                    <div className="flex flex-col gap-2">
+                      <p className="text-foreground-500 text-xs font-medium">
+                        {t("sync.deleteSectionMetaRejected", {
+                          count: metaRejectedMutableCount,
+                        })}
+                      </p>
+                      {REJECTED_MODES.filter(
+                        (m) =>
+                          m !== "archive_meta_rejected" ||
+                          dirName !== "default",
+                      ).map((m) => renderModeButton(m, true))}
+                    </div>
+                  ) : null}
+                  <div className="flex flex-col gap-2">
+                    <p className="text-foreground-500 text-xs font-medium">
+                      {t("sync.deleteExternalSectionFiles")}
+                    </p>
+                    {!allowMutate ? (
+                      <p className="text-warning text-xs">
+                        {t("sync.deleteExternalReadonlyBlock")}
+                      </p>
+                    ) : null}
+                    {FILE_MODES.map((m) => renderModeButton(m, allowMutate))}
+                  </div>
+                </div>
+              </details>
             </>
           ) : (
             <>
@@ -195,7 +231,9 @@ export function ExternalPlaylistDeleteModal({
                   ? t("sync.forgetExternalWarn")
                   : mode.startsWith("clear_offline")
                     ? t("sync.clearStaleWarn")
-                    : t("sync.deleteExternalWarn")}
+                    : mode === "archive_meta_rejected"
+                      ? t("sync.archiveMetaRejectedWarn")
+                      : t("sync.deleteExternalWarn")}
               </p>
             </>
           )}
@@ -226,7 +264,9 @@ export function ExternalPlaylistDeleteModal({
                 });
               }}
             >
-              {isLedger || mode === "clear_offline_to_raw_delete"
+              {isLedger ||
+              mode === "clear_offline_to_raw_delete" ||
+              mode === "archive_meta_rejected"
                 ? t("sync.continue")
                 : mode === "move_matched_to_direct"
                   ? t("sync.continue")

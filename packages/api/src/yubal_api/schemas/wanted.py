@@ -36,6 +36,8 @@ class WantedTrackResponse(BaseModel):
 
 class WantedSummary(BaseModel):
     total_count: int
+    local_heart_count: int
+    recovery_count: int
     matched_file_count: int
     unmatched_count: int
     exclusive_count: int = 0

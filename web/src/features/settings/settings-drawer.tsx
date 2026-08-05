@@ -8,11 +8,14 @@ import {
 import {
   clearMatchCooldowns,
   clearScrapeCooldowns,
+  executeFactoryReset,
   getSettings,
+  previewFactoryReset,
   reclaimPits,
-  resetSettings,
   updateSettings,
   type AppSettings,
+  type FactoryResetMode,
+  type FactoryResetPreview,
   type ReclaimPitTarget,
   type SettingsUpdate,
 } from "@/api/settings";
@@ -50,7 +53,7 @@ import {
   Trash2Icon,
   UploadIcon,
 } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { type ReactNode, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 const EXTERNAL_RAW_PATH = "/data/external/raw";
@@ -60,6 +63,39 @@ type Props = {
   isOpen: boolean;
   onOpenChange: (open: boolean) => void;
 };
+
+type ResetStage = "select" | "warning" | "confirm";
+
+function SettingsDisclosure({
+  title,
+  hint,
+  children,
+}: {
+  title: string;
+  hint?: string;
+  children: ReactNode;
+}) {
+  return (
+    <details className="border-default-200 group rounded-xl border">
+      <summary className="text-foreground-600 cursor-pointer list-none px-3 py-2.5 text-sm font-medium marker:hidden">
+        <div className="flex items-center justify-between gap-3">
+          <span>{title}</span>
+          <span className="text-foreground-400 transition-transform group-open:rotate-180">
+            ▾
+          </span>
+        </div>
+        {hint ? (
+          <span className="text-foreground-400 mt-0.5 block text-xs font-normal">
+            {hint}
+          </span>
+        ) : null}
+      </summary>
+      <div className="border-default-200 flex flex-col gap-3 border-t px-3 py-3">
+        {children}
+      </div>
+    </details>
+  );
+}
 
 type FormState = {
   min_free_gb: string;
@@ -75,8 +111,11 @@ type FormState = {
   scrape_cooldown_hours: string;
   scheduler_enabled: boolean;
   scheduler_cron: string;
+  external_inventory_schedule_enabled: boolean;
+  external_inventory_schedule_time: string;
   job_timeout_seconds: string;
   external_library_enabled: boolean;
+  external_new_playlist_mode: AppSettings["external_new_playlist_mode"];
   match_backoff_cap_days: string;
   match_strictness: AppSettings["match_strictness"];
   cover_excellence_px: string;
@@ -114,8 +153,13 @@ function formFromSettings(data: AppSettings): FormState {
     scrape_cooldown_hours: String(data.scrape_cooldown_hours ?? 24),
     scheduler_enabled: data.scheduler_enabled,
     scheduler_cron: data.scheduler_cron,
+    external_inventory_schedule_enabled:
+      data.external_inventory_schedule_enabled ?? true,
+    external_inventory_schedule_time:
+      data.external_inventory_schedule_time ?? "03:00",
     job_timeout_seconds: String(data.job_timeout_seconds),
     external_library_enabled: data.external_library_enabled ?? false,
+    external_new_playlist_mode: data.external_new_playlist_mode ?? "pending",
     match_backoff_cap_days: String(data.match_backoff_cap_days ?? 7),
     match_strictness: data.match_strictness ?? "strict",
     cover_excellence_px: String(data.cover_excellence_px ?? 0),
@@ -158,8 +202,14 @@ export function SettingsDrawer({ isOpen, onOpenChange }: Props) {
   const [form, setForm] = useState<FormState | null>(null);
   const [saving, setSaving] = useState(false);
   const [resetting, setResetting] = useState(false);
+  const [resetPreviewing, setResetPreviewing] = useState(false);
   const [loading, setLoading] = useState(false);
   const [confirmResetOpen, setConfirmResetOpen] = useState(false);
+  const [resetStage, setResetStage] = useState<ResetStage>("select");
+  const [resetPreview, setResetPreview] = useState<FactoryResetPreview | null>(
+    null,
+  );
+  const [resetPassword, setResetPassword] = useState("");
   const [libraryHealth, setLibraryHealth] = useState<LibraryHealth | null>(
     null,
   );
@@ -345,20 +395,70 @@ export function SettingsDrawer({ isOpen, onOpenChange }: Props) {
     window.dispatchEvent(new Event("yubal:ledger-changed"));
   };
 
-  const handleReset = async () => {
-    setConfirmResetOpen(false);
-    setResetting(true);
-    const result = await resetSettings();
-    setResetting(false);
+  const openReset = () => {
+    setResetStage("select");
+    setResetPreview(null);
+    setResetPassword("");
+    setConfirmResetOpen(true);
+  };
+
+  const selectResetMode = async (mode: FactoryResetMode) => {
+    setResetPreviewing(true);
+    const result = await previewFactoryReset(mode);
+    setResetPreviewing(false);
     if ("error" in result) {
       showErrorToast(t("settings.resetFailedTitle"), result.error);
       return;
     }
-    applyResult(result);
-    showSuccessToast(t("settings.resetTitle"), t("settings.resetDesc"));
+    setResetPreview(result);
+    setResetStage(mode === "preferences" ? "confirm" : "warning");
+  };
+
+  const clearBrowserPreferences = () => {
+    for (let index = window.localStorage.length - 1; index >= 0; index -= 1) {
+      const key = window.localStorage.key(index);
+      if (key?.startsWith("yubal")) window.localStorage.removeItem(key);
+    }
+  };
+
+  const handleReset = async () => {
+    if (!resetPreview) return;
+    setResetting(true);
+    const result = await executeFactoryReset(resetPreview, resetPassword);
+    setResetting(false);
+    if ("error" in result) {
+      showErrorToast(
+        t("settings.resetFailedTitle"),
+        result.error === "invalid password"
+          ? t("settings.factoryPasswordInvalid")
+          : result.error,
+      );
+      return;
+    }
+    clearBrowserPreferences();
+    setConfirmResetOpen(false);
+    if (result.requires_setup) {
+      window.location.reload();
+      return;
+    }
+    const next = await getSettings();
+    if (next) applyResult(next);
+    showSuccessToast(
+      t("settings.factoryDoneTitle"),
+      t(`settings.factoryDone.${result.mode}`),
+    );
+    window.setTimeout(() => window.location.reload(), 500);
   };
 
   const busy = loading || !form || saving;
+  const resetStats = resetPreview
+    ? t("settings.factoryStats", {
+        entries: resetPreview.list_entries,
+        files: resetPreview.files,
+        paths: resetPreview.paths,
+        size: (resetPreview.bytes / (1024 * 1024)).toFixed(1),
+      })
+    : "";
 
   return (
     <>
@@ -427,6 +527,7 @@ export function SettingsDrawer({ isOpen, onOpenChange }: Props) {
                     classNames={{ input: "font-mono" }}
                   />
                 </HoverHint>
+
               </div>
 
               <div className="flex flex-col gap-3">
@@ -508,10 +609,10 @@ export function SettingsDrawer({ isOpen, onOpenChange }: Props) {
                 </div>
               </div>
 
-              <div className="flex flex-col gap-3">
-                <p className="text-foreground-500 text-sm font-medium">
-                  {t("settings.sectionLibrary")}
-                </p>
+              <SettingsDisclosure
+                title={t("settings.advancedSettings")}
+                hint={t("settings.advancedSettingsHint")}
+              >
                 <div className="grid grid-cols-2 gap-2">
                   <Input
                     size="sm"
@@ -622,7 +723,7 @@ export function SettingsDrawer({ isOpen, onOpenChange }: Props) {
                     classNames={{ input: "font-mono" }}
                   />
                 </div>
-              </div>
+              </SettingsDisclosure>
 
               <div className="flex flex-col gap-3">
                 <HoverHint
@@ -665,7 +766,10 @@ export function SettingsDrawer({ isOpen, onOpenChange }: Props) {
                   </div>
                 </HoverHint>
                 {form?.external_library_enabled ? (
-                  <>
+                  <SettingsDisclosure
+                    title={t("settings.externalAdvanced")}
+                    hint={t("settings.externalAdvancedHint")}
+                  >
                     {libraryHealth ? (
                       <p
                         className={
@@ -677,6 +781,81 @@ export function SettingsDrawer({ isOpen, onOpenChange }: Props) {
                         {t(`libraryHealth.status.${libraryHealth.status}`)}
                       </p>
                     ) : null}
+                    <HoverHint
+                      content={t("settings.externalInventoryScheduleHint")}
+                    >
+                      <div className="flex items-center justify-between gap-3">
+                        <span className="text-foreground-500 text-sm">
+                          {t("settings.externalInventorySchedule")}
+                        </span>
+                        <Switch
+                          size="sm"
+                          isSelected={
+                            form?.external_inventory_schedule_enabled ?? true
+                          }
+                          isDisabled={busy}
+                          onValueChange={(v) => {
+                            if (!form) return;
+                            setForm({
+                              ...form,
+                              external_inventory_schedule_enabled: v,
+                            });
+                            patchField({
+                              external_inventory_schedule_enabled: v,
+                            });
+                          }}
+                        />
+                      </div>
+                    </HoverHint>
+                    <Input
+                      size="sm"
+                      type="time"
+                      label={t("settings.externalInventoryScheduleTime")}
+                      value={form?.external_inventory_schedule_time ?? "03:00"}
+                      isDisabled={
+                        busy ||
+                        !(form?.external_inventory_schedule_enabled ?? true)
+                      }
+                      onValueChange={(v) => {
+                        if (!form) return;
+                        setForm({
+                          ...form,
+                          external_inventory_schedule_time: v,
+                        });
+                        if (/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(v)) {
+                          patchField({
+                            external_inventory_schedule_time: v,
+                          });
+                        }
+                      }}
+                    />
+                    <Select
+                      size="sm"
+                      label={t("settings.externalNewPlaylistMode")}
+                      title={t("settings.externalNewPlaylistModeHint")}
+                      selectedKeys={
+                        form ? [form.external_new_playlist_mode] : ["pending"]
+                      }
+                      isDisabled={busy}
+                      onSelectionChange={(keys) => {
+                        const value = Array.from(keys)[0] as
+                          | AppSettings["external_new_playlist_mode"]
+                          | undefined;
+                        if (!value || !form) return;
+                        setForm({ ...form, external_new_playlist_mode: value });
+                        patchField({ external_new_playlist_mode: value });
+                      }}
+                    >
+                      <SelectItem key="pending">
+                        {t("settings.externalNewPlaylistPending")}
+                      </SelectItem>
+                      <SelectItem key="readonly">
+                        {t("settings.externalNewPlaylistReadonly")}
+                      </SelectItem>
+                      <SelectItem key="managed">
+                        {t("settings.externalNewPlaylistManaged")}
+                      </SelectItem>
+                    </Select>
                     <div className="grid grid-cols-2 gap-2">
                       <Input
                         size="sm"
@@ -767,16 +946,14 @@ export function SettingsDrawer({ isOpen, onOpenChange }: Props) {
                         {t("settings.clearMatchCooldownsRejected")}
                       </Button>
                     </div>
-                  </>
+                  </SettingsDisclosure>
                 ) : null}
               </div>
 
-              <div className="flex flex-col gap-3">
-                <HoverHint content={t("settings.diskHint")}>
-                  <p className="text-foreground-500 text-sm font-medium">
-                    {t("settings.sectionStorage")}
-                  </p>
-                </HoverHint>
+              <SettingsDisclosure
+                title={t("settings.sectionStorage")}
+                hint={t("settings.storageAdvancedHint")}
+              >
                 <HoverHint content={t("settings.cacheMinFreeHint")}>
                   <div className="flex items-center justify-between gap-3">
                     <span className="text-foreground-500 text-sm">
@@ -951,7 +1128,7 @@ export function SettingsDrawer({ isOpen, onOpenChange }: Props) {
                     {t("settings.reclaimNeedExternal")}
                   </p>
                 )}
-              </div>
+              </SettingsDisclosure>
             </section>
 
             <Divider />
@@ -978,7 +1155,10 @@ export function SettingsDrawer({ isOpen, onOpenChange }: Props) {
                 </div>
               </HoverHint>
               {form?.wanted_enabled ? (
-                <>
+                <SettingsDisclosure
+                  title={t("settings.wantedSources")}
+                  hint={t("settings.metadataSourcesHint")}
+                >
                   <p className="text-foreground-500 text-xs font-medium">
                     {t("settings.wantedSources")}
                   </p>
@@ -1033,7 +1213,7 @@ export function SettingsDrawer({ isOpen, onOpenChange }: Props) {
                       classNames={{ input: "font-mono" }}
                     />
                   ) : null}
-                </>
+                </SettingsDisclosure>
               ) : null}
             </section>
 
@@ -1061,108 +1241,104 @@ export function SettingsDrawer({ isOpen, onOpenChange }: Props) {
                   }}
                 />
               </div>
-              <div className="flex items-center justify-between gap-3">
-                <span className="text-foreground-500 text-sm">
-                  {t("settings.ytmusicLyricsFallback")}
-                </span>
-                <Switch
-                  size="sm"
-                  isSelected={form?.ytmusic_lyrics_fallback ?? true}
-                  isDisabled={busy || !form?.fetch_lyrics}
-                  onValueChange={(v) => {
-                    if (!form) return;
-                    setForm({ ...form, ytmusic_lyrics_fallback: v });
-                    patchField({ ytmusic_lyrics_fallback: v });
-                  }}
-                />
-              </div>
-              <div className="flex items-center justify-between gap-3">
-                <span className="text-foreground-500 text-sm">
-                  {t("settings.qqLyricsFallback")}
-                </span>
-                <Switch
-                  size="sm"
-                  isSelected={form?.qq_lyrics_fallback ?? true}
-                  isDisabled={busy || !form?.fetch_lyrics}
-                  onValueChange={(v) => {
-                    if (!form) return;
-                    setForm({ ...form, qq_lyrics_fallback: v });
-                    patchField({ qq_lyrics_fallback: v });
-                  }}
-                />
-              </div>
-              <div className="grid grid-cols-2 gap-2">
-                <Input
-                  size="sm"
-                  type="number"
-                  min={0}
-                  max={8760}
-                  step={1}
-                  label={t("settings.scrapeCooldown")}
-                  title={t("settings.scrapeCooldownHint")}
-                  value={form?.scrape_cooldown_hours ?? "24"}
-                  isDisabled={busy}
-                  onValueChange={(v) => {
-                    if (!form) return;
-                    setForm({ ...form, scrape_cooldown_hours: v });
-                    const hours = Number.parseInt(v, 10);
-                    if (Number.isNaN(hours) || hours < 0) return;
-                    patchFieldDebounced("scrape_cooldown_hours", {
-                      scrape_cooldown_hours: hours,
-                    });
-                  }}
-                  endContent={
-                    <span className="text-foreground-400 text-[10px]">
-                      {t("settings.hours")}
-                    </span>
-                  }
-                  classNames={{ input: "font-mono" }}
-                />
-                <Input
-                  size="sm"
-                  type="number"
-                  min={0}
-                  max={10000}
-                  step={100}
-                  label={t("settings.coverExcellencePx")}
-                  title={t("settings.coverExcellencePxHint")}
-                  value={form?.cover_excellence_px ?? "0"}
-                  isDisabled={busy}
-                  onValueChange={(v) => {
-                    if (!form) return;
-                    setForm({ ...form, cover_excellence_px: v });
-                    const px = Number.parseInt(v, 10);
-                    if (Number.isNaN(px) || px < 0 || px > 10000) return;
-                    patchFieldDebounced("cover_excellence_px", {
-                      cover_excellence_px: px,
-                    });
-                  }}
-                  endContent={
-                    <span className="text-foreground-400 text-[10px]">px</span>
-                  }
-                  classNames={{ input: "font-mono" }}
-                />
-                <Input
-                  size="sm"
-                  type="number"
-                  min={1}
-                  max={365}
-                  step={1}
-                  label={t("settings.coverProbeFreshDays")}
-                  title={t("settings.coverProbeFreshDaysHint")}
-                  value={form?.cover_probe_fresh_days ?? "7"}
-                  isDisabled={busy}
-                  onValueChange={(v) => {
-                    if (!form) return;
-                    setForm({ ...form, cover_probe_fresh_days: v });
-                    const days = Number.parseInt(v, 10);
-                    if (Number.isNaN(days) || days < 1 || days > 365) return;
-                    patchFieldDebounced("cover_probe_fresh_days", {
-                      cover_probe_fresh_days: days,
-                    });
-                  }}
-                  classNames={{ input: "font-mono" }}
-                />
+              <SettingsDisclosure
+                title={t("settings.lyricsAdvanced")}
+                hint={t("settings.lyricsAdvancedHint")}
+              >
+                <div className="flex items-center justify-between gap-3">
+                  <span className="text-foreground-500 text-sm">
+                    {t("settings.ytmusicLyricsFallback")}
+                  </span>
+                  <Switch
+                    size="sm"
+                    isSelected={form?.ytmusic_lyrics_fallback ?? true}
+                    isDisabled={busy || !form?.fetch_lyrics}
+                    onValueChange={(v) => {
+                      if (!form) return;
+                      setForm({ ...form, ytmusic_lyrics_fallback: v });
+                      patchField({ ytmusic_lyrics_fallback: v });
+                    }}
+                  />
+                </div>
+                <div className="flex items-center justify-between gap-3">
+                  <span className="text-foreground-500 text-sm">
+                    {t("settings.qqLyricsFallback")}
+                  </span>
+                  <Switch
+                    size="sm"
+                    isSelected={form?.qq_lyrics_fallback ?? true}
+                    isDisabled={busy || !form?.fetch_lyrics}
+                    onValueChange={(v) => {
+                      if (!form) return;
+                      setForm({ ...form, qq_lyrics_fallback: v });
+                      patchField({ qq_lyrics_fallback: v });
+                    }}
+                  />
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  <Input
+                    size="sm"
+                    type="number"
+                    min={0}
+                    max={8760}
+                    step={1}
+                    label={t("settings.scrapeCooldown")}
+                    title={t("settings.scrapeCooldownHint")}
+                    value={form?.scrape_cooldown_hours ?? "24"}
+                    isDisabled={busy}
+                    onValueChange={(v) => {
+                      if (!form) return;
+                      setForm({ ...form, scrape_cooldown_hours: v });
+                      const hours = Number.parseInt(v, 10);
+                      if (Number.isNaN(hours) || hours < 0) return;
+                      patchFieldDebounced("scrape_cooldown_hours", {
+                        scrape_cooldown_hours: hours,
+                      });
+                    }}
+                    classNames={{ input: "font-mono", label: "truncate" }}
+                  />
+                  <Input
+                    size="sm"
+                    type="number"
+                    min={0}
+                    max={10000}
+                    step={100}
+                    label={t("settings.coverExcellencePx")}
+                    title={t("settings.coverExcellencePxHint")}
+                    value={form?.cover_excellence_px ?? "0"}
+                    isDisabled={busy}
+                    onValueChange={(v) => {
+                      if (!form) return;
+                      setForm({ ...form, cover_excellence_px: v });
+                      const px = Number.parseInt(v, 10);
+                      if (Number.isNaN(px) || px < 0 || px > 10000) return;
+                      patchFieldDebounced("cover_excellence_px", {
+                        cover_excellence_px: px,
+                      });
+                    }}
+                    classNames={{ input: "font-mono", label: "truncate" }}
+                  />
+                  <Input
+                    size="sm"
+                    type="number"
+                    min={1}
+                    max={365}
+                    step={1}
+                    label={t("settings.coverProbeFreshDays")}
+                    title={t("settings.coverProbeFreshDaysHint")}
+                    value={form?.cover_probe_fresh_days ?? "7"}
+                    isDisabled={busy}
+                    onValueChange={(v) => {
+                      if (!form) return;
+                      setForm({ ...form, cover_probe_fresh_days: v });
+                      const days = Number.parseInt(v, 10);
+                      if (Number.isNaN(days) || days < 1 || days > 365) return;
+                      patchFieldDebounced("cover_probe_fresh_days", {
+                        cover_probe_fresh_days: days,
+                      });
+                    }}
+                    classNames={{ input: "font-mono", label: "truncate" }}
+                  />
                 <Input
                   size="sm"
                   type="number"
@@ -1182,22 +1358,23 @@ export function SettingsDrawer({ isOpen, onOpenChange }: Props) {
                       cover_download_fresh_days: days,
                     });
                   }}
-                  classNames={{ input: "font-mono" }}
+                  classNames={{ input: "font-mono", label: "truncate" }}
                 />
-              </div>
-              <Button
-                size="sm"
-                variant="flat"
-                className="w-full"
-                title={t("settings.clearScrapeCooldownsHint")}
-                isDisabled={busy || clearingCooldowns}
-                isLoading={clearingCooldowns}
-                onPress={() => {
-                  void handleClearScrapeCooldowns();
-                }}
-              >
-                {t("settings.clearScrapeCooldowns")}
-              </Button>
+                </div>
+                <Button
+                  size="sm"
+                  variant="flat"
+                  className="w-full"
+                  title={t("settings.clearScrapeCooldownsHint")}
+                  isDisabled={busy || clearingCooldowns}
+                  isLoading={clearingCooldowns}
+                  onPress={() => {
+                    void handleClearScrapeCooldowns();
+                  }}
+                >
+                  {t("settings.clearScrapeCooldowns")}
+                </Button>
+              </SettingsDisclosure>
             </section>
 
             <Divider />
@@ -1381,9 +1558,9 @@ export function SettingsDrawer({ isOpen, onOpenChange }: Props) {
                   isLoading={resetting}
                   isDisabled={busy}
                   startContent={<RotateCcwIcon className="h-4 w-4" />}
-                  onPress={() => setConfirmResetOpen(true)}
+                  onPress={openReset}
                 >
-                  {t("settings.resetDefaults")}
+                  {t("settings.factoryCenter")}
                 </Button>
                 {authStatus.enabled && authStatus.authenticated ? (
                   <Button
@@ -1407,33 +1584,139 @@ export function SettingsDrawer({ isOpen, onOpenChange }: Props) {
 
       <Modal
         isOpen={confirmResetOpen}
-        onOpenChange={setConfirmResetOpen}
+        onOpenChange={(open) => {
+          if (!resetting) setConfirmResetOpen(open);
+        }}
         placement="center"
+        isDismissable={!resetting}
       >
         <ModalContent>
           {(onClose) => (
             <>
-              <ModalHeader>{t("settings.resetConfirmTitle")}</ModalHeader>
-              <ModalBody className="gap-2 text-sm">
-                <p>{t("settings.resetConfirmBody")}</p>
+              <ModalHeader>
+                {resetStage === "select"
+                  ? t("settings.factoryCenter")
+                  : resetStage === "warning"
+                    ? t("settings.factoryFirstConfirm")
+                    : t("settings.factoryFinalConfirm")}
+              </ModalHeader>
+              <ModalBody className="gap-3 text-sm">
+                {resetStage === "select" ? (
+                  <div className="flex flex-col gap-2">
+                    {(
+                      ["preferences", "invalid", "full"] as FactoryResetMode[]
+                    ).map((mode, index) => (
+                      <Button
+                        key={mode}
+                        variant="flat"
+                        color={mode === "full" ? "danger" : "default"}
+                        className="h-auto justify-start px-4 py-3 text-left"
+                        isLoading={resetPreviewing}
+                        isDisabled={resetPreviewing}
+                        onPress={() => {
+                          void selectResetMode(mode);
+                        }}
+                      >
+                        <span className="flex flex-col items-start gap-1">
+                          <span className="font-medium">
+                            {index + 1}.{" "}
+                            {t(`settings.factoryMode.${mode}.title`)}
+                          </span>
+                          <span className="text-foreground-500 text-xs whitespace-normal">
+                            {t(`settings.factoryMode.${mode}.summary`)}
+                          </span>
+                        </span>
+                      </Button>
+                    ))}
+                  </div>
+                ) : resetPreview ? (
+                  <>
+                    <p className="font-medium">
+                      {t(
+                        `settings.factoryMode.${resetPreview.mode}.${
+                          resetStage === "warning" ? "warning" : "confirm"
+                        }`,
+                      )}
+                    </p>
+                    {resetPreview.mode !== "preferences" ? (
+                      <div className="bg-default-100 rounded-medium px-3 py-2 text-xs">
+                        <p>{resetStats}</p>
+                        {resetPreview.mode === "full" ? (
+                          <p className="text-danger mt-1">
+                            {t("settings.factoryBackups", {
+                              count: resetPreview.backups,
+                            })}
+                          </p>
+                        ) : null}
+                      </div>
+                    ) : null}
+                    {resetStage === "confirm" &&
+                    resetPreview.mode === "full" &&
+                    authStatus.enabled ? (
+                      <Input
+                        type="password"
+                        autoFocus
+                        label={t("settings.factoryPassword")}
+                        value={resetPassword}
+                        onValueChange={setResetPassword}
+                        isDisabled={resetting}
+                      />
+                    ) : null}
+                  </>
+                ) : null}
               </ModalBody>
               <ModalFooter>
                 <Button
                   variant="light"
-                  onPress={onClose}
+                  onPress={() => {
+                    if (resetStage === "select") {
+                      onClose();
+                    } else {
+                      setResetStage(
+                        resetStage === "confirm" &&
+                          resetPreview?.mode !== "preferences"
+                          ? "warning"
+                          : "select",
+                      );
+                    }
+                  }}
                   isDisabled={resetting}
                 >
-                  {t("sync.cancel")}
+                  {resetStage === "select"
+                    ? t("sync.cancel")
+                    : t("settings.factoryBack")}
                 </Button>
-                <Button
-                  color="danger"
-                  isLoading={resetting}
-                  onPress={() => {
-                    void handleReset();
-                  }}
-                >
-                  {t("settings.resetDefaults")}
-                </Button>
+                {resetStage === "warning" ? (
+                  <Button
+                    color="danger"
+                    onPress={() => setResetStage("confirm")}
+                  >
+                    {t("settings.factoryContinue")}
+                  </Button>
+                ) : resetStage === "confirm" ? (
+                  <Button
+                    color={
+                      resetPreview?.mode === "preferences"
+                        ? "primary"
+                        : "danger"
+                    }
+                    isLoading={resetting}
+                    isDisabled={
+                      resetPreview?.mode === "full" &&
+                      authStatus.enabled &&
+                      !resetPassword
+                    }
+                    onPress={() => {
+                      void handleReset();
+                    }}
+                  >
+                    {t(
+                      resetPreview?.mode === "full"
+                        ? "settings.factoryDeleteAll"
+                        : "settings.factoryExecute",
+                    )}
+                  </Button>
+                ) : null}
               </ModalFooter>
             </>
           )}

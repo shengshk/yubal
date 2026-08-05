@@ -11,6 +11,7 @@ type Kind =
   | "search"
   | "direct"
   | "wanted"
+  | "favorite"
   | "liked"
   | "subscription"
   | "external";
@@ -84,6 +85,10 @@ export function PlaylistTitleTooltip({
     kindLabel = t("sync.playlistTipKindLiked");
     path = "download/liked";
     role = t("sync.playlistTipRoleLiked");
+  } else if (kind === "favorite") {
+    kindLabel = t("sync.playlistTipKindFavorite");
+    path = `download/${(saveFolder || "liked").replace(/^\/+/, "")} + wanted/`;
+    role = t("sync.playlistTipRoleFavorite");
   } else if (kind === "wanted") {
     kindLabel = t("sync.playlistTipKindWanted");
     path = "wanted/";

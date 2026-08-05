@@ -25,6 +25,9 @@ def get_scheduler_status(
         next_run_at=scheduler.next_run_at,
         next_run_subscription_id=str(next_id) if next_id is not None else None,
         next_run_subscription_name=scheduler.next_run_subscription_name,
+        next_run_target_kind=scheduler.next_run_target_kind,
+        next_run_target_id=scheduler.next_run_target_id,
+        next_run_target_name=scheduler.next_run_target_name,
         subscription_counts=SubscriptionCounts(
             total=service.count(),
             enabled=service.count(enabled=True),

@@ -1,6 +1,7 @@
 import { UrlInput } from "@/components/common/url-input";
 import { getContentInfo } from "@/api/info";
 import {
+  activatePendingExternalPlaylists,
   deleteExternalPlaylist,
   listExternalPlaylists,
   type ExternalDeleteMode,
@@ -43,10 +44,10 @@ import { SubscriptionEditModal } from "@/features/sync/subscription-edit-modal";
 import { useJobs } from "@/features/jobs/jobs-context";
 import { useSubscriptions } from "@/features/subscriptions/use-subscriptions";
 import { showErrorToast, showSuccessToast } from "@/lib/toast";
+import { specialExternalPit } from "@/lib/playlist-labels";
 import {
   deleteDirect,
   listSyncLedger,
-  reconcileDirect,
   syncDirect,
   updateDirect,
   type DirectPlaylistDeleteMode,
@@ -87,7 +88,7 @@ function trackWatchUrl(videoId: string): string {
 
 export function JobsPage() {
   const { t } = useTranslation();
-  const { jobs, isLoading: jobsLoading, startJob, cancelJob } = useJobs();
+  const { jobs, startJob, cancelJob } = useJobs();
   const {
     subscriptions,
     schedulerStatus,
@@ -138,6 +139,10 @@ export function JobsPage() {
     useState<ExternalPlaylist | null>(null);
   const [deletingExternal, setDeletingExternal] =
     useState<ExternalPlaylist | null>(null);
+  const [externalActivationMode, setExternalActivationMode] = useState<
+    "readonly" | "managed" | null
+  >(null);
+  const [activatingExternal, setActivatingExternal] = useState(false);
   const [isDirecting, setIsDirecting] = useState(false);
   const [isSearching, setIsSearching] = useState(false);
   const [isAdding, setIsAdding] = useState(false);
@@ -156,6 +161,7 @@ export function JobsPage() {
   const [librarySummary, setLibrarySummary] =
     useState<LibraryTrackSummary | null>(null);
   const previousJobStatusesRef = useRef<Map<string, string> | null>(null);
+  const externalWorkWasActiveRef = useRef(false);
 
   const canAct = url.trim().length > 0;
   const inputKind = classifyUnifiedInput(url);
@@ -167,27 +173,30 @@ export function JobsPage() {
   const directFolder = directEntry?.save_folder ?? "direct";
 
   const refreshLedger = useCallback(async () => {
-    const items = await listSyncLedger();
-    setLedger(items);
-    setLedgerLoading(false);
+    try {
+      setLedger(await listSyncLedger());
+    } finally {
+      setLedgerLoading(false);
+    }
   }, []);
 
-  const refreshLibrarySummary = useCallback(async () => {
-    setLibrarySummary(await getLibraryTrackSummary());
+  const refreshLibrarySummary = useCallback(async (refresh = false) => {
+    setLibrarySummary(await getLibraryTrackSummary(refresh));
   }, []);
 
   const refreshExternal = useCallback(async () => {
-    const settings = await getSettings();
-    const enabled = Boolean(settings?.external_library_enabled);
-    setExternalEnabled(enabled);
-    if (!enabled) {
-      setExternalPlaylists([]);
+    try {
+      const settings = await getSettings();
+      const enabled = Boolean(settings?.external_library_enabled);
+      setExternalEnabled(enabled);
+      if (!enabled) {
+        setExternalPlaylists([]);
+        return;
+      }
+      setExternalPlaylists(await listExternalPlaylists());
+    } finally {
       setExternalLoading(false);
-      return;
     }
-    const items = await listExternalPlaylists();
-    setExternalPlaylists(items);
-    setExternalLoading(false);
   }, []);
 
   const refreshWanted = useCallback(async () => {
@@ -302,7 +311,7 @@ export function JobsPage() {
 
     void Promise.all([
       refreshLedger(),
-      refreshLibrarySummary(),
+      refreshLibrarySummary(true),
       refreshSubscriptions(),
       refreshSearch(),
       refreshWanted(),
@@ -586,11 +595,44 @@ export function JobsPage() {
     setIsSyncingAll(true);
     const steps = await syncAll();
     if (steps) setSyncSteps(steps);
-    await reconcileDirect();
-    await refreshLedger();
-    await refreshSubscriptions();
+    await Promise.all([
+      refreshExternal(),
+      refreshLedger(),
+      refreshLibrarySummary(),
+      refreshSubscriptions(),
+    ]);
     setIsSyncingAll(false);
   };
+
+  const externalWorkActive = externalPlaylists.some(
+    (playlist) =>
+      playlist.last_sync_status === "queued" ||
+      playlist.last_sync_status === "running" ||
+      (!playlist.inventory_scanned &&
+        specialExternalPit(playlist.dir_name) === null),
+  );
+
+  useEffect(() => {
+    const justFinished =
+      externalWorkWasActiveRef.current && !externalWorkActive;
+    externalWorkWasActiveRef.current = externalWorkActive;
+    if (justFinished) {
+      void refreshLibrarySummary(true);
+    }
+    if (!externalWorkActive) return;
+    const timer = window.setInterval(() => {
+      void refreshExternal();
+    }, 5000);
+    return () => window.clearInterval(timer);
+  }, [externalWorkActive, refreshExternal, refreshLibrarySummary]);
+
+  useEffect(() => {
+    if (!librarySummary?.refreshing) return;
+    const timer = window.setInterval(() => {
+      void refreshLibrarySummary();
+    }, 3000);
+    return () => window.clearInterval(timer);
+  }, [librarySummary?.refreshing, refreshLibrarySummary]);
 
   const handleRowSync = async (id: string) => {
     await syncSubscription(id);
@@ -635,16 +677,13 @@ export function JobsPage() {
     );
     if (ok) {
       await refreshLedger();
-      void refreshLibrarySummary();
+      void refreshLibrarySummary(true);
     }
     return ok;
   };
 
-  const handleDirectFolderSave = async (
-    updates: DirectPolicyUpdates & { save_folder: string },
-    confirmMove: boolean,
-  ) => {
-    const result = await updateDirect(updates, confirmMove);
+  const handleDirectFolderSave = async (updates: DirectPolicyUpdates) => {
+    const result = await updateDirect(updates);
     if (result === "ok") await refreshLedger();
     return result;
   };
@@ -683,8 +722,9 @@ export function JobsPage() {
   };
 
   const enabledCount = subscriptions.filter((s) => s.enabled).length;
-  const loading =
-    jobsLoading || subsLoading || ledgerLoading || externalLoading;
+  // The playlist shell must not wait for the slower external-library request
+  // or the jobs poll. Each section fills independently as its own data arrives.
+  const loading = ledgerLoading;
 
   return (
     <>
@@ -817,6 +857,7 @@ export function JobsPage() {
           subscriptions={subscriptions}
           jobs={jobs}
           isLoading={loading}
+          subscriptionsLoading={subsLoading}
           expandedKey={expandedKey}
           onExpandedKeyChange={setExpandedKey}
           onCancel={cancelJob}
@@ -838,17 +879,19 @@ export function JobsPage() {
               next[idx] = entry;
               return next;
             });
-            void refreshLibrarySummary();
+            void refreshLibrarySummary(true);
           }}
           schedulerEnabled={schedulerStatus?.enabled !== false}
           externalPlaylists={externalPlaylists}
-          showExternalSection={externalEnabled}
+          showExternalSection={externalLoading || externalEnabled}
+          externalLoading={externalLoading}
           onEditExternal={setEditingExternal}
           onDeleteExternal={setDeletingExternal}
           onExternalChanged={() => {
             void refreshExternal();
-            void refreshLibrarySummary();
+            void refreshLibrarySummary(true);
           }}
+          onActivateExternalPending={setExternalActivationMode}
           wantedSummary={wantedSummary}
           showWantedSection={wantedEnabled}
         />
@@ -872,11 +915,9 @@ export function JobsPage() {
       />
       <DirectEditModal
         isOpen={editingDirect}
-        currentFolder={directFolder}
         initial={
           directEntry
             ? {
-                save_folder: directEntry.save_folder,
                 enabled: directEntry.enabled ?? false,
                 max_items: directEntry.max_items ?? 100,
                 sync_jitter_seconds: directEntry.sync_jitter_seconds ?? 600,
@@ -920,13 +961,15 @@ export function JobsPage() {
         isOpen={deletingExternal !== null}
         dirName={deletingExternal?.dir_name ?? ""}
         allowMutate={deletingExternal?.allow_mutate ?? false}
+        metaRejectedMutableCount={
+          deletingExternal?.meta_rejected_mutable_count ?? 0
+        }
         onClose={() => setDeletingExternal(null)}
         onConfirm={async (mode: ExternalDeleteMode) => {
           if (!deletingExternal) return false;
           const result = await deleteExternalPlaylist(
             deletingExternal.dir_name,
             mode,
-            directFolder,
           );
           if ("error" in result) {
             showErrorToast(t("sync.deleteExternalFailed"), result.error);
@@ -937,10 +980,79 @@ export function JobsPage() {
             t("sync.deleteExternalDone"),
           );
           void refreshExternal();
-          void refreshLibrarySummary();
+          void refreshLibrarySummary(true);
           return true;
         }}
       />
+      <Modal
+        isOpen={externalActivationMode !== null}
+        onOpenChange={(open) => {
+          if (!open && !activatingExternal) setExternalActivationMode(null);
+        }}
+        placement="center"
+      >
+        <ModalContent>
+          {(onClose) => {
+            const mode = externalActivationMode;
+            const managed = mode === "managed";
+            return (
+              <>
+                <ModalHeader>
+                  {t("sync.externalActivateConfirmTitle")}
+                </ModalHeader>
+                <ModalBody className="text-sm">
+                  <p>
+                    {managed
+                      ? t("sync.externalActivateManagedConfirm")
+                      : t("sync.externalActivateReadonlyConfirm")}
+                  </p>
+                </ModalBody>
+                <ModalFooter>
+                  <Button
+                    variant="light"
+                    isDisabled={activatingExternal}
+                    onPress={onClose}
+                  >
+                    {t("sync.cancel")}
+                  </Button>
+                  <Button
+                    color={managed ? "primary" : "warning"}
+                    isLoading={activatingExternal}
+                    onPress={() => {
+                      if (!mode) return;
+                      setActivatingExternal(true);
+                      void activatePendingExternalPlaylists(mode).then(
+                        (result) => {
+                          setActivatingExternal(false);
+                          if ("error" in result) {
+                            showErrorToast(
+                              t("sync.externalSettingsSaveFailed"),
+                              result.error,
+                            );
+                            return;
+                          }
+                          showSuccessToast(
+                            t("settings.savedTitle"),
+                            t("sync.externalActivated", {
+                              count: result.activated,
+                            }),
+                          );
+                          onClose();
+                          void refreshExternal();
+                        },
+                      );
+                    }}
+                  >
+                    {managed
+                      ? t("sync.externalActivateManaged")
+                      : t("sync.externalActivateReadonly")}
+                  </Button>
+                </ModalFooter>
+              </>
+            );
+          }}
+        </ModalContent>
+      </Modal>
       <Modal
         isOpen={inputChoice !== null}
         onOpenChange={(open) => {
